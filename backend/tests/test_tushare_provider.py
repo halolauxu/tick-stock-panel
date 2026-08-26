@@ -1,7 +1,7 @@
 """Tushare stk_mins plugin contract tests (no real token or network required)."""
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import date, datetime, timedelta
 
 import polars as pl
 import pytest
@@ -286,6 +286,28 @@ def test_provider_maps_statements_to_panel_schema():
     assert income.row(0, named=True)["net_income_attributable"] == 1.8
     assert balance.row(0, named=True)["fixed_assets"] == 12
     assert cash.row(0, named=True)["net_operating_cash_flow"] == 8
+
+
+def test_provider_pins_numeric_schema_beyond_default_inference_window():
+    start = date(1990, 1, 1)
+    rows = []
+    for index in range(121):
+        period = (start + timedelta(days=index)).strftime("%Y%m%d")
+        rows.append({
+            "ts_code": "600000.SH",
+            "ann_date": period,
+            "end_date": period,
+            "update_flag": "1",
+            "revenue": 1 if index < 100 else 60_894.44,
+        })
+    provider = TushareProvider()
+    provider._client = _FinancialClient({"income": rows})
+
+    frame = provider.get_financials("income", ["600000.SH"], latest_only=False)
+
+    assert frame.height == 121
+    assert frame.schema["revenue"] == pl.Float64
+    assert frame["revenue"].max() == pytest.approx(60_894.44)
 
 
 def test_provider_converts_and_compresses_daily_share_capital():

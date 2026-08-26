@@ -290,8 +290,22 @@ class TushareProvider:
                     latest[symbol] = record
             records = list(latest.values())
 
-        frame = pl.DataFrame(records)
         numeric = _FINANCIAL_NUMERIC_FIELDS[table]
+        # Some long Tushare histories have >100 records where the first 100
+        # values of a field are integers/nulls and a later value is float. The
+        # default inference window then selects an incompatible builder and the
+        # whole multi-hour table sync is lost. Pin the canonical schema up front.
+        frame = pl.DataFrame(
+            records,
+            schema_overrides={
+                "symbol": pl.Utf8,
+                "period_end": pl.Utf8,
+                "announce_date": pl.Utf8,
+                **dict.fromkeys(numeric, pl.Float64),
+            },
+            strict=False,
+            infer_schema_length=None,
+        )
         frame = frame.with_columns(
             pl.col("symbol").cast(pl.Utf8),
             pl.col("period_end").cast(pl.Utf8),
