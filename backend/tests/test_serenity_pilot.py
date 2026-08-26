@@ -4,10 +4,13 @@ from datetime import date, timedelta
 from pathlib import Path
 
 import polars as pl
+import pytest
 
+from app.services import serenity_pilot
 from app.services.serenity_pilot import (
     CHAIN_SPECS,
     PilotStore,
+    _historical_decision_dates,
     _score_serenity,
     analyze_pdf,
     collect_main_business,
@@ -61,6 +64,122 @@ def test_score_serenity_keeps_missing_unknown() -> None:
     )
     assert score is not None and score >= 12
     assert eligible is True
+
+
+def test_historical_dates_use_explicit_trading_partitions(tmp_path: Path) -> None:
+    data_dir = tmp_path / "data"
+    trading_days = [
+        date(2026, 8, 14),
+        date(2026, 8, 17),
+        date(2026, 8, 18),
+        date(2026, 8, 19),
+        date(2026, 8, 20),
+        date(2026, 8, 21),
+        date(2026, 8, 24),
+        date(2026, 8, 25),
+        date(2026, 8, 26),
+    ]
+    for day in trading_days:
+        _write_partition(data_dir / "kline_daily_enriched", day, [{"symbol": "000001.SZ"}])
+
+    selected = _historical_decision_dates(data_dir, date(2026, 8, 26), 7)
+
+    assert selected == trading_days[-7:]
+
+
+def test_historical_dates_fail_when_partitions_are_insufficient(tmp_path: Path) -> None:
+    data_dir = tmp_path / "data"
+    _write_partition(
+        data_dir / "kline_daily_enriched",
+        date(2026, 8, 26),
+        [{"symbol": "000001.SZ"}],
+    )
+
+    with pytest.raises(RuntimeError, match="only 1 are available"):
+        _historical_decision_dates(data_dir, date(2026, 8, 26), 7)
+
+
+def test_historical_run_freezes_window_and_leakage_labels(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    data_dir = tmp_path / "data"
+    decision_dates = [
+        date(2026, 8, 18),
+        date(2026, 8, 19),
+        date(2026, 8, 20),
+        date(2026, 8, 21),
+        date(2026, 8, 24),
+        date(2026, 8, 25),
+        date(2026, 8, 26),
+    ]
+    for day in decision_dates:
+        _write_partition(data_dir / "kline_daily_enriched", day, [{"symbol": "000001.SZ"}])
+
+    def fake_universe(_data_dir: Path, as_of: date):
+        rows = []
+        for index in range(100):
+            spec = CHAIN_SPECS[0 if index < 34 else 1 if index < 67 else 2]
+            code = f"{index + 1:06d}"
+            rows.append(
+                {
+                    "symbol": f"{code}.SZ",
+                    "code": code,
+                    "name": f"样本{index + 1}",
+                    "chain_id": spec.id,
+                    "chain_name": spec.name,
+                    "chain_role": spec.role,
+                    "sample_rank": index + 1,
+                    "market_cap_bucket": "mid",
+                    "concept_score": 5,
+                    "concepts": spec.required_any[0],
+                    "market_cap": 5_000_000_000.0,
+                    "amount": 200_000_000.0,
+                    "source_as_of": as_of.isoformat(),
+                }
+            )
+        return as_of, rows
+
+    monkeypatch.setattr(serenity_pilot, "select_universe", fake_universe)
+    monkeypatch.setattr(
+        serenity_pilot,
+        "collect_documents",
+        lambda *_args: {
+            "queried_companies": 100,
+            "query_failures": 0,
+            "discovered_documents": 0,
+            "downloaded_documents": 0,
+            "downloaded_bytes": 0,
+        },
+    )
+    monkeypatch.setattr(
+        serenity_pilot,
+        "collect_main_business",
+        lambda *_args: {"queried": 0, "covered_companies": 0, "rows": 0, "failures": 0},
+    )
+    monkeypatch.setattr(
+        serenity_pilot,
+        "freeze_daily_decisions",
+        lambda _store, _data_dir, value: {"status": "frozen", "date": value.isoformat()},
+    )
+    monkeypatch.setattr(
+        serenity_pilot,
+        "settle_outcomes",
+        lambda *_args, **_kwargs: {"settled": 0, "pending": 0},
+    )
+
+    result = serenity_pilot.run_historical(
+        tmp_path / "pilot",
+        data_dir,
+        end_date=date(2026, 8, 26),
+        trading_days=7,
+    )
+
+    replay = result["report"]["qualification"]["historical_replay"]
+    assert result["decision_dates"] == [value.isoformat() for value in decision_dates]
+    assert result["report"]["period"] == {"start": "2026-08-18", "end": "2026-08-26"}
+    assert replay["status"] == "RETROSPECTIVE_ENGINEERING_SAMPLE_NOT_CLEAN_ROOM"
+    assert replay["concept_membership"] == "UNRESOLVED_CURRENT_SNAPSHOT"
+    assert replay["pdf_facts_in_strategy_score"] is False
 
 
 def test_select_universe_is_exact_and_cap_stratified(tmp_path: Path) -> None:

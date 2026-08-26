@@ -1,10 +1,15 @@
-"""Bounded seven-day forward pilot for the Serenity bottleneck hypothesis.
+"""Bounded seven-day pilot for the Serenity bottleneck hypothesis.
 
 The pilot is deliberately isolated from the panel's production datasets.  It
 freezes a 100-company universe, downloads only official CNINFO disclosures for
 that universe, measures PDF/OCR storage economics, extracts rule-based evidence
 candidates, freezes after-close research selections and settles them from the
 next trading-day open.  It never places orders or calls a paid model.
+
+The default mode is prospective.  ``run-historical`` is a deliberately labelled
+retrospective engineering sample over the latest seven completed local trading
+partitions.  It is not a clean-room Alpha replay because the local concept and
+instrument snapshots are not effective-dated.
 """
 from __future__ import annotations
 
@@ -164,6 +169,19 @@ def _latest_partition(root: Path, not_after: date) -> tuple[date, Path]:
         raise FileNotFoundError(f"no partition in {root} at or before {not_after}")
     latest = dates[-1]
     return latest, root / f"date={latest.isoformat()}" / "part.parquet"
+
+
+def _historical_decision_dates(data_dir: Path, end_date: date, count: int) -> list[date]:
+    """Return the latest explicit local trading partitions, never calendar-day guesses."""
+    if count <= 0:
+        raise ValueError("trading day count must be positive")
+    dates = _partition_dates(data_dir / "kline_daily_enriched", not_after=end_date)
+    if len(dates) < count:
+        raise RuntimeError(
+            f"historical pilot needs {count} trading partitions at or before {end_date}; "
+            f"only {len(dates)} are available"
+        )
+    return dates[-count:]
 
 
 def _concept_score(concepts: set[str], spec: ChainSpec) -> int:
@@ -979,22 +997,40 @@ def settle_outcomes(store: PilotStore, data_dir: Path, *, cost_bps: float) -> di
     return {"settled": settled, "pending": pending}
 
 
-def initialize_pilot(root: Path, data_dir: Path, start_date: date) -> dict[str, Any]:
+def initialize_pilot(
+    root: Path,
+    data_dir: Path,
+    start_date: date,
+    *,
+    end_date: date | None = None,
+    decision_dates: list[date] | None = None,
+    mode: str = "prospective",
+) -> dict[str, Any]:
     store = PilotStore(root)
     try:
         existing = store.get_meta("manifest")
         if existing:
             return existing
         source_as_of, universe = select_universe(data_dir, start_date)
+        resolved_end = end_date or (start_date + timedelta(days=6))
+        resolved_decision_dates = decision_dates or []
+        if resolved_decision_dates:
+            if resolved_decision_dates != sorted(set(resolved_decision_dates)):
+                raise ValueError("decision dates must be unique and ascending")
+            if resolved_decision_dates[0] != start_date or resolved_decision_dates[-1] != resolved_end:
+                raise ValueError("decision dates must match the manifest start and end")
+        retrospective = mode == "retrospective_historical"
         universe_hash = _stable_hash(
             *[f"{row['symbol']}:{row['chain_id']}" for row in sorted(universe, key=lambda row: row["symbol"])]
         )
         manifest = {
             "pilot_version": PILOT_VERSION,
             "pilot_id": root.name,
+            "mode": mode,
             "created_at": datetime.now().isoformat(timespec="seconds"),
             "start_date": start_date.isoformat(),
-            "end_date": (start_date + timedelta(days=6)).isoformat(),
+            "end_date": resolved_end.isoformat(),
+            "decision_dates": [value.isoformat() for value in resolved_decision_dates],
             "source_as_of": source_as_of.isoformat(),
             "sample_size": len(universe),
             "sample_hash": universe_hash,
@@ -1015,6 +1051,27 @@ def initialize_pilot(root: Path, data_dir: Path, start_date: date) -> dict[str, 
                 "models": list(MODELS),
                 "alpha_claim_gate": "minimum_60_trading_sessions_and_200_settled_positions",
                 "seven_day_label": "UNVERIFIED_ALPHA",
+            },
+            "historical_replay_qualification": {
+                "status": (
+                    "RETROSPECTIVE_ENGINEERING_SAMPLE_NOT_CLEAN_ROOM"
+                    if retrospective
+                    else "NOT_APPLICABLE"
+                ),
+                "price_and_financial_inputs": "POINT_IN_TIME_BY_LOCAL_PARTITION",
+                "concept_membership": (
+                    "UNRESOLVED_CURRENT_SNAPSHOT"
+                    if retrospective
+                    else "CURRENT_SNAPSHOT_AT_PILOT_START"
+                ),
+                "instrument_snapshot": (
+                    "UNRESOLVED_CURRENT_SNAPSHOT"
+                    if retrospective
+                    else "CURRENT_SNAPSHOT_AT_PILOT_START"
+                ),
+                "pdf_facts_in_strategy_score": False,
+                "semantic_model_used": False,
+                "claim_boundary": "DECISION_PROCESS_EVIDENCE_ONLY_NO_ALPHA_CLAIM",
             },
         }
         rows = [
@@ -1330,7 +1387,9 @@ def build_report(store: PilotStore) -> dict[str, Any]:
     p95_index = max(0, math.ceil(len(sorted_sizes) * 0.95) - 1) if sorted_sizes else 0
     report = {
         "pilot_id": manifest.get("pilot_id"),
+        "mode": manifest.get("mode", "prospective"),
         "period": {"start": manifest.get("start_date"), "end": manifest.get("end_date")},
+        "decision_dates": manifest.get("decision_dates", []),
         "universe": {
             "companies": store.connection.execute("SELECT count(*) FROM universe").fetchone()[0],
             "chains": dict(
@@ -1395,6 +1454,7 @@ def build_report(store: PilotStore) -> dict[str, Any]:
                 else None
             ),
             "fact_precision_gate": "PENDING_50_FACT_MANUAL_REVIEW",
+            "historical_replay": manifest.get("historical_replay_qualification", {}),
         },
         "generated_at": datetime.now().isoformat(timespec="seconds"),
     }
@@ -1459,24 +1519,118 @@ def run_daily(root: Path, data_dir: Path, as_of: date) -> dict[str, Any]:
         store.close()
 
 
+def run_historical(
+    root: Path,
+    data_dir: Path,
+    *,
+    end_date: date,
+    trading_days: int = 7,
+) -> dict[str, Any]:
+    """Backfill one bounded retrospective sample and settle only available horizons."""
+    decision_dates = _historical_decision_dates(data_dir, end_date, trading_days)
+    start = decision_dates[0]
+    end = decision_dates[-1]
+    manifest = initialize_pilot(
+        root,
+        data_dir,
+        start,
+        end_date=end,
+        decision_dates=decision_dates,
+        mode="retrospective_historical",
+    )
+    expected_dates = [value.isoformat() for value in decision_dates]
+    if manifest.get("mode") != "retrospective_historical":
+        raise RuntimeError("historical command cannot reuse a prospective pilot root")
+    if manifest.get("decision_dates") != expected_dates:
+        raise RuntimeError("historical pilot root is bound to a different trading window")
+
+    store = PilotStore(root)
+    try:
+        collection = collect_documents(store, start, end)
+        store.connection.execute(
+            """
+            INSERT OR REPLACE INTO collection_runs VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            [
+                end,
+                start,
+                end,
+                collection["queried_companies"],
+                collection["query_failures"],
+                collection["discovered_documents"],
+                collection["downloaded_documents"],
+                collection["downloaded_bytes"],
+                datetime.now(),
+            ],
+        )
+        main_business = collect_main_business(store)
+        decisions = {
+            value.isoformat(): freeze_daily_decisions(store, data_dir, value)
+            for value in decision_dates
+        }
+        settlement = settle_outcomes(
+            store,
+            data_dir,
+            cost_bps=float(manifest["research_contract"]["cost_bps"]),
+        )
+        report = build_report(store)
+        result = {
+            "pilot_id": manifest["pilot_id"],
+            "mode": manifest["mode"],
+            "decision_dates": expected_dates,
+            "collection": collection,
+            "main_business": main_business,
+            "decisions": decisions,
+            "settlement": settlement,
+            "report": report,
+        }
+        _atomic_json(root / "status.json", result)
+        return result
+    finally:
+        store.close()
+
+
 def _default_root(start: date) -> Path:
     return settings.data_dir / "research" / "serenity_pilot" / f"serenity-7d-{start:%Y%m%d}"
 
 
+def _historical_root(end: date, trading_days: int) -> Path:
+    return (
+        settings.data_dir
+        / "research"
+        / "serenity_pilot"
+        / f"serenity-historical-{trading_days}td-{end:%Y%m%d}"
+    )
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("command", choices=("init", "run-daily", "status"))
+    parser.add_argument("command", choices=("init", "run-daily", "run-historical", "status"))
     parser.add_argument("--start-date", default=date.today().isoformat())
     parser.add_argument("--as-of", default=date.today().isoformat())
+    parser.add_argument("--end-date", default=date.today().isoformat())
+    parser.add_argument("--trading-days", type=int, default=7)
     parser.add_argument("--root", type=Path)
     args = parser.parse_args(argv)
+    historical_end = date.fromisoformat(args.end_date)
     start = date.fromisoformat(args.start_date)
-    root = args.root or _default_root(start)
+    root = args.root or (
+        _historical_root(historical_end, args.trading_days)
+        if args.command == "run-historical"
+        else _default_root(start)
+    )
     with _pilot_lock(root):
         if args.command == "init":
             payload = initialize_pilot(root, settings.data_dir, start)
         elif args.command == "run-daily":
             payload = run_daily(root, settings.data_dir, date.fromisoformat(args.as_of))
+        elif args.command == "run-historical":
+            payload = run_historical(
+                root,
+                settings.data_dir,
+                end_date=historical_end,
+                trading_days=args.trading_days,
+            )
         else:
             store = PilotStore(root)
             try:

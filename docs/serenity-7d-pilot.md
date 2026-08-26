@@ -128,3 +128,18 @@ uv run python -m app.services.serenity_pilot run-daily \
 ```bash
 uv run python -m app.services.serenity_pilot status --start-date 2026-08-27
 ```
+
+### 立即回补最近 7 个已收盘交易日
+
+这条命令按本地日 K 分区识别真实交易日，不用自然日倒推；结果写入独立目录，不会与前向样本混用：
+
+```bash
+uv run python -m app.services.serenity_pilot run-historical \
+  --end-date 2026-08-26 \
+  --trading-days 7
+```
+
+历史回补属于 `RETROSPECTIVE_ENGINEERING_SAMPLE_NOT_CLEAN_ROOM`。价格与财务字段按决策日读取，
+次一交易日开盘入场并扣除 20bp 研究成本；但概念成分和个股维表只有当前快照，报告会将这两项
+标成 `UNRESOLVED_CURRENT_SNAPSHOT`。PDF/OCR 事实只用于测量数据经济性，未经人工复核不会进入
+策略评分。因此该结果可以回答“流程是否跑通、样本收益是否为正”，不能证明稳定 Alpha。
