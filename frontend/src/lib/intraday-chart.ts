@@ -3,7 +3,12 @@ import type { MinuteKlineRow } from '@/lib/api'
 export function formatMinuteTime(datetime: string): string {
   const match = datetime.match(/(\d{2}):(\d{2})/)
   if (!match) return datetime.slice(11, 16)
-  const hour = (parseInt(match[1]) + 8) % 24
+
+  // 分钟 K 的 canonical datetime 是北京时间墙钟，但旧版 TickFlow 数据由
+  // Unix timestamp 直接落成了 naive UTC。兼容这两种已存在的数据：A 股盘中
+  // 的 UTC 小时只会落在 01:30-07:00，北京时间数据则已经是 09:30-15:00。
+  const rawHour = parseInt(match[1])
+  const hour = rawHour < 8 ? rawHour + 8 : rawHour
   return `${String(hour).padStart(2, '0')}:${match[2]}`
 }
 
