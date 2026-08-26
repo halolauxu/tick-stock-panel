@@ -955,8 +955,22 @@ async def sync_minute(request: Request):
             return
         loop = asyncio.get_event_loop()
 
-        def progress(stage: str, pct: int, msg: str) -> None:
-            job_store.progress(job_id, stage, pct, msg)
+        def progress(
+            stage: str,
+            pct: int,
+            msg: str,
+            *,
+            stage_pct: int | None = None,
+            skip_log: bool = False,
+        ) -> None:
+            job_store.progress(
+                job_id,
+                stage,
+                pct,
+                msg,
+                stage_pct=stage_pct,
+                skip_log=skip_log,
+            )
 
         try:
             job_store.start(job_id)
@@ -996,15 +1010,27 @@ async def sync_minute(request: Request):
 
             def _on_chunk(done: int, total: int, seg_label: str) -> None:
                 # 进度映射: 10% (标的池解析完) → 95%, 留 5% 给写入+刷新
-                pct = 10 + int((done / max(total, 1)) * 85)
+                stage_pct = int((done / max(total, 1)) * 100)
+                pct = 10 + int(stage_pct * 0.85)
                 progress_pct[0] = max(progress_pct[0], pct)
-                progress("sync_minute", pct, f"采集分钟K… {done}/{total} 只 [{seg_label}]")
+                progress(
+                    "sync_minute",
+                    pct,
+                    kline_sync.format_minute_progress(
+                        done,
+                        total,
+                        len(universe),
+                        seg_label,
+                    ),
+                    stage_pct=stage_pct,
+                    skip_log=True,
+                )
 
             def _on_persist(done: int, total: int, trade_date: str) -> None:
                 progress(
                     "sync_minute",
                     progress_pct[0],
-                    f"逐交易日合并落盘… {done}/{total} 日 [{trade_date}]",
+                    f"当前日期分段落盘 {done}/{total} 个交易日 · {trade_date}",
                 )
 
             def _run():
@@ -1025,9 +1051,11 @@ async def sync_minute(request: Request):
             progress("done", 100, f"分钟 K 同步完成,{written} 行")
             coverage = kline_sync.minute_coverage_summary(repo.store.data_dir) or {}
             job_store.succeed(job_id, {
+                "dataset": "minute",
                 "minute_rows": written,
                 "universe_size": len(universe),
                 "requested_start": target_start_date.isoformat() if target_start_date else None,
+                "requested_end": cn_today().isoformat() if target_start_date else None,
                 "earliest_date": coverage.get("earliest_date"),
                 "latest_date": coverage.get("latest_date"),
                 "complete_days": coverage.get("complete_days"),

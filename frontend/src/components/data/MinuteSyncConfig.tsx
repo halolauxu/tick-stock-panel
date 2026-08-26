@@ -99,9 +99,10 @@ export function MinuteSyncConfig({ caps, onJobStart }: { caps: { label: string; 
               }`}
             />
           </button>
-          <span className="text-xs text-foreground font-medium">
-            自动同步{enabled ? '已开启' : '已关闭'}
-          </span>
+          <div>
+            <div className="text-xs text-foreground font-medium">盘后自动增量同步{enabled ? '已开启' : '已关闭'}</div>
+            <div className="text-[10px] text-muted mt-0.5">每次回看最近 {localDays} 个自然日，用于修复近期缺口。</div>
+          </div>
         </div>
         <div className="flex items-center gap-2">
           <div className="flex items-center">
@@ -119,7 +120,7 @@ export function MinuteSyncConfig({ caps, onJobStart }: { caps: { label: string; 
               className="h-6 w-6 flex items-center justify-center rounded-r-btn bg-elevated border border-border text-secondary hover:bg-border/50 disabled:opacity-30 transition-colors text-xs"
             >+</button>
           </div>
-          <span className="text-[10px] text-muted">天</span>
+          <span className="text-[10px] text-muted">自然日</span>
           {!hasMinuteCap && (
             <MissingCapChip capKey="kline.minute.batch" />
           )}
@@ -184,7 +185,7 @@ export function MinuteSyncConfig({ caps, onJobStart }: { caps: { label: string; 
           {fetchingMode === '40d' ? (
             <><Loader2 className="h-3.5 w-3.5 animate-spin" /><span>获取中…</span></>
           ) : (
-            <><Download className="h-3.5 w-3.5" /><span>单次获取 {localSegment} 天</span></>
+            <><Download className="h-3.5 w-3.5" /><span>向前补 {localSegment} 个交易日</span></>
           )}
         </button>
         <button
@@ -195,13 +196,13 @@ export function MinuteSyncConfig({ caps, onJobStart }: { caps: { label: string; 
           {fetchingMode === '1y' ? (
             <><Loader2 className="h-3.5 w-3.5 animate-spin" /><span>分段获取中…</span></>
           ) : (
-            <><Calendar className="h-3.5 w-3.5" /><span>获取最近 1 年</span><span className="text-[9px] opacity-70">分段拉取</span></>
+            <><Calendar className="h-3.5 w-3.5" /><span>补齐最近 1 年</span><span className="text-[9px] opacity-70">固定日期范围 · 可重复执行</span></>
           )}
         </button>
         </div>
         <div className="text-[10px] text-muted leading-relaxed">
-          补齐会从第一个不完整交易日继续；历史扩展则从本地最早日期向前叠加。{' '}
-          采集按标的分批暂存，随后逐交易日合并落盘。
+          “检查补齐”只修复已有范围内的首个缺口；“向前补”从本地最早日期继续扩展；
+          “最近 1 年”始终以今天往前一周年为固定目标，不会因重复点击继续向前叠加。
         </div>
       </div>
 

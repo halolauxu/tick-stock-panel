@@ -156,7 +156,7 @@ async def backfill_tushare_supplemental(
                     job_id,
                     stage,
                     pct,
-                    f"{label} · {done}/{total}",
+                    f"接口请求 {done}/{total} · {label}",
                     stage_pct=stage_pct,
                     skip_log=True,
                 )

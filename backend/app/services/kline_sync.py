@@ -450,6 +450,33 @@ CANONICAL_MINUTE_COLS = [
 ]
 
 
+def format_minute_progress(
+    current: int,
+    total: int,
+    universe_size: int,
+    segment_label: str,
+) -> str:
+    """把分钟 K 内部工作单元转换为用户可理解的进度文案。
+
+    Tushare 按「日期分段 x 股票」逐只请求，回调的 total 因而可能是两者
+    的乘积；它不是股票总数。其他数据源若按批次回调，则明确显示为请求批次。
+    """
+    current = max(0, int(current))
+    total = max(1, int(total))
+    universe_size = max(0, int(universe_size))
+    range_text = f" · 日期范围 {segment_label}" if segment_label else ""
+    if universe_size and total >= universe_size and total % universe_size == 0:
+        segment_total = total // universe_size
+        segment_index = min(segment_total, max(1, (max(current, 1) - 1) // universe_size + 1))
+        segment_current = current - (segment_index - 1) * universe_size
+        segment_current = max(0, min(universe_size, segment_current))
+        return (
+            f"日期分段 {segment_index}/{segment_total} · "
+            f"当前分段标的 {segment_current}/{universe_size} 只{range_text}"
+        )
+    return f"数据源请求 {current}/{total}{range_text}"
+
+
 def _normalize_minute(df_in, default_symbol: str | None = None) -> pl.DataFrame:
     """把 SDK 返回的分钟 K 数据规范成 canonical 列。"""
     if df_in is None or len(df_in) == 0:
@@ -857,7 +884,7 @@ def sync_minute_batch(
         total_steps = len(time_segments) * len(symbols)
         for seg_idx, (cur_start, cur_end) in enumerate(time_segments):
             seg_label = (
-                f"{cur_start.strftime('%m-%d')}~{cur_end.strftime('%m-%d')}"
+                f"{cur_start.strftime('%Y-%m-%d')}~{cur_end.strftime('%Y-%m-%d')}"
                 if cur_start and cur_end else "最新"
             )
             offset = seg_idx * len(symbols)
@@ -923,7 +950,7 @@ def sync_minute_batch(
     for seg_idx, (cur_start, cur_end) in enumerate(time_segments):
         # 当前的日期段描述 (供进度展示)
         if cur_start and cur_end:
-            seg_label = f"{cur_start.strftime('%m-%d')}~{cur_end.strftime('%m-%d')}"
+            seg_label = f"{cur_start.strftime('%Y-%m-%d')}~{cur_end.strftime('%Y-%m-%d')}"
         else:
             seg_label = "最新"
         seg_total = len(time_segments)

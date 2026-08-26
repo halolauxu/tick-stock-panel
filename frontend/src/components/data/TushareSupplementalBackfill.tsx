@@ -5,10 +5,10 @@ import { api } from '@/lib/api'
 import { QK } from '@/lib/queryKeys'
 
 type Dataset = 'auction' | 'irm_qa'
-const PRESETS: readonly (readonly [number, string])[] = [
-  [30, '1 个月'],
-  [90, '3 个月'],
-  [365, '1 年'],
+const PRESETS: readonly (readonly [number, 'month' | 'year', string])[] = [
+  [1, 'month', '最近 1 个月'],
+  [3, 'month', '最近 3 个月'],
+  [1, 'year', '最近 1 年'],
 ]
 
 function parseDate(value: string): Date {
@@ -26,6 +26,14 @@ function shiftDays(value: string, amount: number): string {
   const next = parseDate(value)
   next.setDate(next.getDate() + amount)
   return dateText(next)
+}
+
+function recentRange(value: number, unit: 'month' | 'year'): [string, string] {
+  const end = new Date()
+  const start = new Date(end)
+  if (unit === 'year') start.setFullYear(start.getFullYear() - value)
+  else start.setMonth(start.getMonth() - value)
+  return [dateText(start), dateText(end)]
 }
 
 function defaultRange(earliestDate: string | null, days = 30): [string, string] {
@@ -79,8 +87,8 @@ export function TushareSupplementalBackfill({
     },
   })
 
-  const applyPreset = (days: number) => {
-    const [start, end] = defaultRange(earliestDate, days)
+  const applyPreset = (value: number, unit: 'month' | 'year') => {
+    const [start, end] = recentRange(value, unit)
     setStartDate(start)
     setEndDate(end)
   }
@@ -113,20 +121,21 @@ export function TushareSupplementalBackfill({
             历史补采
           </div>
           <div className="text-[10px] text-muted mt-1 leading-relaxed">
-            {earliestDate ? <>本地最早日期为 <span className="font-mono text-secondary">{earliestDate}</span>，快捷选项会从它的前一天继续向前补。</> : '本地暂无数据，快捷选项以今天为结束日期。'}
+            {earliestDate ? <>本地当前最早数据日为 <span className="font-mono text-secondary">{earliestDate}</span>。</> : '本地暂无数据。'}
+            快捷选项始终以今天为结束日期，按固定时间范围补齐；重复执行会增量合并并去重。
           </div>
         </div>
 
         <div className="grid grid-cols-3 gap-2">
-          {PRESETS.map(([days, text]) => (
+          {PRESETS.map(([value, unit, text]) => (
             <button
-              key={days}
+              key={`${value}-${unit}`}
               type="button"
-              onClick={() => applyPreset(days)}
+              onClick={() => applyPreset(value, unit)}
               disabled={isRunning || backfill.isPending}
               className="rounded-btn border border-border bg-elevated px-2 py-1.5 text-[11px] text-secondary hover:border-accent/40 hover:text-foreground disabled:opacity-40 transition-colors"
             >
-              向前补 {text}
+              {text}
             </button>
           ))}
         </div>
@@ -158,7 +167,9 @@ export function TushareSupplementalBackfill({
         </div>
 
         <div className="rounded-btn border border-accent/20 bg-accent/5 px-3 py-2 text-[10px] text-secondary leading-relaxed">
-          共 {dayCount || 0} 个自然日，预计拆成 {estimatedRequests || 0} 个小请求。按日落盘并增量合并，重复日期会去重；不会触发分钟 K 或另一个特色数据集。
+          日期范围共 {dayCount || 0} 个自然日；预计发起 {estimatedRequests || 0} 次接口请求
+          （{dataset === 'auction' ? '每天开盘、收盘各 1 次' : '每天上证、深证各 1 次'}）。
+          按数据日期增量合并，重复记录会去重；不会触发分钟 K 或另一个特色数据集。
           {dataset === 'irm_qa' && <div className="mt-1 text-muted">上证历史自 2023-06 起，深证历史自 2010-10 起；按回复发布日期补采。</div>}
         </div>
 

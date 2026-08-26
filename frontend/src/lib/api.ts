@@ -3204,9 +3204,14 @@ export interface PipelineJob {
     minute_rows?: number
     auction_rows?: number
     irm_qa_rows?: number
-    dataset?: 'auction' | 'irm_qa'
+    dataset?: 'minute' | 'auction' | 'irm_qa'
     start_date?: string
     end_date?: string
+    requested_start?: string
+    requested_end?: string
+    earliest_date?: string
+    latest_date?: string
+    complete_days?: number
     skipped_stages?: string[]
   } | null
   error: string | null

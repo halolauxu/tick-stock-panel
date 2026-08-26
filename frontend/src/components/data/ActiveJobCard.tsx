@@ -89,8 +89,11 @@ export function ActiveJobCard({ job }: { job: PipelineJob }) {
           </div>
         </div>
         {!isDone && (
-          <div className="font-mono text-2xl font-bold tracking-tight">
-            {job.progress}<span className="text-base text-muted">%</span>
+          <div className="text-right">
+            <div className="text-[10px] text-muted">总进度</div>
+            <div className="font-mono text-2xl font-bold tracking-tight">
+              {job.progress}<span className="text-base text-muted">%</span>
+            </div>
           </div>
         )}
       </div>
@@ -106,7 +109,7 @@ export function ActiveJobCard({ job }: { job: PipelineJob }) {
           </div>
           {job.stage_pct > 0 && (
             <div className="flex items-center justify-between mt-1">
-              <span className="text-[10px] text-muted">当前阶段</span>
+              <span className="text-[10px] text-muted">当前阶段进度</span>
               <span className="text-[10px] font-mono text-secondary">{job.stage_pct}%</span>
             </div>
           )}
@@ -116,13 +119,23 @@ export function ActiveJobCard({ job }: { job: PipelineJob }) {
       <LogViewer log={job.log} />
 
       {job.status === 'succeeded' && job.result && (() => {
+        if (job.result.dataset === 'minute') {
+          return (
+            <div className="mt-3 grid grid-cols-1 md:grid-cols-4 gap-3 text-xs">
+              <Pill label="目标日期范围" value={`${job.result.requested_start ?? '增量'} ~ ${job.result.requested_end ?? '今天'}`} />
+              <Pill label="标的池" value={`${job.result.universe_size ?? 0} 只`} />
+              <Pill label="本次合并写入" value={`${(job.result.minute_rows ?? 0).toLocaleString()} 行`} />
+              <Pill label="当前完整交易日" value={`${job.result.complete_days ?? 0} 日`} />
+            </div>
+          )
+        }
         if (job.result.dataset === 'auction' || job.result.dataset === 'irm_qa') {
           const isAuction = job.result.dataset === 'auction'
           return (
             <div className="mt-3 grid grid-cols-1 md:grid-cols-3 gap-3 text-xs">
               <Pill label="数据集" value={isAuction ? '集合竞价' : '董秘问答'} />
               <Pill label="补采范围" value={`${job.result.start_date ?? '—'} ~ ${job.result.end_date ?? '—'}`} />
-              <Pill label="接口返回" value={`${isAuction ? (job.result.auction_rows ?? 0) : (job.result.irm_qa_rows ?? 0)} 行`} />
+              <Pill label="接口返回行数（含重复）" value={`${isAuction ? (job.result.auction_rows ?? 0) : (job.result.irm_qa_rows ?? 0)} 行`} />
             </div>
           )
         }

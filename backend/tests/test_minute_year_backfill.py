@@ -103,3 +103,33 @@ def test_manual_minute_sync_rejects_unrelated_active_job(monkeypatch):
 
     assert exc_info.value.status_code == 409
     assert "已有数据同步任务" in str(exc_info.value.detail)
+
+
+def test_minute_progress_explains_segment_and_symbol_denominators():
+    message = kline_sync.format_minute_progress(
+        56,
+        61_083,
+        5_553,
+        "2025-08-27~2025-09-24",
+    )
+
+    assert message == (
+        "日期分段 1/11 · 当前分段标的 56/5553 只 · "
+        "日期范围 2025-08-27~2025-09-24"
+    )
+
+    assert kline_sync.format_minute_progress(
+        5_554,
+        61_083,
+        5_553,
+        "2025-09-25~2025-10-22",
+    ).startswith("日期分段 2/11 · 当前分段标的 1/5553 只")
+
+
+def test_minute_progress_labels_non_symbol_work_as_provider_requests():
+    assert kline_sync.format_minute_progress(
+        3,
+        56,
+        5_553,
+        "2026-08-24~2026-08-27",
+    ) == "数据源请求 3/56 · 日期范围 2026-08-24~2026-08-27"

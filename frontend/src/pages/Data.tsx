@@ -37,7 +37,7 @@ import { formatScheduleDatePart, formatScheduleTimePart, isToday } from '@/lib/f
 // 拆分出的子组件
 import { StatCard, type FieldTab } from '@/components/data/StatCard'
 import { ActiveJobCard } from '@/components/data/ActiveJobCard'
-import { SectionTitle, HistoryRow } from '@/components/data/SectionTitle'
+import { SectionTitle } from '@/components/data/SectionTitle'
 import { SettingsModal } from '@/components/data/SettingsModal'
 import { ScheduleEditor } from '@/components/data/ScheduleEditor'
 import { ExtendHistoryPanel } from '@/components/data/ExtendHistoryPanel'
@@ -83,7 +83,7 @@ export function Data() {
 
   const history = useQuery({
     queryKey: QK.pipelineJobs,
-    queryFn: () => api.pipelineJobs(15),
+    queryFn: () => api.pipelineJobs(1),
     refetchInterval: activeJobId ? false : 60_000,
   })
 
@@ -391,13 +391,6 @@ export function Data() {
     }
   }, [activeJobId])
 
-  const handleJobClick = useCallback((id: string) => {
-    setActiveJobId(id)
-    requestAnimationFrame(() => {
-      topRef.current?.scrollIntoView({ behavior: 'smooth', block: 'start' })
-    })
-  }, [])
-
   // 按卡片 key 渲染对应的 StatCard (顺序由 getCardOrder 控制, 显隐由 cardVisible 控制)
   const renderStatCard = (k: CardKey): React.ReactNode => {
     switch (k) {
@@ -531,7 +524,7 @@ export function Data() {
         return (
           <StatCard
             title="分钟 K"
-            hint="全市场同步"
+            hint="全市场 · 1分钟 · 按交易日存储"
             stats={s?.minute}
             loading={isLoading}
             active={activeCard === 'minute'}
@@ -543,7 +536,8 @@ export function Data() {
             customProvider={getCustomProviderName('minute')}
             auto={minuteAuto}
             metricValue={s?.minute ? `${(s.minute as any).complete_days ?? 0} / ${s.minute.trading_days ?? 0}` : null}
-            subLabel={`完整 / 已落盘交易日 · ${(s?.minute?.rows ?? 0).toLocaleString()} 行`}
+            subLabel={`完整交易日 / 已落盘交易日 · ${(s?.minute?.rows ?? 0).toLocaleString()} 行`}
+            rangeStartLabel="最早落盘日"
             rangeEndLabel="最新完整日"
             rangeEndValue={(s?.minute as any)?.latest_complete_date}
             onShowFields={() => setSchemaTable('minute')}
@@ -555,7 +549,7 @@ export function Data() {
         return (
           <StatCard
             title="集合竞价"
-            hint="开盘 / 收盘 · 近 3 日增量"
+            hint="开盘 / 收盘 · 按竞价日期存储"
             stats={s?.auction}
             loading={isLoading}
             active={activeCard === 'auction'}
@@ -565,6 +559,8 @@ export function Data() {
             customProvider="Tushare"
             auto={supplementalAuto}
             subLabel={`行 · ${s?.auction?.symbols_covered ?? 0} 只标的 · 开/收盘`}
+            rangeStartLabel="最早竞价日期"
+            rangeEndLabel="最新竞价日期"
             onShowFields={() => setSchemaTable('auction')}
             onSettings={() => setOpenSettings('auction')}
             settingsOpen={openSettings === 'auction'}
@@ -574,7 +570,7 @@ export function Data() {
         return (
           <StatCard
             title="董秘问答"
-            hint="按回复发布日期增量"
+            hint="上证E互动 / 深证互动易 · 按回复发布日期存储"
             stats={s?.irm_qa}
             loading={isLoading}
             active={activeCard === 'irm_qa'}
@@ -584,6 +580,8 @@ export function Data() {
             customProvider="Tushare"
             auto={supplementalAuto}
             subLabel="行 · 上证E互动 · 深证互动易"
+            rangeStartLabel="最早回复发布日"
+            rangeEndLabel="最新回复发布日"
             onShowFields={() => setSchemaTable('irm_qa')}
             onSettings={() => setOpenSettings('irm_qa')}
             settingsOpen={openSettings === 'irm_qa'}
@@ -965,39 +963,6 @@ export function Data() {
                 onEdit={() => setEditingExt(ext)}
               />
             ))}
-          </div>
-        </div>
-
-        {/* 同步历史 */}
-        <div>
-          <SectionTitle icon={Clock}>同步历史</SectionTitle>
-          <div className="mt-3 rounded-card border border-border overflow-hidden">
-            {history.isLoading ? (
-              <div className="px-5 py-6 space-y-3">
-                {Array.from({ length: 3 }).map((_, i) => (
-                  <div key={i} className="flex items-center justify-between">
-                    <div className="flex items-center gap-3">
-                      <Skeleton w="w-4" h="h-4" rounded="rounded-full" />
-                      <div className="space-y-1.5">
-                        <Skeleton w="w-20" />
-                        <Skeleton w="w-28" h="h-3" />
-                      </div>
-                    </div>
-                    <Skeleton w="w-32" />
-                  </div>
-                ))}
-              </div>
-            ) : history.data && history.data.jobs.length > 0 ? (
-              <div className="divide-y divide-border">
-                {history.data.jobs.map((j) => (
-                  <HistoryRow key={j.id} job={j} onClick={() => handleJobClick(j.id)} />
-                ))}
-              </div>
-            ) : (
-              <div className="px-5 py-8 text-center text-sm text-muted">
-                暂无同步记录 — 点右上角"立即同步"开始。
-              </div>
-            )}
           </div>
         </div>
 
