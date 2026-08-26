@@ -157,6 +157,7 @@ class StrategyDataContext:
     history: pl.DataFrame | None = None
     market: Any | None = None
     cache_key: str | None = None
+    data_dir: Path | None = None
 
 
 @dataclass(frozen=True)
@@ -756,6 +757,8 @@ class StrategyEngine:
         if not matrix_ids:
             return None
 
+        matrix_columns, fundamental_columns = self._split_fundamental_fields(field_columns)
+
         timestamp_col = "datetime" if "datetime" in current.columns else "date"
         if timestamp_col not in current.columns:
             raise ValueError("realtime matrix current data requires date or datetime")
@@ -776,7 +779,11 @@ class StrategyEngine:
             if entry is not None and entry.fingerprint == fingerprint:
                 try:
                     entry.buffer.update(current)
-                    return entry.buffer.snapshot()
+                    return self._attach_matrix_fundamentals(
+                        entry.buffer.snapshot(),
+                        context.data_dir,
+                        fundamental_columns,
+                    )
                 except ValueError as exc:
                     logger.info("realtime matrix %s invalidated: %s", cache_key, exc)
 
@@ -793,14 +800,18 @@ class StrategyEngine:
             previous_builds = entry.buffer.build_count if entry is not None else 0
             buffer = RealtimeMarketDataMatrix(
                 panel,
-                field_columns=field_columns,
+                field_columns=matrix_columns,
                 build_count=previous_builds + 1,
             )
             self._realtime_matrices[cache_key] = _RealtimeMatrixEntry(
                 fingerprint=fingerprint,
                 buffer=buffer,
             )
-            return buffer.snapshot()
+            return self._attach_matrix_fundamentals(
+                buffer.snapshot(),
+                context.data_dir,
+                fundamental_columns,
+            )
 
     def realtime_matrix_stats(self, cache_key: str) -> dict[str, int]:
         with self._realtime_matrix_lock:
@@ -1065,9 +1076,17 @@ class StrategyEngine:
                         params_map.get(sid),
                     )
                 )
+            matrix_columns, fundamental_columns = self._split_fundamental_fields(
+                field_columns
+            )
             shared_matrix = build_market_data_matrix(
                 shared_history,
-                field_columns=field_columns,
+                field_columns=matrix_columns,
+            )
+            shared_matrix = self._attach_matrix_fundamentals(
+                shared_matrix,
+                context.data_dir,
+                fundamental_columns,
             )
 
         results: dict[str, StrategyResult] = {}
@@ -1129,6 +1148,23 @@ class StrategyEngine:
             fields.add(str(order_by))
         return fields
 
+    @staticmethod
+    def _split_fundamental_fields(fields: set[str]) -> tuple[set[str], set[str]]:
+        """Separate point-in-time financial factors from stored market columns."""
+        from app.backtest.fundamentals import FUNDAMENTAL_FACTOR_NAMES
+
+        fundamental = set(fields) & set(FUNDAMENTAL_FACTOR_NAMES)
+        return set(fields) - fundamental, fundamental
+
+    @staticmethod
+    def _attach_matrix_fundamentals(market, data_dir: Path | None, fields: set[str]):
+        """Attach requested financial factors without filling missing values with zero."""
+        if not fields:
+            return market
+        from app.backtest.fundamentals import attach_matrix_fundamental_fields
+
+        return attach_matrix_fundamental_fields(market, data_dir, sorted(fields))
+
     def _run_matrix_strategy(
         self,
         strategy_id: str,
@@ -1149,6 +1185,10 @@ class StrategyEngine:
 
         source_panel = context.history
         market = context.market
+        requested_columns = self._matrix_field_columns(strategy, overrides, params)
+        matrix_columns, fundamental_columns = self._split_fundamental_fields(
+            requested_columns
+        )
         if market is None:
             if source_panel is None:
                 raise ValueError(f"matrix strategy {strategy_id} requires history data")
@@ -1156,8 +1196,14 @@ class StrategyEngine:
                 return StrategyResult(as_of=as_of, strategy_id=strategy_id)
             market = build_market_data_matrix(
                 source_panel,
-                field_columns=self._matrix_field_columns(strategy, overrides, params),
+                field_columns=matrix_columns,
             )
+        missing_fundamentals = fundamental_columns - set(market.fields)
+        market = self._attach_matrix_fundamentals(
+            market,
+            context.data_dir,
+            missing_fundamentals,
+        )
 
         if source_panel is None or source_panel.is_empty():
             source_panel = context.current

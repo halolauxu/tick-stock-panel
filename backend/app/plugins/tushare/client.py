@@ -44,6 +44,17 @@ IRM_QA_FIELDS: dict[str, tuple[str, ...]] = {
     "sz": ("ts_code", "name", "trade_date", "q", "a", "pub_time", "industry"),
 }
 
+MAIN_BUSINESS_FIELDS = (
+    "ts_code",
+    "end_date",
+    "bz_item",
+    "bz_sales",
+    "bz_profit",
+    "bz_cost",
+    "curr_type",
+    "update_flag",
+)
+
 FINANCIAL_FIELDS: dict[str, tuple[str, ...]] = {
     "metrics": (
         "ts_code", "ann_date", "end_date", "update_flag",
@@ -207,6 +218,17 @@ class TushareClient:
         except KeyError as exc:
             raise TushareError(f"Tushare 不支持财务表: {table}") from exc
         return self.query(api_name, {"ts_code": symbol}, fields)
+
+    def main_business_records(self, symbol: str, *, kind: str = "P") -> list[dict]:
+        """Fetch product/region/industry main-business composition for one stock."""
+        normalized = kind.strip().upper()
+        if normalized not in {"P", "D", "I"}:
+            raise TushareError(f"Tushare 主营构成 type 不支持: {kind}")
+        return self.query(
+            "fina_mainbz",
+            {"ts_code": symbol, "type": normalized},
+            MAIN_BUSINESS_FIELDS,
+        )
 
     def auction_records(self, session: str, trade_date: date) -> list[dict]:
         """Fetch one market-wide opening or closing auction snapshot."""

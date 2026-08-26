@@ -402,6 +402,7 @@ class ScreenerService:
             history=history,
             market=market,
             cache_key=cache_key,
+            data_dir=self.repo.store.data_dir,
         )
 
     def latest_date(self) -> date | None:

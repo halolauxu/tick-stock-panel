@@ -276,6 +276,21 @@ def test_client_posts_standard_financial_contract(monkeypatch):
     assert body["fields"] == ",".join(tc.FINANCIAL_FIELDS["metrics"])
 
 
+def test_client_posts_main_business_contract(monkeypatch):
+    fake = _patch_http(
+        monkeypatch,
+        {"code": 0, "data": {"fields": [], "items": []}},
+    )
+    client = TushareClient("secret-token", min_interval_s=0)
+
+    client.main_business_records("600000.SH", kind="P")
+
+    body = fake.calls[0][1]
+    assert body["api_name"] == "fina_mainbz"
+    assert body["params"] == {"ts_code": "600000.SH", "type": "P"}
+    assert body["fields"] == ",".join(tc.MAIN_BUSINESS_FIELDS)
+
+
 def test_client_posts_auction_and_irm_qa_contracts(monkeypatch):
     fake = _patch_http(
         monkeypatch,

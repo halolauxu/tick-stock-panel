@@ -76,9 +76,11 @@ WORKDIR /app
 # bookworm 自带 nodejs 18.19, 满足插件 engines>=18; --no-install-recommends 精简,
 # 自带 libnode/libc-ares 等全部动态依赖, 无需手动补库。
 # 国内构建走 apt mirror 已在 debian 镜像sources.list 配好, 无需额外换源。
-# tesseract-ocr: 自选截图导入（始终安装）; nodejs: 仅 INCLUDE_STOCKSDK=1 时安装
+# tesseract-ocr: 自选截图导入；chi-sim: 研究小样本的中文公告 OCR；
+# nodejs: 仅 INCLUDE_STOCKSDK=1 时安装。
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends tesseract-ocr tesseract-ocr-eng \
+    && apt-get install -y --no-install-recommends \
+         tesseract-ocr tesseract-ocr-eng tesseract-ocr-chi-sim \
     && if [ "$INCLUDE_STOCKSDK" = "1" ]; then \
          apt-get install -y --no-install-recommends nodejs \
          && node --version; \

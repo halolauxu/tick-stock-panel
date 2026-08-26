@@ -38,6 +38,7 @@ dependencies = [
     # Watchlist screenshot OCR (Tesseract)
     "pytesseract>=0.3.10",
     "Pillow>=10.0",
+    "pymupdf>=1.24",             # PDF 原文抽取 + 低文本页按需渲染 OCR
 ]
 
 [project.optional-dependencies]
