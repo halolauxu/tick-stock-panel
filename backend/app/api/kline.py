@@ -921,7 +921,6 @@ async def sync_minute(request: Request):
     from app.services.pipeline_jobs import JobCancelledError, job_store, release_run_slot, try_acquire_run_slot
     from app.api.data import invalidate_storage_cache
     from app.services.preferences import get_minute_sync_days
-    from app.tickflow.capabilities import Cap
     from app.tickflow.pools import get_pool
 
     repo = request.app.state.repo
@@ -930,8 +929,9 @@ async def sync_minute(request: Request):
     if not _minute_allowed(capset):
         raise HTTPException(status_code=403, detail="需要 Pro+ 权限")
 
-    # 可选 body: { "days": int, "extend": bool }
+    # 可选 body: { "days": int, "extend": bool, "recent_year": bool }
     # days: 拉取天数; extend: 向前扩展模式 (从最早数据往前补)
+    # recent_year: 精确补齐最近一个自然年的交易日,重复执行不会继续向前叠加。
     body = {}
     try:
         body = await request.json()
@@ -939,11 +939,15 @@ async def sync_minute(request: Request):
         pass
     override_days = body.get("days")
     extend_flag = body.get("extend")
+    recent_year = body.get("recent_year") is True
 
     # 分钟K全市场同步是长任务(数据量是日K的 ~240 倍),用更宽松的卡死阈值
     job_id, is_new = job_store.create(long_running=True)
     if not is_new:
-        return {"status": "reused", "job_id": job_id}
+        raise HTTPException(
+            status_code=409,
+            detail="已有数据同步任务正在运行,请等待完成或取消后再启动分钟K同步",
+        )
 
     async def task() -> None:
         if not try_acquire_run_slot(job_id):
@@ -973,8 +977,21 @@ async def sync_minute(request: Request):
             progress("sync_minute", 10, f"标的池 {len(universe)} 只")
 
             days = override_days if override_days else get_minute_sync_days()
+            target_start_date = None
+            if recent_year:
+                today = cn_today()
+                try:
+                    target_start_date = today.replace(year=today.year - 1)
+                except ValueError:
+                    # 2 月 29 日回退到上一年的 2 月 28 日。
+                    target_start_date = today.replace(year=today.year - 1, day=28)
+                progress(
+                    "sync_minute",
+                    10,
+                    f"补齐最近1年分钟K [{target_start_date} ~ {today}]…",
+                )
             # extend=1 → 向前扩展; days>=365 也自动向前扩展
-            extend_backward = bool(extend_flag) or days >= 365
+            extend_backward = not recent_year and (bool(extend_flag) or days >= 365)
             progress_pct = [10]
 
             def _on_chunk(done: int, total: int, seg_label: str) -> None:
@@ -994,6 +1011,7 @@ async def sync_minute(request: Request):
                 return kline_sync.sync_and_persist_minute(
                     universe, repo, capset, days=days,
                     extend_backward=extend_backward,
+                    target_start_date=target_start_date,
                     on_chunk_done=_on_chunk,
                     on_persist_done=_on_persist,
                 )
@@ -1005,7 +1023,15 @@ async def sync_minute(request: Request):
             _refresh_single_view(repo, "kline_minute")
 
             progress("done", 100, f"分钟 K 同步完成,{written} 行")
-            job_store.succeed(job_id, {"minute_rows": written, "universe_size": len(universe)})
+            coverage = kline_sync.minute_coverage_summary(repo.store.data_dir) or {}
+            job_store.succeed(job_id, {
+                "minute_rows": written,
+                "universe_size": len(universe),
+                "requested_start": target_start_date.isoformat() if target_start_date else None,
+                "earliest_date": coverage.get("earliest_date"),
+                "latest_date": coverage.get("latest_date"),
+                "complete_days": coverage.get("complete_days"),
+            })
             invalidate_storage_cache()
         except JobCancelledError:
             # 已由 terminate() 标记失败, 拉取线程在分块回调处自行退出

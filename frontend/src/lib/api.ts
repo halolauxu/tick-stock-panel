@@ -2078,10 +2078,14 @@ export const api = {
       `/api/kline/sync?symbol=${encodeURIComponent(symbol)}&days=${days}`,
       { method: 'POST' },
     ),
-  syncMinute: (days?: number, extend?: boolean) =>
+  syncMinute: (days?: number, extend?: boolean, recentYear?: boolean) =>
     request<{ status: string; job_id: string }>('/api/kline/sync_minute', {
       method: 'POST',
-      body: JSON.stringify({ ...(days ? { days } : {}), ...(extend ? { extend: true } : {}) }),
+      body: JSON.stringify({
+        ...(days ? { days } : {}),
+        ...(extend ? { extend: true } : {}),
+        ...(recentYear ? { recent_year: true } : {}),
+      }),
     }),
   syncMinuteSingle: (symbol: string, days?: number) =>
     request<{ status: string; symbol: string; rows: number }>('/api/kline/sync_minute_single', {

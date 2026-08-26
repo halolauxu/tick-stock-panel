@@ -1158,6 +1158,64 @@ def _earliest_minute_datetime(repo: KlineRepository) -> datetime | None:
     return None
 
 
+def _minute_missing_window(
+    repo: KlineRepository,
+    target_start: date,
+    target_end: date,
+) -> tuple[datetime, datetime] | None:
+    """返回目标区间内仍需获取的最小连续范围。
+
+    “最近一年”是固定目标区间,不是从当前最早分区继续向前叠加一年。
+    日 K 交易日作为期望日历,分钟 K sidecar 的 complete 作为完成证据。
+    返回 None 表示目标区间内所有预期交易日均已完整。
+    """
+    try:
+        rows = repo.execute_all(
+            """SELECT DISTINCT date
+               FROM kline_daily
+               WHERE date BETWEEN ? AND ?
+               ORDER BY date""",
+            [target_start.isoformat(), target_end.isoformat()],
+        )
+        expected_dates: set[date] = set()
+        for row in rows:
+            if not row or row[0] is None:
+                continue
+            value = row[0]
+            if isinstance(value, datetime):
+                expected_dates.add(value.date())
+            elif isinstance(value, date):
+                expected_dates.add(value)
+            else:
+                expected_dates.add(date.fromisoformat(str(value)))
+    except Exception as exc:
+        logger.warning("minute target-window calendar lookup failed: %s", exc)
+        expected_dates = set()
+
+    summary = minute_coverage_summary(repo.store.data_dir)
+    complete_dates = {
+        date.fromisoformat(str(record["date"]))
+        for record in (summary or {}).get("dates", [])
+        if record.get("complete") and record.get("date")
+    }
+
+    if expected_dates:
+        missing_dates = sorted(expected_dates - complete_dates)
+        if not missing_dates:
+            return None
+        range_start = missing_dates[0]
+        range_end = missing_dates[-1] + timedelta(days=1)
+    else:
+        # 日 K 日历不可用时仍执行完整目标区间,不能误报“一年已齐”。
+        range_start = target_start
+        range_end = target_end + timedelta(days=1)
+
+    return (
+        datetime.combine(range_start, datetime.min.time()),
+        datetime.combine(range_end, datetime.min.time()),
+    )
+
+
 def _cleanup_null_datetime_minute(repo: KlineRepository) -> None:
     """检测并清除 datetime 全为 null 的旧版分钟 K 数据(迁移用)。"""
     minute_dir = repo.store.data_dir / "kline_minute"
@@ -1247,6 +1305,7 @@ def sync_and_persist_minute(
     on_persist_done: Callable[[int, int, str], None] | None = None,
     extend_backward: bool = False,
     force_full_days: bool = False,
+    target_start_date: date | None = None,
 ) -> int:
     """同步分钟 K 并存到 Parquet(前复权价格, SDK 端 adjust=qfq)。返回写入行数。
 
@@ -1277,7 +1336,18 @@ def sync_and_persist_minute(
 
     now = datetime.now()
 
-    if extend_backward:
+    if target_start_date is not None:
+        target_end_date = cn_today()
+        target_window = _minute_missing_window(repo, target_start_date, target_end_date)
+        if target_window is None:
+            logger.info(
+                "minute K target window already complete: %s ~ %s",
+                target_start_date,
+                target_end_date,
+            )
+            return 0
+        start_time, end_time = target_window
+    elif extend_backward:
         # 向前扩展模式: 从本地最早数据往前补, 叠加已有数据避免缺口。
         earliest_dt = _earliest_minute_datetime(repo)
         # 按交易日换算自然日 (7/5 系数)。>41 交易日时 +10 天余量覆盖节假日。

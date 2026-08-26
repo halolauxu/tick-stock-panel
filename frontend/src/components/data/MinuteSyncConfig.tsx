@@ -71,10 +71,11 @@ export function MinuteSyncConfig({ caps, onJobStart }: { caps: { label: string; 
 
   const handleFetch = (mode: '40d' | '1y') => {
     if (!hasMinuteCap) return
-    // 单次获取 = 按「分段大小」拉一段 (向前扩展); 1年 = 拉365天按分段切多段
-    const fetchDays = mode === '40d' ? localSegment : 365
+    // 单次获取 = 按「分段大小」向前扩展一段；1年 = 补齐固定自然年目标区间。
+    // 后者是幂等操作，重复点击不会从当前最早日期继续叠加一年。
+    const fetchDays = mode === '40d' ? localSegment : undefined
     setFetchingMode(mode)
-    api.syncMinute(fetchDays, true).then((res) => {
+    api.syncMinute(fetchDays, mode === '40d', mode === '1y').then((res) => {
       startJob(res)
     }).finally(() => setFetchingMode(''))
   }
