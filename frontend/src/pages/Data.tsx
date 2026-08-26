@@ -200,7 +200,10 @@ export function Data() {
           : activeProvider
     if (selectedProvider === 'tickflow') return null
     const ds = TIERKEY_TO_DATASET[tierKey]
-    const source = dataSources.data?.custom?.find(s => s.name === selectedProvider)
+    const source = [
+      ...(dataSources.data?.plugins || []),
+      ...(dataSources.data?.custom || []),
+    ].find(s => s.name === selectedProvider)
     if (ds && source?.datasets?.includes(ds)) return source.display_name || selectedProvider
     return null
   }
