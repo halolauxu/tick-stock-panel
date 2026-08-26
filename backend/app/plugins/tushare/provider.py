@@ -12,6 +12,7 @@ boundary conversion.  ``trade_time`` is a Beijing wall-clock string and is
 stored as a naive ``Datetime('us')``, matching the existing minute repository
 contract.
 """
+
 from __future__ import annotations
 
 import contextlib
@@ -33,34 +34,76 @@ API_KEY_ENV = "TUSHARE_TOKEN"
 SECRETS_FIELD = "tushare_api_key"
 _DATASETS = ("minute", "financial")
 _MINUTE_CANONICAL = [
-    "symbol", "datetime", "open", "high", "low", "close", "volume", "amount",
+    "symbol",
+    "datetime",
+    "open",
+    "high",
+    "low",
+    "close",
+    "volume",
+    "amount",
 ]
 _FINANCIAL_NUMERIC_FIELDS: dict[str, tuple[str, ...]] = {
     "metrics": (
-        "eps_basic", "eps_diluted", "bps", "ocfps", "roe", "roe_diluted",
-        "roa", "gross_margin", "net_margin", "debt_to_asset_ratio",
-        "revenue_yoy", "net_income_yoy", "operating_cash_to_revenue",
+        "eps_basic",
+        "eps_diluted",
+        "bps",
+        "ocfps",
+        "roe",
+        "roe_diluted",
+        "roa",
+        "gross_margin",
+        "net_margin",
+        "debt_to_asset_ratio",
+        "revenue_yoy",
+        "net_income_yoy",
+        "operating_cash_to_revenue",
         "inventory_turnover",
     ),
     "income": (
-        "revenue", "operating_cost", "operating_profit", "selling_expense",
-        "admin_expense", "rd_expense", "financial_expense",
-        "non_operating_income", "non_operating_expense", "total_profit",
-        "income_tax", "net_income", "net_income_attributable", "basic_eps",
+        "revenue",
+        "operating_cost",
+        "operating_profit",
+        "selling_expense",
+        "admin_expense",
+        "rd_expense",
+        "financial_expense",
+        "non_operating_income",
+        "non_operating_expense",
+        "total_profit",
+        "income_tax",
+        "net_income",
+        "net_income_attributable",
+        "basic_eps",
         "diluted_eps",
     ),
     "balance_sheet": (
-        "total_assets", "total_current_assets", "total_non_current_assets",
-        "cash_and_equivalents", "accounts_receivable", "inventory",
-        "fixed_assets", "intangible_assets", "goodwill", "total_liabilities",
-        "total_current_liabilities", "total_non_current_liabilities",
-        "short_term_borrowing", "long_term_borrowing", "accounts_payable",
-        "total_equity", "equity_attributable", "retained_earnings",
+        "total_assets",
+        "total_current_assets",
+        "total_non_current_assets",
+        "cash_and_equivalents",
+        "accounts_receivable",
+        "inventory",
+        "fixed_assets",
+        "intangible_assets",
+        "goodwill",
+        "total_liabilities",
+        "total_current_liabilities",
+        "total_non_current_liabilities",
+        "short_term_borrowing",
+        "long_term_borrowing",
+        "accounts_payable",
+        "total_equity",
+        "equity_attributable",
+        "retained_earnings",
         "minority_interest",
     ),
     "cash_flow": (
-        "net_operating_cash_flow", "net_investing_cash_flow",
-        "net_financing_cash_flow", "capex", "net_cash_change",
+        "net_operating_cash_flow",
+        "net_investing_cash_flow",
+        "net_financing_cash_flow",
+        "capex",
+        "net_cash_change",
     ),
     "shares": ("total_shares", "float_shares"),
 }
@@ -83,7 +126,10 @@ def probe_api_key(api_key: str) -> tuple[bool, str]:
         client = TushareClient(api_key, timeout=15.0, min_interval_s=0)
         rows = client.stock_minutes("600000.SH", freq="1min")
         if not rows:
-            return False, "Token 可访问 Tushare, 但 stk_mins 未返回数据; 请确认已开通 A股历史分钟权限"
+            return (
+                False,
+                "Token 可访问 Tushare, 但 stk_mins 未返回数据; 请确认已开通 A股历史分钟权限",
+            )
         rows = client.financial_records("metrics", "600000.SH")
         if not rows:
             return False, "Token 可访问 Tushare, 但 fina_indicator 未返回数据; 请确认财务接口权限"
@@ -175,15 +221,21 @@ class TushareProvider:
 
         if not frames:
             return pl.DataFrame()
-        return pl.concat(frames, how="diagonal_relaxed").unique(
-            subset=["symbol", "datetime"], keep="last",
-        ).sort(["symbol", "datetime"])
+        return (
+            pl.concat(frames, how="diagonal_relaxed")
+            .unique(
+                subset=["symbol", "datetime"],
+                keep="last",
+            )
+            .sort(["symbol", "datetime"])
+        )
 
     def get_financials(
         self,
         table: str,
         symbols: list[str],
         latest_only: bool = True,
+        on_progress: Callable[[int, int, int, int], None] | None = None,
     ) -> pl.DataFrame:
         """Fetch and normalize one of the panel's five canonical financial tables.
 
@@ -199,6 +251,7 @@ class TushareProvider:
 
         frames: list[pl.DataFrame] = []
         failures = 0
+        row_count = 0
         total = len(symbols)
         for index, symbol in enumerate(symbols, start=1):
             try:
@@ -221,19 +274,23 @@ class TushareProvider:
             frame = self._financial_df(table, rows, latest_only=latest_only)
             if not frame.is_empty():
                 frames.append(frame)
+                row_count += frame.height
+            if on_progress is not None:
+                on_progress(index, total, row_count, failures)
             if index % 100 == 0 or index == total:
                 logger.info(
                     "tushare financial progress: table=%s symbols=%d/%d rows=%d failures=%d",
                     table,
                     index,
                     total,
-                    sum(frame.height for frame in frames),
+                    row_count,
                     failures,
                 )
         if not frames:
             return pl.DataFrame()
         return pl.concat(frames, how="diagonal_relaxed").sort(
-            ["symbol", "period_end"], descending=[False, True],
+            ["symbol", "period_end"],
+            descending=[False, True],
         )
 
     @staticmethod
@@ -324,22 +381,34 @@ class TushareProvider:
         if missing:
             raise TushareError(f"stk_mins 响应缺少字段: {', '.join(missing)}")
 
-        frame = frame.rename({
-            "ts_code": "symbol",
-            "trade_time": "datetime",
-            "vol": "volume",
-        }).with_columns(
-            pl.col("symbol").cast(pl.Utf8),
-            pl.col("datetime").cast(pl.Utf8).str.to_datetime(
-                "%Y-%m-%d %H:%M:%S", strict=False, time_unit="us",
-            ),
-            *[
-                pl.col(column).cast(pl.Float64, strict=False)
-                for column in ("open", "high", "low", "close", "volume", "amount")
-            ],
-        ).with_columns(
-            (pl.col("volume") / 100).alias("volume"),
-        ).select(_MINUTE_CANONICAL).drop_nulls(_MINUTE_CANONICAL)
+        frame = (
+            frame.rename(
+                {
+                    "ts_code": "symbol",
+                    "trade_time": "datetime",
+                    "vol": "volume",
+                }
+            )
+            .with_columns(
+                pl.col("symbol").cast(pl.Utf8),
+                pl.col("datetime")
+                .cast(pl.Utf8)
+                .str.to_datetime(
+                    "%Y-%m-%d %H:%M:%S",
+                    strict=False,
+                    time_unit="us",
+                ),
+                *[
+                    pl.col(column).cast(pl.Float64, strict=False)
+                    for column in ("open", "high", "low", "close", "volume", "amount")
+                ],
+            )
+            .with_columns(
+                (pl.col("volume") / 100).alias("volume"),
+            )
+            .select(_MINUTE_CANONICAL)
+            .drop_nulls(_MINUTE_CANONICAL)
+        )
         return frame
 
     def test_dataset(self, dataset: str, symbols: list[str] | None = None) -> dict:

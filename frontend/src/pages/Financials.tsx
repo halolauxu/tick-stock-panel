@@ -52,6 +52,14 @@ export function Financials() {
   const currentTableIndex = currentSyncingTable
     ? TABLE_ORDER.indexOf(currentSyncingTable as (typeof TABLE_ORDER)[number])
     : -1
+  const syncProgress = status?.sync_progress ?? null
+  const hasNumericProgress = !!syncProgress && syncProgress.symbols_total > 0
+  const progressPercent = hasNumericProgress
+    ? Math.min(100, (syncProgress.symbols_done / syncProgress.symbols_total) * 100)
+    : 0
+  const progressLabel = hasNumericProgress
+    ? `${syncProgress.symbols_done.toLocaleString()}/${syncProgress.symbols_total.toLocaleString()} 只 · ${progressPercent.toFixed(1)}%`
+    : '正在初始化任务…'
   // 选中的个股(模糊搜索结果);null 时显示搜索引导
   const [selected, setSelected] = useState<{ symbol: string; name: string } | null>(null)
   const { last: lastStock, remember: rememberStock } = useLastStock('financials')
@@ -149,7 +157,7 @@ export function Financials() {
                 {isFullSync
                   ? `全部更新 ${Math.max(currentTableIndex + 1, 1)}/${TABLE_ORDER.length}：${TABLE_LABELS[currentSyncingTable ?? ''] ?? '准备中'}…`
                   : isSingleSync
-                    ? `只更新${TABLE_LABELS[currentSyncingTable ?? ''] ?? '当前表'}…`
+                    ? `只更新${TABLE_LABELS[currentSyncingTable ?? ''] ?? '当前表'} · ${progressLabel}`
                     : '同步中…'}
               </span>
             )}
@@ -170,13 +178,34 @@ export function Financials() {
 
       <div className="px-3 sm:px-8 py-6 space-y-6 max-w-7xl">
         {syncing && (
-          <div className="flex items-center gap-2 rounded-card border border-accent/30 bg-accent/[0.06] px-3 py-2 text-xs text-accent">
-            <Loader2 className="h-3.5 w-3.5 animate-spin shrink-0" />
-            {isFullSync
-              ? `正在依次更新全部财务表，当前处理${TABLE_LABELS[currentSyncingTable ?? ''] ?? '财务数据'}。`
-              : currentSyncingTable
-                ? `正在单独更新${TABLE_LABELS[currentSyncingTable] ?? currentSyncingTable}；已有标的增量更新，新标的补齐历史，其他表不会重复下载。`
-                : '财务数据更新任务正在运行；完成后行数会自动刷新。'}
+          <div className="rounded-card border border-accent/30 bg-accent/[0.06] px-3 py-2.5 text-xs text-accent">
+            <div className="flex items-center gap-2">
+              <Loader2 className="h-3.5 w-3.5 animate-spin shrink-0" />
+              <span className="font-medium">
+                {isFullSync
+                  ? `全部同步：当前正在更新${TABLE_LABELS[currentSyncingTable ?? ''] ?? '财务数据'}`
+                  : currentSyncingTable
+                    ? `仅更新：${TABLE_LABELS[currentSyncingTable] ?? currentSyncingTable}`
+                    : '财务数据更新任务正在运行'}
+              </span>
+              <span className="ml-auto tabular-nums text-accent/90">{progressLabel}</span>
+            </div>
+            {hasNumericProgress && (
+              <div className="mt-2 h-1.5 overflow-hidden rounded-full bg-accent/10">
+                <div
+                  className="h-full rounded-full bg-accent transition-[width] duration-300"
+                  style={{ width: `${progressPercent}%` }}
+                />
+              </div>
+            )}
+            <div className="mt-1.5 flex items-center gap-3 text-[10px] text-secondary">
+              <span>已有标的增量更新，新标的补齐历史；其他表不会重复下载</span>
+              {hasNumericProgress && (
+                <span className="ml-auto tabular-nums">
+                  本次已获取 {syncProgress.rows_received.toLocaleString()} 行 · 失败 {syncProgress.failures.toLocaleString()}
+                </span>
+              )}
+            </div>
           </div>
         )}
 
@@ -190,7 +219,7 @@ export function Financials() {
                 const hasData = (info?.rows ?? 0) > 0
                 // 本次同步三态: 完成 / 同步中 / 等待 (仅全量同步时未轮到的表才"等待")
                 const doneThisRound = tableDoneThisRound(key)
-                const isThisSyncing = currentSyncingTable === key
+                const isThisSyncing = syncing && currentSyncingTable === key
                 const isWaiting = isWaitingTable(key)
                 const lsTime = lastSync[key]
                 return (
@@ -241,6 +270,22 @@ export function Financials() {
                     <div className="text-[11px] text-muted mt-0.5">
                       {fmtBigNum(info?.symbols ?? 0)} 只标的
                     </div>
+                    {isThisSyncing && (
+                      <div className="mt-2 rounded-btn bg-accent/[0.07] px-2 py-1.5">
+                        <div className="flex items-center justify-between text-[10px] tabular-nums text-accent">
+                          <span>{progressLabel}</span>
+                          {hasNumericProgress && <span>{syncProgress.rows_received.toLocaleString()} 行</span>}
+                        </div>
+                        {hasNumericProgress && (
+                          <div className="mt-1 h-1 overflow-hidden rounded-full bg-accent/10">
+                            <div
+                              className="h-full rounded-full bg-accent transition-[width] duration-300"
+                              style={{ width: `${progressPercent}%` }}
+                            />
+                          </div>
+                        )}
+                      </div>
+                    )}
                     <div className="mt-auto pt-2 border-t border-border/40 text-[10px] text-muted flex items-center gap-1">
                       <Clock className="h-2.5 w-2.5 shrink-0" />
                       {isThisSyncing

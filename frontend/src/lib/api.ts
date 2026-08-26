@@ -65,6 +65,13 @@ export interface FinancialStatus {
   sync_scope?: 'single' | 'all' | null
   /** 服务端当前真正处理的表；全量同步时会随进度切换 */
   syncing_table?: string | null
+  /** 当前表的实时拉取进度；rows_received 是本次已获取、尚未合并落盘的行数 */
+  sync_progress?: {
+    symbols_done: number
+    symbols_total: number
+    rows_received: number
+    failures: number
+  } | null
 }
 
 export interface FinancialMetricRecord {

@@ -29,6 +29,7 @@ def test_single_table_trigger_exposes_and_clears_active_table(tmp_path, monkeypa
 
     def fake_run_body(table):
         assert table == "income"
+        scheduler._progress_callback(table)(75, 100, 3210, 2)
         entered.set()
         assert release.wait(1)
         return {"income": 12}
@@ -41,6 +42,12 @@ def test_single_table_trigger_exposes_and_clears_active_table(tmp_path, monkeypa
         "syncing": True,
         "sync_scope": "single",
         "syncing_table": "income",
+        "sync_progress": {
+            "symbols_done": 75,
+            "symbols_total": 100,
+            "rows_received": 3210,
+            "failures": 2,
+        },
     }
 
     release.set()
@@ -49,6 +56,7 @@ def test_single_table_trigger_exposes_and_clears_active_table(tmp_path, monkeypa
         "syncing": False,
         "sync_scope": None,
         "syncing_table": None,
+        "sync_progress": None,
     }
 
 
@@ -62,7 +70,9 @@ def test_full_sync_reports_each_active_table(tmp_path, monkeypatch):
     monkeypatch.setattr(
         financial_sync,
         "_sync_history_table_for_symbols",
-        lambda table, *_args: observed.append(scheduler.sync_state["syncing_table"]) or 0,
+        lambda table, *_args, **_kwargs: (
+            observed.append(scheduler.sync_state["syncing_table"]) or 0
+        ),
     )
     monkeypatch.setattr(financial_sync, "_refresh_financials_views", lambda _data_dir: None)
     monkeypatch.setattr(scheduler, "_record_sync", lambda _table: None)
@@ -86,6 +96,12 @@ def test_status_returns_server_sync_scope_and_active_table(tmp_path, monkeypatch
             "syncing": True,
             "sync_scope": "single",
             "syncing_table": "balance_sheet",
+            "sync_progress": {
+                "symbols_done": 1200,
+                "symbols_total": 5550,
+                "rows_received": 55200,
+                "failures": 0,
+            },
         },
     )
     request = SimpleNamespace(
@@ -103,3 +119,9 @@ def test_status_returns_server_sync_scope_and_active_table(tmp_path, monkeypatch
     assert result["syncing"] is True
     assert result["sync_scope"] == "single"
     assert result["syncing_table"] == "balance_sheet"
+    assert result["sync_progress"] == {
+        "symbols_done": 1200,
+        "symbols_total": 5550,
+        "rows_received": 55200,
+        "failures": 0,
+    }

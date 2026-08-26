@@ -69,6 +69,7 @@ def financial_status(request: Request):
             "syncing": False,
             "sync_scope": None,
             "syncing_table": None,
+            "sync_progress": None,
         }
     )
 

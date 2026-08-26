@@ -1,4 +1,5 @@
 """Tushare stk_mins plugin contract tests (no real token or network required)."""
+
 from __future__ import annotations
 
 from datetime import date, datetime, timedelta
@@ -61,7 +62,9 @@ def _patch_http(monkeypatch, payload: dict) -> _HTTP:
 
 def test_client_posts_stk_mins_contract_and_transposes_rows(monkeypatch):
     fields = list(tc.MINUTE_FIELDS)
-    fake = _patch_http(monkeypatch, {"code": 0, "msg": None, "data": {"fields": fields, "items": _sample_items()}})
+    fake = _patch_http(
+        monkeypatch, {"code": 0, "msg": None, "data": {"fields": fields, "items": _sample_items()}}
+    )
     client = TushareClient("secret-token", min_interval_s=0)
 
     rows = client.stock_minutes(
@@ -93,10 +96,12 @@ def test_client_api_error_never_exposes_token(monkeypatch):
 
 def test_client_waits_and_retries_tushare_rate_limit(monkeypatch):
     fields = list(tc.MINUTE_FIELDS)
-    fake = _HTTPSequence([
-        {"code": 40203, "msg": "访问接口频率超限(200次/分钟)", "data": None},
-        {"code": 0, "msg": None, "data": {"fields": fields, "items": _sample_items()}},
-    ])
+    fake = _HTTPSequence(
+        [
+            {"code": 40203, "msg": "访问接口频率超限(200次/分钟)", "data": None},
+            {"code": 0, "msg": None, "data": {"fields": fields, "items": _sample_items()}},
+        ]
+    )
     monkeypatch.setattr(tc.httpx, "Client", lambda **kwargs: fake)
     pauses: list[float] = []
     monkeypatch.setattr(tc.time, "sleep", lambda seconds: pauses.append(seconds))
@@ -117,7 +122,11 @@ def test_client_waits_and_retries_tushare_rate_limit(monkeypatch):
 class _FakeClient:
     def __init__(self, rows: list[dict] | None = None, error: Exception | None = None) -> None:
         fields = list(tc.MINUTE_FIELDS)
-        self.rows = rows if rows is not None else [dict(zip(fields, item, strict=True)) for item in _sample_items()]
+        self.rows = (
+            rows
+            if rows is not None
+            else [dict(zip(fields, item, strict=True)) for item in _sample_items()]
+        )
         self.error = error
         self.calls: list[dict] = []
 
@@ -150,7 +159,16 @@ def test_provider_normalizes_schema_orders_rows_and_converts_cn_window():
         on_chunk_done=lambda current, total: progress.append((current, total)),
     )
 
-    assert frame.columns == ["symbol", "datetime", "open", "high", "low", "close", "volume", "amount"]
+    assert frame.columns == [
+        "symbol",
+        "datetime",
+        "open",
+        "high",
+        "low",
+        "close",
+        "volume",
+        "amount",
+    ]
     assert frame.height == 2
     assert frame.schema["datetime"] == pl.Datetime("us")
     assert frame.schema["volume"] == pl.Float64
@@ -195,7 +213,9 @@ def test_probe_rejects_missing_permission(monkeypatch):
     monkeypatch.setattr(
         tp,
         "TushareClient",
-        lambda *args, **kwargs: _FakeClient(error=TushareError("Tushare API 错误 code=2002: 没有接口权限")),
+        lambda *args, **kwargs: _FakeClient(
+            error=TushareError("Tushare API 错误 code=2002: 没有接口权限")
+        ),
     )
     ok, reason = tp.probe_api_key("candidate")
     assert ok is False
@@ -213,10 +233,16 @@ def test_manifest_declares_minute_financial_and_ui_token_field():
 
 def test_client_posts_standard_financial_contract(monkeypatch):
     fields = list(tc.FINANCIAL_FIELDS["metrics"])
-    fake = _patch_http(monkeypatch, {
-        "code": 0,
-        "data": {"fields": fields, "items": [["600000.SH", "20260430", "20260331", "1", *([1.0] * (len(fields) - 4))]]},
-    })
+    fake = _patch_http(
+        monkeypatch,
+        {
+            "code": 0,
+            "data": {
+                "fields": fields,
+                "items": [["600000.SH", "20260430", "20260331", "1", *([1.0] * (len(fields) - 4))]],
+            },
+        },
+    )
     client = TushareClient("secret-token", min_interval_s=0)
 
     rows = client.financial_records("metrics", "600000.SH")
@@ -240,13 +266,36 @@ class _FinancialClient(_FakeClient):
 
 def test_provider_normalizes_metrics_and_prefers_current_update():
     provider = TushareProvider()
-    provider._client = _FinancialClient({
-        "metrics": [
-            {"ts_code": "603800.SH", "ann_date": "20260430", "end_date": "20260331", "update_flag": "0", "eps": -9, "ocf_to_or": 0.01},
-            {"ts_code": "603800.SH", "ann_date": "20260430", "end_date": "20260331", "update_flag": "1", "eps": -0.08, "ocf_to_or": 0.0859},
-            {"ts_code": "603800.SH", "ann_date": "20251031", "end_date": "20250930", "update_flag": "1", "eps": 0.30, "ocf_to_or": 0.0761},
-        ],
-    })
+    provider._client = _FinancialClient(
+        {
+            "metrics": [
+                {
+                    "ts_code": "603800.SH",
+                    "ann_date": "20260430",
+                    "end_date": "20260331",
+                    "update_flag": "0",
+                    "eps": -9,
+                    "ocf_to_or": 0.01,
+                },
+                {
+                    "ts_code": "603800.SH",
+                    "ann_date": "20260430",
+                    "end_date": "20260331",
+                    "update_flag": "1",
+                    "eps": -0.08,
+                    "ocf_to_or": 0.0859,
+                },
+                {
+                    "ts_code": "603800.SH",
+                    "ann_date": "20251031",
+                    "end_date": "20250930",
+                    "update_flag": "1",
+                    "eps": 0.30,
+                    "ocf_to_or": 0.0761,
+                },
+            ],
+        }
+    )
 
     frame = provider.get_financials("metrics", ["603800.SH"], latest_only=False)
 
@@ -257,26 +306,77 @@ def test_provider_normalizes_metrics_and_prefers_current_update():
     assert frame.schema["roe"] == pl.Float64
 
 
+def test_provider_reports_live_financial_progress():
+    provider = TushareProvider()
+    provider._client = _FinancialClient(
+        {
+            "income": [
+                {
+                    "ts_code": "600000.SH",
+                    "ann_date": "20260430",
+                    "end_date": "20260331",
+                    "update_flag": "1",
+                    "revenue": 10,
+                }
+            ],
+        }
+    )
+    progress: list[tuple[int, int, int, int]] = []
+
+    frame = provider.get_financials(
+        "income",
+        ["600000.SH", "000001.SZ"],
+        on_progress=lambda *values: progress.append(values),
+    )
+
+    assert frame.height == 2
+    assert progress == [(1, 2, 1, 0), (2, 2, 2, 0)]
+
+
 def test_provider_maps_statements_to_panel_schema():
     provider = TushareProvider()
-    provider._client = _FinancialClient({
-        "income": [{
-            "ts_code": "603800.SH", "ann_date": "20260429", "f_ann_date": "20260430",
-            "end_date": "20260331", "update_flag": "1", "revenue": 10,
-            "oper_cost": 6, "n_income": 2, "n_income_attr_p": 1.8,
-        }],
-        "balance_sheet": [{
-            "ts_code": "603800.SH", "ann_date": "20260430", "end_date": "20260331",
-            "update_flag": "1", "total_assets": 100, "total_liab": 60,
-            "fix_assets": None, "fix_assets_total": 12,
-        }],
-        "cash_flow": [{
-            "ts_code": "603800.SH", "ann_date": "20260430", "end_date": "20260331",
-            "update_flag": "1", "n_cashflow_act": 8, "n_cashflow_inv_act": -3,
-            "n_cash_flows_fnc_act": -2, "c_pay_acq_const_fiolta": 4,
-            "n_incr_cash_cash_equ": 3,
-        }],
-    })
+    provider._client = _FinancialClient(
+        {
+            "income": [
+                {
+                    "ts_code": "603800.SH",
+                    "ann_date": "20260429",
+                    "f_ann_date": "20260430",
+                    "end_date": "20260331",
+                    "update_flag": "1",
+                    "revenue": 10,
+                    "oper_cost": 6,
+                    "n_income": 2,
+                    "n_income_attr_p": 1.8,
+                }
+            ],
+            "balance_sheet": [
+                {
+                    "ts_code": "603800.SH",
+                    "ann_date": "20260430",
+                    "end_date": "20260331",
+                    "update_flag": "1",
+                    "total_assets": 100,
+                    "total_liab": 60,
+                    "fix_assets": None,
+                    "fix_assets_total": 12,
+                }
+            ],
+            "cash_flow": [
+                {
+                    "ts_code": "603800.SH",
+                    "ann_date": "20260430",
+                    "end_date": "20260331",
+                    "update_flag": "1",
+                    "n_cashflow_act": 8,
+                    "n_cashflow_inv_act": -3,
+                    "n_cash_flows_fnc_act": -2,
+                    "c_pay_acq_const_fiolta": 4,
+                    "n_incr_cash_cash_equ": 3,
+                }
+            ],
+        }
+    )
 
     income = provider.get_financials("income", ["603800.SH"])
     balance = provider.get_financials("balance_sheet", ["603800.SH"])
@@ -293,13 +393,15 @@ def test_provider_pins_numeric_schema_beyond_default_inference_window():
     rows = []
     for index in range(121):
         period = (start + timedelta(days=index)).strftime("%Y%m%d")
-        rows.append({
-            "ts_code": "600000.SH",
-            "ann_date": period,
-            "end_date": period,
-            "update_flag": "1",
-            "revenue": 1 if index < 100 else 60_894.44,
-        })
+        rows.append(
+            {
+                "ts_code": "600000.SH",
+                "ann_date": period,
+                "end_date": period,
+                "update_flag": "1",
+                "revenue": 1 if index < 100 else 60_894.44,
+            }
+        )
     provider = TushareProvider()
     provider._client = _FinancialClient({"income": rows})
 
@@ -312,14 +414,36 @@ def test_provider_pins_numeric_schema_beyond_default_inference_window():
 
 def test_provider_converts_and_compresses_daily_share_capital():
     provider = TushareProvider()
-    provider._client = _FinancialClient({
-        "shares": [
-            {"ts_code": "603800.SH", "trade_date": "20260825", "total_share": 20783.2, "float_share": 20783.2},
-            {"ts_code": "603800.SH", "trade_date": "20260824", "total_share": 20783.2, "float_share": 20783.2},
-            {"ts_code": "603800.SH", "trade_date": "20250102", "total_share": 20000, "float_share": 18000},
-            {"ts_code": "603800.SH", "trade_date": "20250101", "total_share": 20000, "float_share": 18000},
-        ],
-    })
+    provider._client = _FinancialClient(
+        {
+            "shares": [
+                {
+                    "ts_code": "603800.SH",
+                    "trade_date": "20260825",
+                    "total_share": 20783.2,
+                    "float_share": 20783.2,
+                },
+                {
+                    "ts_code": "603800.SH",
+                    "trade_date": "20260824",
+                    "total_share": 20783.2,
+                    "float_share": 20783.2,
+                },
+                {
+                    "ts_code": "603800.SH",
+                    "trade_date": "20250102",
+                    "total_share": 20000,
+                    "float_share": 18000,
+                },
+                {
+                    "ts_code": "603800.SH",
+                    "trade_date": "20250101",
+                    "total_share": 20000,
+                    "float_share": 18000,
+                },
+            ],
+        }
+    )
 
     frame = provider.get_financials("shares", ["603800.SH"], latest_only=False)
 

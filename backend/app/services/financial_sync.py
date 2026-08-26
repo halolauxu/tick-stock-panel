@@ -7,8 +7,10 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import logging
 import threading
+from collections.abc import Callable
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -23,6 +25,7 @@ _BATCH_SIZE = 100
 
 # 财务报表 + 历史股本表
 FINANCIAL_TABLES = ("metrics", "income", "balance_sheet", "cash_flow", "shares")
+FinancialProgressCallback = Callable[[int, int, int, int], None]
 
 
 # ================================================================
@@ -60,6 +63,7 @@ def _fetch_table(
     symbols: list[str],
     capset: CapabilitySet,
     latest_only: bool = True,
+    on_progress: FinancialProgressCallback | None = None,
 ) -> pl.DataFrame:
     """通过当前财务数据源拉取一张标准化财务表。"""
     is_custom = _financial_is_custom()
@@ -77,7 +81,25 @@ def _fetch_table(
 
         try:
             provider = custom_sources.get_provider(preferences.get_financial_provider())
-            df = provider.get_financials(table, symbols, latest_only=latest_only)
+            method = provider.get_financials
+            parameters = inspect.signature(method).parameters.values()
+            supports_progress = any(
+                parameter.name == "on_progress" or parameter.kind is inspect.Parameter.VAR_KEYWORD
+                for parameter in parameters
+            )
+            if supports_progress:
+                df = method(
+                    table,
+                    symbols,
+                    latest_only=latest_only,
+                    on_progress=on_progress,
+                )
+            else:
+                # 兼容尚未升级签名的第三方财务插件。旧插件仍可同步, 只在返回后
+                # 给出一次完成态进度, 不强制其立即实现新回调。
+                df = method(table, symbols, latest_only=latest_only)
+                if on_progress is not None:
+                    on_progress(len(symbols), len(symbols), len(df), 0)
         except Exception as e:
             logger.warning("sync_%s custom provider failed: %s", table, e)
             return pl.DataFrame()
@@ -102,6 +124,7 @@ def _fetch_table(
         return pl.DataFrame()
 
     all_records: list[dict] = []
+    failures = 0
     total_batches = (len(symbols) + _BATCH_SIZE - 1) // _BATCH_SIZE
 
     for i in range(0, len(symbols), _BATCH_SIZE):
@@ -125,7 +148,15 @@ def _fetch_table(
                 len(data) if isinstance(data, dict) else 0,
             )
         except Exception as e:
+            failures += len(chunk)
             logger.warning("sync_%s batch %d/%d failed: %s", table, batch_num, total_batches, e)
+        if on_progress is not None:
+            on_progress(
+                min(i + len(chunk), len(symbols)),
+                len(symbols),
+                len(all_records),
+                failures,
+            )
 
     if not all_records:
         return pl.DataFrame()
@@ -156,11 +187,22 @@ def _sync_table(
     data_dir: Path,
     capset: CapabilitySet,
     latest_only: bool = True,
+    on_progress: FinancialProgressCallback | None = None,
 ) -> int:
     """同步单张财务表。返回写入的行数。"""
+    if on_progress is None:
+        frame = _fetch_table(table, symbols, capset, latest_only=latest_only)
+    else:
+        frame = _fetch_table(
+            table,
+            symbols,
+            capset,
+            latest_only=latest_only,
+            on_progress=on_progress,
+        )
     return _write_table(
         table,
-        _fetch_table(table, symbols, capset, latest_only=latest_only),
+        frame,
         data_dir,
     )
 
@@ -189,6 +231,7 @@ def _sync_history_table_for_symbols(
     symbols: list[str],
     data_dir: Path,
     capset: CapabilitySet,
+    on_progress: FinancialProgressCallback | None = None,
 ) -> int:
     """历史累积同步: 保留已有各期记录, 仅拉最新期 + 为新标的补全量历史。
 
@@ -197,49 +240,130 @@ def _sync_history_table_for_symbols(
     """
     existing = get_financial_df(data_dir, table)
     if existing.is_empty() or not {"symbol", "period_end"} <= set(existing.columns):
-        return _sync_table(table, symbols, data_dir, capset, latest_only=False)
+        return _sync_table(
+            table,
+            symbols,
+            data_dir,
+            capset,
+            latest_only=False,
+            on_progress=on_progress,
+        )
 
     existing_symbols = set(existing["symbol"].drop_nulls().to_list())
     missing_symbols = [symbol for symbol in symbols if symbol not in existing_symbols]
-    missing_history = (
-        _fetch_table(table, missing_symbols, capset, latest_only=False)
-        if missing_symbols
-        else pl.DataFrame()
-    )
     current_symbols = [symbol for symbol in symbols if symbol in existing_symbols]
-    latest = _fetch_table(table, current_symbols, capset, latest_only=True)
+
+    # 缺失标的补历史、已有标的拉最新是两个 provider 调用。把两个阶段的回调
+    # 合并成同一条单调递增进度, 避免第二阶段从 0 开始导致页面“倒退”。
+    processed_offset = 0
+    row_offset = 0
+    failure_offset = 0
+
+    def fetch_phase(phase_symbols: list[str], *, latest_only: bool) -> pl.DataFrame:
+        nonlocal processed_offset, row_offset, failure_offset
+        if not phase_symbols:
+            return pl.DataFrame()
+        phase_rows = 0
+        phase_failures = 0
+        progress_seen = False
+
+        def phase_progress(done: int, _total: int, rows: int, failures: int) -> None:
+            nonlocal phase_rows, phase_failures, progress_seen
+            progress_seen = True
+            phase_rows = rows
+            phase_failures = failures
+            if on_progress is not None:
+                on_progress(
+                    processed_offset + done,
+                    len(symbols),
+                    row_offset + rows,
+                    failure_offset + failures,
+                )
+
+        if on_progress is None:
+            frame = _fetch_table(
+                table,
+                phase_symbols,
+                capset,
+                latest_only=latest_only,
+            )
+        else:
+            frame = _fetch_table(
+                table,
+                phase_symbols,
+                capset,
+                latest_only=latest_only,
+                on_progress=phase_progress,
+            )
+        processed_offset += len(phase_symbols)
+        row_offset += phase_rows if progress_seen else len(frame)
+        failure_offset += phase_failures
+        return frame
+
+    missing_history = fetch_phase(missing_symbols, latest_only=False)
+    latest = fetch_phase(current_symbols, latest_only=True)
     merged = _merge_report_history(existing, missing_history, latest)
     return _write_table(table, merged, data_dir)
 
 
-def sync_metrics(data_dir: Path, capset: CapabilitySet) -> int:
+def sync_metrics(
+    data_dir: Path,
+    capset: CapabilitySet,
+    on_progress: FinancialProgressCallback | None = None,
+) -> int:
     """同步核心财务指标 (metrics), 历史各期累积保留。"""
     symbols = _get_symbols(data_dir)
-    return _sync_history_table_for_symbols("metrics", symbols, data_dir, capset)
+    return _sync_history_table_for_symbols(
+        "metrics", symbols, data_dir, capset, on_progress=on_progress
+    )
 
 
-def sync_income(data_dir: Path, capset: CapabilitySet) -> int:
+def sync_income(
+    data_dir: Path,
+    capset: CapabilitySet,
+    on_progress: FinancialProgressCallback | None = None,
+) -> int:
     """同步利润表, 历史各期累积保留。"""
     symbols = _get_symbols(data_dir)
-    return _sync_history_table_for_symbols("income", symbols, data_dir, capset)
+    return _sync_history_table_for_symbols(
+        "income", symbols, data_dir, capset, on_progress=on_progress
+    )
 
 
-def sync_balance_sheet(data_dir: Path, capset: CapabilitySet) -> int:
+def sync_balance_sheet(
+    data_dir: Path,
+    capset: CapabilitySet,
+    on_progress: FinancialProgressCallback | None = None,
+) -> int:
     """同步资产负债表, 历史各期累积保留。"""
     symbols = _get_symbols(data_dir)
-    return _sync_history_table_for_symbols("balance_sheet", symbols, data_dir, capset)
+    return _sync_history_table_for_symbols(
+        "balance_sheet", symbols, data_dir, capset, on_progress=on_progress
+    )
 
 
-def sync_cash_flow(data_dir: Path, capset: CapabilitySet) -> int:
+def sync_cash_flow(
+    data_dir: Path,
+    capset: CapabilitySet,
+    on_progress: FinancialProgressCallback | None = None,
+) -> int:
     """同步现金流量表, 历史各期累积保留。"""
     symbols = _get_symbols(data_dir)
-    return _sync_history_table_for_symbols("cash_flow", symbols, data_dir, capset)
+    return _sync_history_table_for_symbols(
+        "cash_flow", symbols, data_dir, capset, on_progress=on_progress
+    )
 
 
-def sync_shares(data_dir: Path, capset: CapabilitySet) -> int:
+def sync_shares(
+    data_dir: Path,
+    capset: CapabilitySet,
+    on_progress: FinancialProgressCallback | None = None,
+) -> int:
     """同步历史股本表。"""
     symbols = _get_symbols(data_dir)
-    return _sync_history_table_for_symbols("shares", symbols, data_dir, capset)
+    return _sync_history_table_for_symbols(
+        "shares", symbols, data_dir, capset, on_progress=on_progress
+    )
 
 
 def sync_all(data_dir: Path, capset: CapabilitySet) -> dict[str, int]:
@@ -315,6 +439,7 @@ class FinancialScheduler:
         # 全部渲染成“下载中”, 页面刷新后也无法知道真正运行的是哪一张。
         self._sync_scope: str | None = None  # single / all
         self._active_table: str | None = None
+        self._sync_progress: dict[str, int] | None = None
 
     def start(self, data_dir: Path, capset: CapabilitySet, *, auto_schedule: bool = False) -> None:
         """初始化调度器, 并按需启动周期同步后台任务。
@@ -447,7 +572,11 @@ class FinancialScheduler:
             }.get(table)
             if not fn:
                 return {}
-            rows = fn(self._data_dir, self._capset)
+            rows = fn(
+                self._data_dir,
+                self._capset,
+                on_progress=self._progress_callback(table),
+            )
             self._record_sync(table)
             return {table: rows}
         # 全部同步
@@ -455,7 +584,13 @@ class FinancialScheduler:
         result: dict[str, int] = {}
         for t in FINANCIAL_TABLES:
             self._set_active_table(t)
-            result[t] = _sync_history_table_for_symbols(t, symbols, self._data_dir, self._capset)
+            result[t] = _sync_history_table_for_symbols(
+                t,
+                symbols,
+                self._data_dir,
+                self._capset,
+                on_progress=self._progress_callback(t),
+            )
             self._record_sync(t)
         _refresh_financials_views(self._data_dir)
         return result
@@ -465,17 +600,47 @@ class FinancialScheduler:
         self._is_syncing = True
         self._sync_scope = "single" if table else "all"
         self._active_table = table or FINANCIAL_TABLES[0]
+        self._sync_progress = {
+            "symbols_done": 0,
+            "symbols_total": 0,
+            "rows_received": 0,
+            "failures": 0,
+        }
 
     def _set_active_table(self, table: str) -> None:
         """切换当前表; 供全量同步逐表推进时更新前端状态。"""
         with self._lock:
+            if self._active_table != table:
+                self._sync_progress = {
+                    "symbols_done": 0,
+                    "symbols_total": 0,
+                    "rows_received": 0,
+                    "failures": 0,
+                }
             self._active_table = table
+
+    def _progress_callback(self, table: str) -> FinancialProgressCallback:
+        """创建仅更新当前表的线程安全进度回调。"""
+
+        def update(done: int, total: int, rows: int, failures: int) -> None:
+            with self._lock:
+                if not self._is_syncing or self._active_table != table:
+                    return
+                self._sync_progress = {
+                    "symbols_done": max(0, int(done)),
+                    "symbols_total": max(0, int(total)),
+                    "rows_received": max(0, int(rows)),
+                    "failures": max(0, int(failures)),
+                }
+
+        return update
 
     def _finish_sync(self) -> None:
         """在已持有 ``_lock`` 时清理同步状态。"""
         self._is_syncing = False
         self._sync_scope = None
         self._active_table = None
+        self._sync_progress = None
 
     def run_now(self, table: str | None = None) -> dict[str, int]:
         """同步执行一次同步(阻塞调用线程)。
@@ -542,13 +707,14 @@ class FinancialScheduler:
             return self._is_syncing
 
     @property
-    def sync_state(self) -> dict[str, bool | str | None]:
+    def sync_state(self) -> dict[str, object]:
         """返回一次加锁读取的同步快照, 避免 API 拼出不一致的状态。"""
         with self._lock:
             return {
                 "syncing": self._is_syncing,
                 "sync_scope": self._sync_scope,
                 "syncing_table": self._active_table,
+                "sync_progress": dict(self._sync_progress) if self._sync_progress else None,
             }
 
     @property
