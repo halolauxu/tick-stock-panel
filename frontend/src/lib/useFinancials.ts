@@ -74,9 +74,13 @@ export function useFinancialSync() {
     onMutate: () => {
       qc.invalidateQueries({ queryKey: FINANCIAL_QK.status })
     },
-    onSuccess: () => {
-      qc.invalidateQueries({ queryKey: FINANCIAL_QK.status })
-      qc.invalidateQueries({ queryKey: ['financials'] })
+    onSuccess: async () => {
+      // 等待 status 刷新后再结束 mutation 乐观态，避免 trigger 已返回、
+      // 服务端 syncing 真值尚未进入查询缓存时出现按钮短暂恢复的竞态。
+      await Promise.all([
+        qc.invalidateQueries({ queryKey: FINANCIAL_QK.status }),
+        qc.invalidateQueries({ queryKey: ['financials'] }),
+      ])
     },
   })
 }

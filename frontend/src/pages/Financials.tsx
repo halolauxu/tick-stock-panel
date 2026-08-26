@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react'
+import { useState } from 'react'
 import { RefreshCw, Download, Lock, Loader2, X, Search, FileText, Database, Clock, CheckCircle2, Hourglass, Lightbulb, ExternalLink, ChartPie } from 'lucide-react'
 import { PageHeader } from '@/components/PageHeader'
 import { EmptyState } from '@/components/EmptyState'
@@ -28,6 +28,8 @@ const TABLE_ICON: Record<string, typeof FileText> = {
   shares: ChartPie,
 }
 
+const TABLE_ORDER = ['metrics', 'income', 'balance_sheet', 'cash_flow', 'shares'] as const
+
 export function Financials() {
   const { data: caps } = useCapabilities()
   const { data: status, isLoading } = useFinancialStatus()
@@ -38,19 +40,18 @@ export function Financials() {
   // 用 syncMut.isPending 覆盖,让按钮立即置灰、避免重复点击。
   // 后端 trigger() 返回时 syncing 已为 true,refetch 到达后 status.syncing 接管。
   const syncing = (status?.syncing ?? false) || syncMut.isPending
-  // 本次同步开始时间戳(ms): 用于判断每张表的 last_sync 是否属于本次同步
-  // (后端每张表完成即更新 last_sync, 前端轮询时对比时间戳得到精确进度)
-  const [syncStartedAt, setSyncStartedAt] = useState<number | null>(null)
-  // 单表同步时记录表名 (null = 全量同步), 用于区分卡片状态
-  const [syncSingleTable, setSyncSingleTable] = useState<string | null>(null)
-  // 同步自然结束(服务端 syncing 由 true→false):清空本次同步记录。
-  // 这是可靠的收尾时机 —— 不依赖 mutation 的 onSettled(它现在瞬间触发,会误清)。
-  useEffect(() => {
-    if (!syncing && syncStartedAt !== null) {
-      setSyncStartedAt(null)
-      setSyncSingleTable(null)
-    }
-  }, [syncing, syncStartedAt])
+  // 请求刚发出时用 mutation variables 做乐观态；status 返回后完全以服务端记录的
+  // scope/active table 为准。因此刷新页面、其他客户端触发也能准确显示当前表。
+  const optimisticTarget = syncMut.isPending ? (syncMut.variables ?? null) : null
+  const syncScope = status?.sync_scope
+    ?? (optimisticTarget ? (optimisticTarget === 'all' ? 'all' : 'single') : null)
+  const currentSyncingTable = status?.syncing_table
+    ?? (optimisticTarget === 'all' ? TABLE_ORDER[0] : optimisticTarget)
+  const isFullSync = syncing && syncScope === 'all'
+  const isSingleSync = syncing && syncScope === 'single'
+  const currentTableIndex = currentSyncingTable
+    ? TABLE_ORDER.indexOf(currentSyncingTable as (typeof TABLE_ORDER)[number])
+    : -1
   // 选中的个股(模糊搜索结果);null 时显示搜索引导
   const [selected, setSelected] = useState<{ symbol: string; name: string } | null>(null)
   const { last: lastStock, remember: rememberStock } = useLastStock('financials')
@@ -100,13 +101,10 @@ export function Financials() {
   const handleSync = (table: string) => {
     // 防重复点击:syncing 中不再触发(后端 trigger 也有 _is_syncing 兜底)
     if (syncing) return
-    // 记录开始时间: 全量同步判断所有财务表, 单表同步只判断这一张
-    setSyncStartedAt(Date.now())
-    setSyncSingleTable(table === 'all' ? null : table)
     syncMut.mutate(table, {
       onSuccess: (r) => {
         // 后端 trigger 立即返回 started 状态;若被防并发跳过(已有同步在进行),
-        // 给用户明确反馈,并清空本次误设的记录。
+        // 给用户明确反馈。服务端状态会由 status 轮询接管。
         if (!r.synced?.started) {
           if (r.synced?.reason === 'already running') {
             toast('财务数据正在同步中,请稍候', 'success')
@@ -116,14 +114,11 @@ export function Financials() {
           } else {
             toast(`同步未能开始${r.synced?.reason ? `:${r.synced.reason}` : ''}`, 'error')
           }
-          setSyncStartedAt(null)
-          setSyncSingleTable(null)
+        } else if (table === 'all') {
+          toast('已开始依次更新全部财务表', 'success')
+        } else {
+          toast(`已开始单独更新${TABLE_LABELS[table] ?? table}`, 'success')
         }
-      },
-      onError: () => {
-        // 请求失败:清空本次记录(request 已弹错误 toast)
-        setSyncStartedAt(null)
-        setSyncSingleTable(null)
       },
     })
   }
@@ -131,29 +126,14 @@ export function Financials() {
   const tables = status?.tables ?? {}
   const available = status?.available ?? false
   const lastSync = status?.last_sync ?? {}
-  // 本次同步进度: 仅当 syncStartedAt 存在且 syncing 时, 按 last_sync 时间戳判断
-  const isFullSync = syncing && syncStartedAt && !syncSingleTable  // 全量同步
-  const isSingleSync = syncing && syncStartedAt && !!syncSingleTable  // 单表同步
-  const TABLE_ORDER = ['metrics', 'income', 'balance_sheet', 'cash_flow', 'shares'] as const
-  const tableDoneThisRound = (key: string): boolean => {
-    if (!syncStartedAt || !syncing) return false
-    // 单表同步: 只判断这一张表是否完成
-    if (syncSingleTable && key !== syncSingleTable) return false
-    const ls = lastSync[key]
-    if (!ls) return false
-    return new Date(ls).getTime() >= syncStartedAt
+  // 全量同步按固定顺序推进：当前表之前为本轮已完成，之后为等待。
+  // 单表同步时其他卡片保持原样，仅禁用按钮，避免误导为“五张表都在下载”。
+  const tableDoneThisRound = (key: string): boolean =>
+    isFullSync && currentTableIndex > TABLE_ORDER.indexOf(key as (typeof TABLE_ORDER)[number])
+  const isWaitingTable = (key: string): boolean => {
+    const index = TABLE_ORDER.indexOf(key as (typeof TABLE_ORDER)[number])
+    return isFullSync && currentTableIndex >= 0 && index > currentTableIndex
   }
-  // 当前正在同步的表:
-  // 全量同步 → 第一个未完成的; 单表同步 → 那张表(未完成时)
-  const currentSyncingTable = syncing && syncStartedAt
-    ? (syncSingleTable
-        ? (tableDoneThisRound(syncSingleTable) ? null : syncSingleTable)
-        : TABLE_ORDER.find(t => !tableDoneThisRound(t)) ?? null)
-    : null
-  const syncedCount = TABLE_ORDER.filter(t => tableDoneThisRound(t)).length
-  // 卡片三态: 仅全量同步时未轮到的表显示"等待"; 单表同步时其他表保持原样
-  const isWaitingTable = (key: string): boolean =>
-    !!isFullSync && !tableDoneThisRound(key) && currentSyncingTable !== key
 
   return (
     <>
@@ -167,9 +147,9 @@ export function Financials() {
               <span className="text-xs text-accent/80 flex items-center gap-1.5">
                 <Loader2 className="w-3 h-3 animate-spin" />
                 {isFullSync
-                  ? `已同步 ${syncedCount}/${TABLE_ORDER.length} 张表…`
+                  ? `全部更新 ${Math.max(currentTableIndex + 1, 1)}/${TABLE_ORDER.length}：${TABLE_LABELS[currentSyncingTable ?? ''] ?? '准备中'}…`
                   : isSingleSync
-                    ? `同步${TABLE_LABELS[syncSingleTable!] ?? syncSingleTable}…`
+                    ? `只更新${TABLE_LABELS[currentSyncingTable ?? ''] ?? '当前表'}…`
                     : '同步中…'}
               </span>
             )}
@@ -177,12 +157,12 @@ export function Financials() {
               className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-btn bg-gradient-to-r from-accent/25 to-accent/10 border border-accent/30 text-accent text-xs font-medium hover:from-accent/35 hover:to-accent/20 transition-all duration-150 disabled:opacity-40 disabled:cursor-not-allowed"
               onClick={() => handleSync('all')}
               disabled={syncing}
-              title={syncing ? '正在同步，请稍候…' : '同步全部财务表'}
+              title={syncing ? '已有财务表正在更新，请稍候…' : '按顺序更新全部财务表'}
             >
-              {syncing
+              {isFullSync
                 ? <Loader2 className="h-3.5 w-3.5 animate-spin" />
                 : <RefreshCw className="h-3.5 w-3.5" />}
-              {syncing ? '同步中…' : '全部同步'}
+              {isFullSync ? '全部同步中…' : '全部同步'}
             </button>
           </div>
         }
@@ -192,7 +172,11 @@ export function Financials() {
         {syncing && (
           <div className="flex items-center gap-2 rounded-card border border-accent/30 bg-accent/[0.06] px-3 py-2 text-xs text-accent">
             <Loader2 className="h-3.5 w-3.5 animate-spin shrink-0" />
-            正在从财务数据源拉取数据，请稍候…
+            {isFullSync
+              ? `正在依次更新全部财务表，当前处理${TABLE_LABELS[currentSyncingTable ?? ''] ?? '财务数据'}。`
+              : currentSyncingTable
+                ? `正在单独更新${TABLE_LABELS[currentSyncingTable] ?? currentSyncingTable}；已有标的增量更新，新标的补齐历史，其他表不会重复下载。`
+                : '财务数据更新任务正在运行；完成后行数会自动刷新。'}
           </div>
         )}
 
@@ -239,9 +223,13 @@ export function Financials() {
                         className="text-muted hover:text-accent transition-colors disabled:opacity-30 disabled:cursor-not-allowed"
                         onClick={() => handleSync(key)}
                         disabled={syncing}
-                        title={syncing ? '正在同步…' : `更新${label}`}
+                        title={isThisSyncing
+                          ? `正在更新${label}，完成后刷新行数`
+                          : syncing
+                            ? `当前正在更新${TABLE_LABELS[currentSyncingTable ?? ''] ?? '另一张表'}`
+                            : `只更新${label}（已有标的增量更新，新标的补齐历史）`}
                       >
-                        {syncing
+                        {isThisSyncing
                           ? <Loader2 className="h-3.5 w-3.5 animate-spin" />
                           : <Download className="h-3.5 w-3.5" />}
                       </button>
@@ -255,7 +243,9 @@ export function Financials() {
                     </div>
                     <div className="mt-auto pt-2 border-t border-border/40 text-[10px] text-muted flex items-center gap-1">
                       <Clock className="h-2.5 w-2.5 shrink-0" />
-                      {lsTime
+                      {isThisSyncing
+                        ? '任务运行中 · 完成后更新行数'
+                        : lsTime
                         ? new Date(lsTime).toLocaleString('zh-CN', { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' })
                         : '尚未同步'}
                     </div>
@@ -274,7 +264,7 @@ export function Financials() {
           <div className="rounded-card border border-dashed border-border bg-surface px-6 py-14 text-center">
             <Database className="mx-auto h-8 w-8 text-muted" />
             <div className="mt-3 text-sm text-secondary">暂无财务数据</div>
-            <div className="mt-1 text-xs text-muted">点击右上角"全部同步"从 TickFlow 拉取</div>
+            <div className="mt-1 text-xs text-muted">可单独更新一张表，也可点击右上角“全部同步”</div>
           </div>
         ) : (
           <>

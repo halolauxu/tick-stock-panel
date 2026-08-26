@@ -3,14 +3,14 @@
 解耦于 K-line 管道, 自有调度 + 自有存储。
 能力门控: Cap.FINANCIAL (Expert 套餐)
 """
+
 from __future__ import annotations
 
 import asyncio
 import logging
 import threading
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
 
 import polars as pl
 
@@ -29,6 +29,7 @@ FINANCIAL_TABLES = ("metrics", "income", "balance_sheet", "cash_flow", "shares")
 # 同步函数
 # ================================================================
 
+
 def _get_symbols(data_dir: Path) -> list[str]:
     """从 instruments 表获取标的列表。"""
     inst_path = data_dir / "instruments" / "instruments.parquet"
@@ -45,10 +46,12 @@ def _get_symbols(data_dir: Path) -> list[str]:
 def _financial_is_custom() -> bool:
     """当前财务数据源是否走 custom (用于绕过 TickFlow Expert 套餐门槛)。"""
     from app.services import preferences
+
     provider = preferences.get_financial_provider()
     if provider == "tickflow":
         return False
     from app.data_providers import custom as custom_sources
+
     return custom_sources.provider_has_dataset(provider, "financial")
 
 
@@ -69,12 +72,13 @@ def _fetch_table(
 
     # 自定义数据源分流
     if is_custom:
-        from app.services import preferences
         from app.data_providers import custom as custom_sources
+        from app.services import preferences
+
         try:
             provider = custom_sources.get_provider(preferences.get_financial_provider())
             df = provider.get_financials(table, symbols, latest_only=latest_only)
-        except Exception as e:  # noqa: BLE001
+        except Exception as e:
             logger.warning("sync_%s custom provider failed: %s", table, e)
             return pl.DataFrame()
         if df.is_empty() or "symbol" not in df.columns:
@@ -82,6 +86,7 @@ def _fetch_table(
         return df
 
     from app.tickflow.client import get_client
+
     tf = get_client()
 
     # 分批拉取
@@ -112,7 +117,13 @@ def _fetch_table(
                             if isinstance(rec, dict):
                                 rec["symbol"] = sym
                                 all_records.append(rec)
-            logger.debug("sync_%s batch %d/%d: %d records", table, batch_num, total_batches, len(data) if isinstance(data, dict) else 0)
+            logger.debug(
+                "sync_%s batch %d/%d: %d records",
+                table,
+                batch_num,
+                total_batches,
+                len(data) if isinstance(data, dict) else 0,
+            )
         except Exception as e:
             logger.warning("sync_%s batch %d/%d failed: %s", table, batch_num, total_batches, e)
 
@@ -162,9 +173,8 @@ def _merge_report_history(*frames: pl.DataFrame) -> pl.DataFrame:
     ]
     if not valid:
         return pl.DataFrame()
-    merged = (
-        pl.concat(valid, how="diagonal_relaxed")
-        .filter(pl.col("symbol").is_not_null() & pl.col("period_end").is_not_null())
+    merged = pl.concat(valid, how="diagonal_relaxed").filter(
+        pl.col("symbol").is_not_null() & pl.col("period_end").is_not_null()
     )
     # 同一 (symbol, period_end) 多条时保留 announce_date 最新一条 (业绩修正以最新公告为准)。
     if "announce_date" in merged.columns:
@@ -241,9 +251,7 @@ def sync_all(data_dir: Path, capset: CapabilitySet) -> dict[str, int]:
     symbols = _get_symbols(data_dir)
     results: dict[str, int] = {}
     for table in FINANCIAL_TABLES:
-        results[table] = _sync_history_table_for_symbols(
-            table, symbols, data_dir, capset
-        )
+        results[table] = _sync_history_table_for_symbols(table, symbols, data_dir, capset)
 
     # 同步完成后注册 DuckDB 视图
     _refresh_financials_views(data_dir)
@@ -255,6 +263,7 @@ def sync_all(data_dir: Path, capset: CapabilitySet) -> dict[str, int]:
 # DuckDB 视图
 # ================================================================
 
+
 def _refresh_financials_views(data_dir: Path) -> None:
     """刷新财务表 DuckDB 视图 (在 DataStore.db 上注册)。"""
     d = data_dir.as_posix()
@@ -265,7 +274,7 @@ def _refresh_financials_views(data_dir: Path) -> None:
         "financials_cash_flow": f"{d}/financials/cash_flow/*.parquet",
         "financials_shares": f"{d}/financials/shares/*.parquet",
     }
-    for name, path in views.items():
+    for name, _path in views.items():
         out = data_dir / "financials" / name.replace("financials_", "") / "part.parquet"
         if not out.exists():
             continue
@@ -289,6 +298,7 @@ def get_financial_df(data_dir: Path, table: str) -> pl.DataFrame:
 # 调度器
 # ================================================================
 
+
 class FinancialScheduler:
     """独立调度器: 每周同步 metrics, 财务表支持手动同步。"""
 
@@ -301,9 +311,13 @@ class FinancialScheduler:
         self._last_sync: dict[str, str] = {}  # {table: iso_timestamp}
         # 手动同步(run_now)是否正在进行。前端据此显示"同步中"并防重复点击。
         self._is_syncing = False
+        # 当前同步范围与正在处理的表。不能只暴露全局 bool: 否则前端会把五张表
+        # 全部渲染成“下载中”, 页面刷新后也无法知道真正运行的是哪一张。
+        self._sync_scope: str | None = None  # single / all
+        self._active_table: str | None = None
 
     def start(self, data_dir: Path, capset: CapabilitySet, *, auto_schedule: bool = False) -> None:
-        """初始化调度器，并按需启动周期同步后台任务。
+        """初始化调度器, 并按需启动周期同步后台任务。
 
         auto_schedule=False (默认): 仅初始化 (设置数据目录/能力 + 恢复 last_sync),
             供 /api/financials/sync/* 手动同步使用, 不启动自动调度。
@@ -321,6 +335,7 @@ class FinancialScheduler:
         # 从持久化恢复上次同步时间: 重启后前端仍能显示真实最后同步时间,而非"尚未同步"
         try:
             from app.services import preferences
+
             restored = dict(preferences.get_financial_sync_times())
             # 老用户迁移兜底: 若某表在 preferences 无记录但 parquet 已存在(升级前同步过),
             # 用 parquet 文件的修改时间作为同步时间并补写持久化。
@@ -329,14 +344,18 @@ class FinancialScheduler:
                     continue
                 parquet = data_dir / "financials" / table / "part.parquet"
                 if parquet.exists():
-                    mtime = datetime.fromtimestamp(parquet.stat().st_mtime, tz=timezone.utc).isoformat()
+                    mtime = datetime.fromtimestamp(parquet.stat().st_mtime, tz=UTC).isoformat()
                     restored[table] = mtime
                     preferences.set_financial_sync_time(table, mtime)
-                    logger.info("FinancialScheduler backfilled last_sync for %s from parquet mtime", table)
+                    logger.info(
+                        "FinancialScheduler backfilled last_sync for %s from parquet mtime", table
+                    )
             self._last_sync = restored
             if self._last_sync:
-                logger.info("FinancialScheduler restored last_sync: %s", list(self._last_sync.keys()))
-        except Exception as e:  # noqa: BLE001
+                logger.info(
+                    "FinancialScheduler restored last_sync: %s", list(self._last_sync.keys())
+                )
+        except Exception as e:
             logger.warning("restore financial_sync_times failed: %s", e)
 
         if not auto_schedule:
@@ -354,12 +373,13 @@ class FinancialScheduler:
         持久化确保即使重启,前端 /status 仍返回真实的最后同步时间,
         不会错误地显示"尚未同步"。
         """
-        ts = datetime.now(timezone.utc).isoformat()
+        ts = datetime.now(UTC).isoformat()
         self._last_sync[table] = ts
         try:
             from app.services import preferences
+
             preferences.set_financial_sync_time(table, ts)
-        except Exception as e:  # noqa: BLE001
+        except Exception as e:
             logger.warning("persist financial_sync_time(%s) failed: %s", e)
 
     def update_capabilities(self, capset: CapabilitySet) -> None:
@@ -375,9 +395,7 @@ class FinancialScheduler:
         had = bool(prev) and prev.has(Cap.FINANCIAL)
         now = capset.has(Cap.FINANCIAL)
         if had != now:
-            logger.info(
-                "FinancialScheduler capabilities updated: FINANCIAL %s -> %s", had, now
-            )
+            logger.info("FinancialScheduler capabilities updated: FINANCIAL %s -> %s", had, now)
 
     def stop(self) -> None:
         self._running = False
@@ -419,6 +437,7 @@ class FinancialScheduler:
         每张表完成立即更新 last_sync,让前端轮询 /status 能看到进度递增。
         """
         if table:
+            self._set_active_table(table)
             fn = {
                 "metrics": sync_metrics,
                 "income": sync_income,
@@ -435,12 +454,28 @@ class FinancialScheduler:
         symbols = _get_symbols(self._data_dir)
         result: dict[str, int] = {}
         for t in FINANCIAL_TABLES:
-            result[t] = _sync_history_table_for_symbols(
-                t, symbols, self._data_dir, self._capset
-            )
+            self._set_active_table(t)
+            result[t] = _sync_history_table_for_symbols(t, symbols, self._data_dir, self._capset)
             self._record_sync(t)
         _refresh_financials_views(self._data_dir)
         return result
+
+    def _begin_sync(self, table: str | None) -> None:
+        """在已持有 ``_lock`` 时记录一次同步的服务端真值。"""
+        self._is_syncing = True
+        self._sync_scope = "single" if table else "all"
+        self._active_table = table or FINANCIAL_TABLES[0]
+
+    def _set_active_table(self, table: str) -> None:
+        """切换当前表; 供全量同步逐表推进时更新前端状态。"""
+        with self._lock:
+            self._active_table = table
+
+    def _finish_sync(self) -> None:
+        """在已持有 ``_lock`` 时清理同步状态。"""
+        self._is_syncing = False
+        self._sync_scope = None
+        self._active_table = None
 
     def run_now(self, table: str | None = None) -> dict[str, int]:
         """同步执行一次同步(阻塞调用线程)。
@@ -458,12 +493,12 @@ class FinancialScheduler:
             if self._is_syncing:
                 logger.info("financial sync skipped: already running")
                 return {"_skipped": 1}
-            self._is_syncing = True
+            self._begin_sync(table)
         try:
             return self._run_body(table)
         finally:
             with self._lock:
-                self._is_syncing = False
+                self._finish_sync()
 
     def trigger(self, table: str | None = None) -> dict[str, int]:
         """触发一次同步(非阻塞,立即返回)。
@@ -484,16 +519,16 @@ class FinancialScheduler:
                 logger.info("financial sync trigger skipped: already running")
                 return {"started": False, "reason": "already running"}
             # 持锁置位:保证 trigger 返回前 syncing 已为 True
-            self._is_syncing = True
+            self._begin_sync(table)
 
         def _bg() -> None:
             try:
                 self._run_body(table)
-            except Exception as e:  # noqa: BLE001
+            except Exception as e:
                 logger.exception("background financial sync failed: %s", e)
             finally:
                 with self._lock:
-                    self._is_syncing = False
+                    self._finish_sync()
 
         t = threading.Thread(target=_bg, name="financial-sync", daemon=True)
         t.start()
@@ -505,6 +540,16 @@ class FinancialScheduler:
         """手动同步是否正在进行(供 /status 返回,前端据此显示"同步中")。"""
         with self._lock:
             return self._is_syncing
+
+    @property
+    def sync_state(self) -> dict[str, bool | str | None]:
+        """返回一次加锁读取的同步快照, 避免 API 拼出不一致的状态。"""
+        with self._lock:
+            return {
+                "syncing": self._is_syncing,
+                "sync_scope": self._sync_scope,
+                "syncing_table": self._active_table,
+            }
 
     @property
     def last_sync(self) -> dict[str, str]:

@@ -1,4 +1,5 @@
 """财务数据 API — 独立路由, Cap.FINANCIAL 门控。"""
+
 from __future__ import annotations
 
 import logging
@@ -8,9 +9,9 @@ from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
-from app.services.financial_sync import FINANCIAL_TABLES, get_financial_df
-from app.services.financial_analyzer import analyze_financials_stream
 from app.services import ai_reports
+from app.services.financial_analyzer import analyze_financials_stream
+from app.services.financial_sync import FINANCIAL_TABLES, get_financial_df
 from app.tickflow.capabilities import Cap
 
 logger = logging.getLogger(__name__)
@@ -23,6 +24,7 @@ def _financial_allowed(capset) -> bool:
     if capset.has(Cap.FINANCIAL):
         return True
     from app.services.financial_sync import _financial_is_custom
+
     return _financial_is_custom()
 
 
@@ -30,12 +32,13 @@ def _require_financial(capset) -> None:
     """_require_financial(capset) 的 custom 感知版本。"""
     if not _financial_allowed(capset):
         from app.tickflow.capabilities import CapabilityDenied
+
         raise CapabilityDenied(Cap.FINANCIAL)
 
 
 @router.get("/status")
 def financial_status(request: Request):
-    """返回各财务表的同步状态。无需 FINANCIAL 权限（前端根据 available 决定是否展示）。"""
+    """返回各财务表的同步状态。无需 FINANCIAL 权限(前端根据 available 决定是否展示)。"""
     capset = request.app.state.capabilities
     if not _financial_allowed(capset):
         return {"available": False, "tables": {}}
@@ -59,14 +62,23 @@ def financial_status(request: Request):
 
     fs = getattr(request.app.state, "financial_scheduler", None)
     last_sync = fs.last_sync if fs else {}
+    sync_state = (
+        fs.sync_state
+        if fs
+        else {
+            "syncing": False,
+            "sync_scope": None,
+            "syncing_table": None,
+        }
+    )
 
     return {
         "available": True,
         "tables": tables,
         "last_sync": last_sync,
-        # 服务端是否正在同步(手动触发)——前端据此显示"同步中"并防重复点击,
-        # 且刷新页面后仍能正确反映服务端状态。
-        "syncing": bool(fs and fs.is_syncing),
+        # 同步范围与当前表均以服务端为准: 页面刷新或由其他客户端触发后,
+        # 前端仍能只给真正处理中的卡片显示进度。
+        **sync_state,
     }
 
 
@@ -167,6 +179,7 @@ def sync_table(request: Request, table: str):
 
 class AnalyzeRequest(BaseModel):
     """AI 财务分析请求。"""
+
     symbol: str
     focus: str = ""  # 可选:用户追加的分析关注点
 
@@ -202,8 +215,10 @@ async def analyze_financials(request: Request, req: AnalyzeRequest):
 # AI 报告 CRUD(历史报告持久化)
 # ================================================================
 
+
 class SaveReportRequest(BaseModel):
     """保存一条 AI 财务分析报告。"""
+
     symbol: str
     name: str = ""
     focus: str = ""
@@ -226,14 +241,16 @@ def save_report(request: Request, req: SaveReportRequest):
     """保存一条报告。"""
     capset = request.app.state.capabilities
     _require_financial(capset)
-    report = ai_reports.save_report({
-        "symbol": req.symbol,
-        "name": req.name,
-        "focus": req.focus,
-        "content": req.content,
-        "periods": req.periods,
-        "summary": req.summary,
-    })
+    report = ai_reports.save_report(
+        {
+            "symbol": req.symbol,
+            "name": req.name,
+            "focus": req.focus,
+            "content": req.content,
+            "periods": req.periods,
+            "summary": req.summary,
+        }
+    )
     return {"ok": True, "report": report}
 
 
