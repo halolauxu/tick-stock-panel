@@ -24,7 +24,9 @@ services:
       # 将主机 Codex Desktop 的 loopback local-access 端点映射到 Docker host gateway。
       - CODEX_DOCKER_HOST=host.docker.internal
     volumes:
-      - ./data:/app/data
+      # 本地开发默认沿用仓库内 data；服务器可通过 DATA_DIR_HOST 将业务数据
+      # 挂载到独立数据盘，避免行情与财务历史占用系统盘。
+      - ${DATA_DIR_HOST:-./data}:/app/data
       - ./tiers.yaml:/app/tiers.yaml:ro
       # 保留原始 dotenv 值供首次密码初始化读取，避免 Compose 展开密码中的 $VAR。
       - ./.env:/app/.env:ro
