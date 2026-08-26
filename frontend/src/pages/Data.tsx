@@ -189,15 +189,19 @@ export function Data() {
     minute: 'minute',
     financials: 'financial',
   }
-  // 当前 custom 源支持的数据集集合
-  const activeCustomDatasets = activeProvider !== 'tickflow'
-    ? new Set(dataSources.data?.custom?.find(s => s.name === activeProvider)?.datasets || [])
-    : new Set<string>()
   // 给定 tierKey, 返回 custom provider 显示名 (走 custom 时) 或 null (走 TickFlow)
   const getCustomProviderName = (tierKey: string): string | null => {
-    if (activeProvider === 'tickflow') return null
+    const selectedProvider = tierKey === 'minute'
+      ? (prefs.data?.minute_data_provider || 'tickflow')
+      : tierKey === 'financials'
+        ? (prefs.data?.financial_data_provider || 'tickflow')
+        : tierKey === 'adj_factor'
+          ? (prefs.data?.adj_factor_provider || activeProvider)
+          : activeProvider
+    if (selectedProvider === 'tickflow') return null
     const ds = TIERKEY_TO_DATASET[tierKey]
-    if (ds && activeCustomDatasets.has(ds)) return activeDataSourceName
+    const source = dataSources.data?.custom?.find(s => s.name === selectedProvider)
+    if (ds && source?.datasets?.includes(ds)) return source.display_name || selectedProvider
     return null
   }
 
@@ -323,7 +327,7 @@ export function Data() {
     symbols_covered: s.etf_daily?.symbols_covered ?? s.etf_instruments?.rows ?? 0,
     trading_days: s.etf_daily?.trading_days ?? s.etf_enriched?.trading_days ?? 0,
   } : null
-  const indexOverviewLabel = s ? '日 · 维表 · 日K · 指标' : undefined
+  const indexOverviewLabel = s ? '维表 · 日K · 指标' : undefined
   const indexEarliestDate = s?.index_daily?.earliest_date ?? s?.index_enriched?.earliest_date ?? null
   const indexOffsetDays = indexExtendUnit === 'month' ? indexExtendValue * 30 : indexExtendValue * 365
   const indexTargetDate = (() => {
