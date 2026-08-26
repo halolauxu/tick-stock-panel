@@ -975,17 +975,27 @@ async def sync_minute(request: Request):
             days = override_days if override_days else get_minute_sync_days()
             # extend=1 → 向前扩展; days>=365 也自动向前扩展
             extend_backward = bool(extend_flag) or days >= 365
+            progress_pct = [10]
 
             def _on_chunk(done: int, total: int, seg_label: str) -> None:
                 # 进度映射: 10% (标的池解析完) → 95%, 留 5% 给写入+刷新
                 pct = 10 + int((done / max(total, 1)) * 85)
-                progress("sync_minute", pct, f"拉取分钟K… {done}/{total} 批 [{seg_label}]")
+                progress_pct[0] = max(progress_pct[0], pct)
+                progress("sync_minute", pct, f"采集分钟K… {done}/{total} 只 [{seg_label}]")
+
+            def _on_persist(done: int, total: int, trade_date: str) -> None:
+                progress(
+                    "sync_minute",
+                    progress_pct[0],
+                    f"逐交易日合并落盘… {done}/{total} 日 [{trade_date}]",
+                )
 
             def _run():
                 return kline_sync.sync_and_persist_minute(
                     universe, repo, capset, days=days,
                     extend_backward=extend_backward,
                     on_chunk_done=_on_chunk,
+                    on_persist_done=_on_persist,
                 )
 
             written = await loop.run_in_executor(_long_task_executor, _run)

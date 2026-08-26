@@ -208,24 +208,16 @@ class TushareProvider:
         if asset_type != "stock":
             raise TushareError(f"当前权限仅覆盖 A股历史分钟, 不支持 asset_type={asset_type}")
 
-        tushare_freq = _normalize_freq(freq)
-        start = _beijing_wall_clock(start_time)
-        end = _beijing_wall_clock(end_time)
         frames: list[pl.DataFrame] = []
-        total = len(symbols)
-
-        for index, symbol in enumerate(symbols, start=1):
-            rows = self._get_client().stock_minutes(
-                symbol,
-                freq=tushare_freq,
-                start_time=start,
-                end_time=end,
-            )
-            frame = self._minute_df(rows)
-            if not frame.is_empty():
-                frames.append(frame)
-            if on_chunk_done is not None:
-                on_chunk_done(index, total)
+        self.stream_minute(
+            symbols,
+            start_time=start_time,
+            end_time=end_time,
+            asset_type=asset_type,
+            freq=freq,
+            on_batch=frames.append,
+            on_chunk_done=on_chunk_done,
+        )
 
         if not frames:
             return pl.DataFrame()
@@ -237,6 +229,65 @@ class TushareProvider:
             )
             .sort(["symbol", "datetime"])
         )
+
+    def stream_minute(
+        self,
+        symbols: list[str],
+        start_time: datetime | None,
+        end_time: datetime | None,
+        asset_type: AssetType = "stock",
+        freq: str = "1m",
+        on_batch: Callable[[pl.DataFrame], None] | None = None,
+        on_chunk_done: Callable[[int, int], None] | None = None,
+        batch_symbols: int = 100,
+    ) -> None:
+        """Bounded-memory minute fetch used by full-market persistence.
+
+        Tushare ``stk_mins`` is queried per symbol.  Emitting at most
+        ``batch_symbols`` frames prevents a full-market range from being held in
+        one Python list before persistence.  The caller additionally splits the
+        requested time range so every per-symbol request stays below Tushare's
+        8,000-row response limit.
+        """
+        if not symbols:
+            return
+        if asset_type != "stock":
+            raise TushareError(f"当前权限仅覆盖 A股历史分钟, 不支持 asset_type={asset_type}")
+
+        tushare_freq = _normalize_freq(freq)
+        start = _beijing_wall_clock(start_time)
+        end = _beijing_wall_clock(end_time)
+        batch_symbols = max(1, int(batch_symbols))
+        frames: list[pl.DataFrame] = []
+        total = len(symbols)
+
+        def flush() -> None:
+            if not frames:
+                return
+            batch = (
+                pl.concat(frames, how="diagonal_relaxed")
+                .unique(subset=["symbol", "datetime"], keep="last")
+                .sort(["symbol", "datetime"])
+            )
+            frames.clear()
+            if on_batch is not None and not batch.is_empty():
+                on_batch(batch)
+
+        for index, symbol in enumerate(symbols, start=1):
+            rows = self._get_client().stock_minutes(
+                symbol,
+                freq=tushare_freq,
+                start_time=start,
+                end_time=end,
+            )
+            frame = self._minute_df(rows)
+            if not frame.is_empty():
+                frames.append(frame)
+            if len(frames) >= batch_symbols:
+                flush()
+            if on_chunk_done is not None:
+                on_chunk_done(index, total)
+        flush()
 
     def get_financials(
         self,

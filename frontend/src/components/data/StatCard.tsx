@@ -90,6 +90,7 @@ export function StatCard({
   active = false, done = false, skipped = false, stagePct = 0,
   tierKey, capLimits, customProvider,
   auto, onSettings, onShowFields, settingsOpen, subLabel, localBadgeSuffix, fieldTabs,
+  metricValue, rangeStartLabel, rangeEndLabel, rangeStartValue, rangeEndValue,
 }: {
   title: string
   hint: string
@@ -109,6 +110,11 @@ export function StatCard({
   auto?: boolean
   subLabel?: string
   localBadgeSuffix?: string
+  metricValue?: number | string | null
+  rangeStartLabel?: string
+  rangeEndLabel?: string
+  rangeStartValue?: string | null
+  rangeEndValue?: string | null
   // 多表字段入口: [{label: '维表', table: 'index_instruments'}, ...]
   // 提供时渲染多个图标按钮(每个对应一张表的字段说明); 否则回退到单个 onShowFields
   fieldTabs?: FieldTab[]
@@ -266,7 +272,9 @@ export function StatCard({
         ) : (
           <>
             <div className="font-mono text-2xl font-bold tracking-tight tabular-nums text-foreground">
-              {stats.fields
+              {metricValue !== undefined && metricValue !== null
+                ? (typeof metricValue === 'number' ? metricValue.toLocaleString() : metricValue)
+                : stats.fields
                 ? stats.fields
                 : stats.trading_days && !stats.rows
                   ? stats.trading_days.toLocaleString()
@@ -288,23 +296,23 @@ export function StatCard({
         ) : empty ? (
           <>
             <div className="flex justify-between text-[11px]">
-              <span className="text-muted">{isInstrument ? '快照日' : '起'}</span>
+              <span className="text-muted">{isInstrument ? '快照日' : (rangeStartLabel ?? '最早数据日')}</span>
               <span className="font-mono text-secondary">—</span>
             </div>
             <div className="flex justify-between text-[11px]">
-              <span className="text-muted">{isInstrument ? '标的数' : '止'}</span>
+              <span className="text-muted">{isInstrument ? '标的数' : (rangeEndLabel ?? '最新数据日')}</span>
               <span className="font-mono text-secondary">—</span>
             </div>
           </>
         ) : (
           <>
             <div className="flex justify-between text-[11px]">
-              <span className="text-muted">{isInstrument ? '快照日' : '起'}</span>
-              <span className="font-mono text-secondary">{fmtDate(isInstrument ? stats.latest_as_of : stats.earliest_date)}</span>
+              <span className="text-muted">{isInstrument ? '快照日' : (rangeStartLabel ?? '最早数据日')}</span>
+              <span className="font-mono text-secondary">{fmtDate(isInstrument ? stats.latest_as_of : (rangeStartValue ?? stats.earliest_date))}</span>
             </div>
             <div className="flex justify-between text-[11px]">
-              <span className="text-muted">{isInstrument ? '标的数' : '止'}</span>
-              <span className="font-mono text-secondary">{isInstrument ? String(stats.rows) : fmtDate(stats.latest_date)}</span>
+              <span className="text-muted">{isInstrument ? '标的数' : (rangeEndLabel ?? '最新数据日')}</span>
+              <span className="font-mono text-secondary">{isInstrument ? String(stats.rows) : fmtDate(rangeEndValue ?? stats.latest_date)}</span>
             </div>
           </>
         )}

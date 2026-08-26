@@ -191,6 +191,28 @@ def test_provider_empty_symbols_does_not_create_client():
     assert provider._client is None
 
 
+def test_provider_streams_bounded_symbol_batches():
+    provider = TushareProvider()
+    fake = _FakeClient()
+    provider._client = fake
+    emitted: list[pl.DataFrame] = []
+    progress: list[tuple[int, int]] = []
+
+    provider.stream_minute(
+        [f"00000{i}.SZ" for i in range(5)],
+        datetime(2026, 8, 25),
+        datetime(2026, 8, 26),
+        batch_symbols=2,
+        on_batch=emitted.append,
+        on_chunk_done=lambda current, total: progress.append((current, total)),
+    )
+
+    assert len(emitted) == 3
+    assert all(frame.height <= 2 for frame in emitted)
+    assert len(fake.calls) == 5
+    assert progress[-1] == (5, 5)
+
+
 def test_get_api_key_uses_secrets_store_before_environment(monkeypatch):
     monkeypatch.setenv(tp.API_KEY_ENV, "token-from-env")
     monkeypatch.setattr(tp.secrets_store, "load", lambda: {tp.SECRETS_FIELD: "token-from-ui"})

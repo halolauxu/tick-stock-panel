@@ -7,9 +7,13 @@
 """
 from __future__ import annotations
 
+import json
 import logging
+import shutil
+import uuid
 from collections.abc import Callable
 from datetime import date, datetime, timedelta
+from pathlib import Path
 
 import polars as pl
 
@@ -527,8 +531,204 @@ def _write_minute_partition(df: pl.DataFrame, minute_dir) -> int:
             day_df = day_df.drop("_trade_date")
         day_df = day_df.sort("symbol", "datetime")
         _atomic_write_parquet(day_df, out)
+        _write_minute_coverage(day_df, out.parent)
         written += day_df.height
     return written
+
+
+def _minute_coverage_payload(df: pl.DataFrame) -> dict[str, object]:
+    """Return cheap per-day completeness metadata for the status page."""
+    if df.is_empty():
+        return {"rows": 0, "symbols": 0, "full_symbols": 0, "min_bars": 0, "max_bars": 0}
+    bars = df.group_by("symbol").len().get_column("len")
+    max_bars = int(bars.max() or 0)
+    # A full A-share 1-minute session normally has 241 bars in this provider.
+    # Values below 200 are boundary/intraday fragments and must never be called complete.
+    full_symbols = int((bars >= max_bars).sum()) if max_bars >= 200 else 0
+    return {
+        "rows": int(df.height),
+        "symbols": int(bars.len()),
+        "full_symbols": full_symbols,
+        "min_bars": int(bars.min() or 0),
+        "max_bars": max_bars,
+        "updated_at": datetime.now().isoformat(timespec="seconds"),
+    }
+
+
+def _write_minute_coverage(df: pl.DataFrame, day_dir: Path) -> None:
+    payload = _minute_coverage_payload(df)
+    out = day_dir / "stats.json"
+    tmp = out.with_name(f".{out.name}.{uuid.uuid4().hex}.tmp")
+    tmp.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+    tmp.replace(out)
+
+
+def rebuild_minute_coverage_metadata(data_dir: Path) -> int:
+    """Build per-day sidecars for legacy minute partitions, one day at a time."""
+    minute_dir = data_dir / "kline_minute"
+    rebuilt = 0
+    if not minute_dir.exists():
+        return rebuilt
+    for day_dir in sorted(minute_dir.glob("date=*")):
+        files = sorted(day_dir.glob("*.parquet"))
+        if not files:
+            continue
+        frame = pl.read_parquet(files)
+        if "datetime" in frame.columns:
+            frame = frame.filter(pl.col("datetime").is_not_null())
+        _write_minute_coverage(frame, day_dir)
+        rebuilt += 1
+    return rebuilt
+
+
+def _daily_expected_symbols(data_dir: Path, trade_date: str) -> int:
+    day_dir = data_dir / "kline_daily" / f"date={trade_date}"
+    files = sorted(day_dir.glob("*.parquet")) if day_dir.exists() else []
+    if not files:
+        return 0
+    try:
+        return int(
+            pl.scan_parquet(files)
+            .select(pl.col("symbol").n_unique())
+            .collect()
+            .item()
+            or 0
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("daily expected-symbol count failed for %s: %s", trade_date, exc)
+        return 0
+
+
+def minute_coverage_summary(data_dir: Path) -> dict[str, object] | None:
+    """Read per-day sidecars and classify full-market minute coverage."""
+    minute_dir = data_dir / "kline_minute"
+    if not minute_dir.exists():
+        return None
+    records: list[dict[str, object]] = []
+    for day_dir in sorted(d for d in minute_dir.glob("date=*") if d.is_dir()):
+        stats_path = day_dir / "stats.json"
+        try:
+            stats = json.loads(stats_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError, TypeError):
+            stats = {
+                "rows": 0,
+                "symbols": 0,
+                "full_symbols": 0,
+                "min_bars": 0,
+                "max_bars": 0,
+                "metadata_missing": True,
+            }
+        trade_date = day_dir.name[5:]
+        expected = _daily_expected_symbols(data_dir, trade_date)
+        symbols = int(stats.get("symbols") or 0)
+        full_symbols = int(stats.get("full_symbols") or 0)
+        max_bars = int(stats.get("max_bars") or 0)
+        baseline = expected or symbols
+        required = (baseline * 98 + 99) // 100 if baseline else 0
+        complete = bool(max_bars >= 200 and required and full_symbols >= required)
+        records.append({
+            **stats,
+            "date": trade_date,
+            "expected_symbols": expected,
+            "complete": complete,
+        })
+    if not records:
+        return None
+
+    complete_records = [record for record in records if record["complete"]]
+    return {
+        "rows": sum(int(record.get("rows") or 0) for record in records),
+        "symbols_covered": max(int(record.get("symbols") or 0) for record in records),
+        "trading_days": len(records),
+        "complete_days": len(complete_records),
+        "incomplete_days": len(records) - len(complete_records),
+        "earliest_date": str(records[0]["date"]),
+        "latest_date": str(records[-1]["date"]),
+        "earliest_complete_date": (
+            str(complete_records[0]["date"]) if complete_records else None
+        ),
+        "latest_complete_date": (
+            str(complete_records[-1]["date"]) if complete_records else None
+        ),
+        "metadata_complete": all(not record.get("metadata_missing") for record in records),
+        "dates": records,
+    }
+
+
+def find_minute_repair_start(data_dir: Path) -> date | None:
+    """Find the first incomplete day after coverage has begun.
+
+    A deliberately partial leading boundary (for example the first day of a
+    backward range) is not treated as a hole.  Missing sidecars are rebuilt
+    once, one day at a time, before making this decision.
+    """
+    summary = minute_coverage_summary(data_dir)
+    if summary is None:
+        return None
+    if not bool(summary.get("metadata_complete")):
+        rebuild_minute_coverage_metadata(data_dir)
+        summary = minute_coverage_summary(data_dir)
+    if summary is None:
+        return None
+    seen_complete = False
+    for record in summary.get("dates", []):
+        if record.get("complete"):
+            seen_complete = True
+        elif seen_complete:
+            return date.fromisoformat(str(record["date"]))
+    return None
+
+
+def _stage_minute_batch(df: pl.DataFrame, staging_dir: Path) -> None:
+    """Persist one bounded provider batch into date-partitioned staging files."""
+    if df.is_empty():
+        return
+    staged = df.with_columns(pl.col("datetime").dt.date().alias("_trade_date"))
+    for day_df in staged.partition_by("_trade_date"):
+        trade_date = day_df["_trade_date"][0]
+        day_dir = staging_dir / f"date={trade_date}"
+        day_dir.mkdir(parents=True, exist_ok=True)
+        out = day_dir / f"part-{uuid.uuid4().hex}.parquet"
+        _atomic_write_parquet(day_df.drop("_trade_date"), out)
+
+
+def _flush_staged_minute_days(
+    staging_dir: Path,
+    minute_dir: Path,
+    on_day_done: Callable[[int, int, str], None] | None = None,
+) -> int:
+    """Merge staged batches into final storage one trading day at a time."""
+    day_dirs = sorted(d for d in staging_dir.glob("date=*") if d.is_dir())
+    written = 0
+    total = len(day_dirs)
+    for index, day_dir in enumerate(day_dirs, start=1):
+        files = sorted(day_dir.glob("*.parquet"))
+        if not files:
+            continue
+        day_df = pl.read_parquet(files)
+        written += _write_minute_partition(day_df, minute_dir)
+        if on_day_done is not None:
+            on_day_done(index, total, day_dir.name[5:])
+        shutil.rmtree(day_dir, ignore_errors=True)
+    return written
+
+
+def _minute_time_segments(
+    start_time: datetime | None,
+    end_time: datetime | None,
+    segment_trading_days: int,
+) -> list[tuple[datetime | None, datetime | None]]:
+    if not start_time or not end_time:
+        return [(None, None)]
+    seg_calendar_days = max(1, int(segment_trading_days * 7 / 5))
+    step = timedelta(days=seg_calendar_days)
+    segments: list[tuple[datetime | None, datetime | None]] = []
+    seg_start = start_time
+    while seg_start < end_time:
+        seg_end = min(seg_start + step, end_time)
+        segments.append((seg_start, seg_end))
+        seg_start = seg_end
+    return segments
 
 
 def _resolve_minute_provider(
@@ -623,6 +823,7 @@ def sync_minute_batch(
     on_chunk_done: Callable[[int, int, str], None] | None = None,
     segment_trading_days: int = 20,
     on_segment: Callable[[pl.DataFrame], None] | None = None,
+    on_segment_done: Callable[[int, int, str], None] | None = None,
     asset_type: AssetType = "stock",
 ) -> pl.DataFrame:
     """批量拉取多股分钟 K。
@@ -641,6 +842,58 @@ def sync_minute_batch(
         不进入全局 out → 内存峰值从「全量」降到「单段」。适用于 sync_and_persist_minute。
         不传时 (如 get_minute_batch 的实时补拉) 保持原契约: 累积进 out 末尾一次性返回。
     """
+    time_segments = _minute_time_segments(start_time, end_time, segment_trading_days)
+
+    # Tushare exposes a bounded streaming contract.  Use it only for persistent
+    # full-market jobs (on_segment is present); realtime callers keep the
+    # original DataFrame-returning provider contract below.
+    provider_name = preferences.get_minute_data_provider()
+    provider, provider_fallback, provider_error = _resolve_minute_provider(provider_name)
+    # Inspect the provider type first so MagicMock/dynamic __getattr__ providers
+    # do not accidentally appear to implement the explicit streaming contract.
+    stream_contract = getattr(type(provider), "stream_minute", None) if provider is not None else None
+    stream_minute = getattr(provider, "stream_minute", None) if callable(stream_contract) else None
+    if on_segment is not None and not provider_fallback and callable(stream_minute):
+        total_steps = len(time_segments) * len(symbols)
+        for seg_idx, (cur_start, cur_end) in enumerate(time_segments):
+            seg_label = (
+                f"{cur_start.strftime('%m-%d')}~{cur_end.strftime('%m-%d')}"
+                if cur_start and cur_end else "最新"
+            )
+            offset = seg_idx * len(symbols)
+
+            def _stream_progress(
+                cur: int,
+                _total: int,
+                *,
+                _offset: int = offset,
+                _label: str = seg_label,
+            ) -> None:
+                if on_chunk_done is not None:
+                    on_chunk_done(_offset + cur, total_steps, _label)
+
+            # Streaming failures are not silently routed to TickFlow after
+            # partial staging; surfacing the failure keeps job state truthful.
+            stream_minute(
+                symbols,
+                start_time=cur_start,
+                end_time=cur_end,
+                asset_type=asset_type,
+                freq="1m",
+                on_batch=on_segment,
+                on_chunk_done=_stream_progress,
+                batch_symbols=batch_size or 100,
+            )
+            if on_segment_done is not None:
+                on_segment_done(seg_idx + 1, len(time_segments), seg_label)
+        return pl.DataFrame()
+    if provider_fallback and provider_error is not None:
+        logger.warning(
+            "custom minute provider %s resolution failed, falling back to TickFlow: %s",
+            provider_name,
+            provider_error,
+        )
+
     df, fallback = _try_custom_minute(
         symbols, start_time=start_time, end_time=end_time,
         asset_type=asset_type, freq="1m", on_chunk_done=on_chunk_done,
@@ -653,24 +906,12 @@ def sync_minute_batch(
         if on_segment and not df.is_empty():
             # 空 df 不调 on_segment, 与 TickFlow 路径 `if seg_out:` (L684) 对称
             on_segment(df)
+            if on_segment_done is not None:
+                on_segment_done(1, 1, "custom")
             return pl.DataFrame()
         return df
 
     tf = get_client()
-
-    # TickFlow count 上限 10000 根/股, 1 天 240 根 → 单次最多约 41 个交易日。
-    # 按 segment_trading_days 交易日分段 (交易日→自然日 ×7/5 换算, 含节假日余量)。
-    seg_calendar_days = max(1, int(segment_trading_days * 7 / 5))
-    SEG_CHUNK = timedelta(days=seg_calendar_days)
-    time_segments: list[tuple[datetime | None, datetime | None]] = []
-    if start_time and end_time:
-        seg_start = start_time
-        while seg_start < end_time:
-            seg_end = min(seg_start + SEG_CHUNK, end_time)
-            time_segments.append((seg_start, seg_end))
-            seg_start = seg_end
-    else:
-        time_segments = [(None, None)]  # fallback: 用 count 模式
 
     total_steps = len(time_segments) * len(chunked(symbols, batch_size))
     step = 0
@@ -726,6 +967,8 @@ def sync_minute_batch(
             else:
                 out.extend(seg_out)
             seg_out = []
+        if on_segment_done is not None:
+            on_segment_done(seg_idx + 1, seg_total, seg_label)
 
     if not out:
         return pl.DataFrame()
@@ -1001,6 +1244,7 @@ def sync_and_persist_minute(
     capset: CapabilitySet,
     days: int = 5,
     on_chunk_done: Callable[[int, int, str], None] | None = None,
+    on_persist_done: Callable[[int, int, str], None] | None = None,
     extend_backward: bool = False,
     force_full_days: bool = False,
 ) -> int:
@@ -1040,7 +1284,7 @@ def sync_and_persist_minute(
         # (分段由 sync_minute_batch 的 segment_trading_days 控制, 与此处的区间天数独立。)
         calendar_days = int(days * 7 / 5) + (10 if days > 41 else 0)
         if earliest_dt:
-            end_time = earliest_dt
+            end_time = datetime.combine(earliest_dt.date(), datetime.min.time())
             start_time = end_time - timedelta(days=calendar_days)
         else:
             # 本地无数据 → 从今天往前拉
@@ -1055,7 +1299,12 @@ def sync_and_persist_minute(
             calendar_days = int(days * 7 / 5) + 5
             start_time = now - timedelta(days=calendar_days)
         elif last_dt:
-            start_time = last_dt
+            repair_start = find_minute_repair_start(repo.store.data_dir)
+            start_time = (
+                datetime.combine(repair_start, datetime.min.time())
+                if repair_start is not None
+                else last_dt
+            )
         else:
             start_time = now - timedelta(days=days)
         end_time = now
@@ -1068,26 +1317,39 @@ def sync_and_persist_minute(
         default_rpm_when_unset=False,
     )
 
-    # 流式落盘: 每段拉完立即写盘, 内存峰值 = 单段 (而非全量)。
-    # 全量攒内存曾导致 1 年全市场分钟 K OOM 卡死 (3 亿行 / 数十 GB)。
+    # 自定义源按标的批次写 staging；每个时间段完成后再逐交易日合并到最终分区。
+    # 内存峰值由「全市场全部日期」降为「一个标的批次 / 一个交易日」。
     minute_dir = repo.store.data_dir / "kline_minute"
+    staging_dir = repo.store.data_dir / ".minute_staging" / uuid.uuid4().hex
+    staging_dir.mkdir(parents=True, exist_ok=True)
     written_box = [0]  # list 闭包, 绕过 Python 闭包外层赋值
 
-    def _persist(seg_df: pl.DataFrame) -> None:
-        # 单股自动补齐可能与另一个补齐请求同时写同一日期分区。Windows 不允许
-        # 替换仍被另一写入占用的临时文件,因此读-改-写必须复用仓库写锁。
+    def _stage(seg_df: pl.DataFrame) -> None:
+        _stage_minute_batch(seg_df, staging_dir)
+
+    def _finish_segment(_current: int, _total: int, _label: str) -> None:
+        # 单股自动补齐可能与另一个请求同时写同一日期分区；最终的
+        # read-merge-write 必须复用仓库写锁。
         with repo._write_lock:
-            written_box[0] += _write_minute_partition(seg_df, minute_dir)
+            written_box[0] += _flush_staged_minute_days(
+                staging_dir,
+                minute_dir,
+                on_day_done=on_persist_done,
+            )
 
     segment_days = preferences.get_minute_sync_segment_days()
-    sync_minute_batch(
-        symbols, start_time=start_time, end_time=end_time,
-        batch_size=limit.batch, rpm=limit.rpm,
-        on_chunk_done=on_chunk_done,
-        segment_trading_days=segment_days,
-        on_segment=_persist,
-        asset_type="stock",
-    )
+    try:
+        sync_minute_batch(
+            symbols, start_time=start_time, end_time=end_time,
+            batch_size=limit.batch, rpm=limit.rpm,
+            on_chunk_done=on_chunk_done,
+            segment_trading_days=segment_days,
+            on_segment=_stage,
+            on_segment_done=_finish_segment,
+            asset_type="stock",
+        )
+    finally:
+        shutil.rmtree(staging_dir, ignore_errors=True)
 
     if written_box[0] == 0:
         return 0

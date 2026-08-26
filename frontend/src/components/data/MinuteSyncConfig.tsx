@@ -56,17 +56,26 @@ export function MinuteSyncConfig({ caps, onJobStart }: { caps: { label: string; 
   })
 
   // 手动获取 (两个独立按钮, 各自指定天数, 不影响自动同步偏好)
-  const [fetchingMode, setFetchingMode] = useState<'' | '40d' | '1y'>('')
+  const [fetchingMode, setFetchingMode] = useState<'' | 'repair' | '40d' | '1y'>('')
+  const startJob = (res: { job_id?: string }) => {
+    qc.invalidateQueries({ queryKey: QK.pipelineJobs })
+    qc.invalidateQueries({ queryKey: QK.dataStatus })
+    if (res.job_id && onJobStart) onJobStart(res.job_id)
+  }
+
+  const handleRepair = () => {
+    if (!hasMinuteCap) return
+    setFetchingMode('repair')
+    api.syncMinute().then(startJob).finally(() => setFetchingMode(''))
+  }
+
   const handleFetch = (mode: '40d' | '1y') => {
     if (!hasMinuteCap) return
     // 单次获取 = 按「分段大小」拉一段 (向前扩展); 1年 = 拉365天按分段切多段
     const fetchDays = mode === '40d' ? localSegment : 365
     setFetchingMode(mode)
     api.syncMinute(fetchDays, true).then((res) => {
-      qc.invalidateQueries({ queryKey: QK.pipelineJobs })
-      qc.invalidateQueries({ queryKey: QK.dataStatus })
-      // 通知主页面跟踪 job 进度 (ActiveJobCard 会显示实时进度+日志)
-      if (res.job_id && onJobStart) onJobStart(res.job_id)
+      startJob(res)
     }).finally(() => setFetchingMode(''))
   }
 
@@ -116,7 +125,7 @@ export function MinuteSyncConfig({ caps, onJobStart }: { caps: { label: string; 
         </div>
       </div>
 
-      {/* 分段大小: 控制单次 SDK 请求覆盖的交易日数。每段拉完即落盘,避免全量攒内存 OOM。
+      {/* 分段大小: 控制单次 SDK 请求覆盖的交易日数。分批暂存后逐日落盘,避免全量攒内存 OOM。
           「往前获取」与「获取 1 年」共用此设置 (两者都经过 sync_and_persist_minute)。 */}
       <div className="flex items-center justify-between">
         <div className="flex items-center gap-1.5">
@@ -143,7 +152,7 @@ export function MinuteSyncConfig({ caps, onJobStart }: { caps: { label: string; 
         </div>
       </div>
       <div className="text-[10px] text-muted leading-relaxed -mt-1">
-        每段拉完即写盘,避免内存堆积。越小越省内存但越慢,默认 20 平衡。
+        每批先写临时分区，每段再逐交易日合并，避免内存堆积。越小越省内存但越慢。
       </div>
       </div>
 
@@ -154,6 +163,17 @@ export function MinuteSyncConfig({ caps, onJobStart }: { caps: { label: string; 
           <span className="text-[11px] text-secondary font-medium">手动获取</span>
           <span className="text-[10px] text-muted">不受自动同步开关影响</span>
         </div>
+        <button
+          onClick={handleRepair}
+          disabled={!hasMinuteCap || fetchingMode !== ''}
+          className="w-full inline-flex items-center justify-center gap-1.5 px-2 py-2 rounded-btn bg-accent/90 text-foreground text-xs font-medium hover:bg-accent disabled:opacity-40 transition-colors duration-150"
+        >
+          {fetchingMode === 'repair' ? (
+            <><Loader2 className="h-3.5 w-3.5 animate-spin" /><span>检查并补齐中…</span></>
+          ) : (
+            <><Download className="h-3.5 w-3.5" /><span>检查并补齐不完整交易日</span></>
+          )}
+        </button>
         <div className="grid grid-cols-2 gap-2">
         <button
           onClick={() => handleFetch('40d')}
@@ -179,8 +199,8 @@ export function MinuteSyncConfig({ caps, onJobStart }: { caps: { label: string; 
         </button>
         </div>
         <div className="text-[10px] text-muted leading-relaxed">
-          A股标的 · 前复权价格 · 从本地最早数据向前叠加 ·{' '}
-          均按上方「分段大小」分段拉取、每段即落盘
+          补齐会从第一个不完整交易日继续；历史扩展则从本地最早日期向前叠加。{' '}
+          采集按标的分批暂存，随后逐交易日合并落盘。
         </div>
       </div>
 

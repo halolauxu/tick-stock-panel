@@ -380,32 +380,14 @@ def _safe_aggregate_adj_factor(repo) -> dict | None:
 
 
 def _safe_aggregate_minute(repo) -> dict | None:
-    """kline_minute 统计 — 从分区目录名获取交易日数，跳过全表扫描。
+    """kline_minute 统计 — 读逐日 sidecar，不扫描四千多万行明细。"""
+    from app.services.kline_sync import minute_coverage_summary
 
-    分钟 K 按 date=YYYY-MM-DD 分区存储，直接数目录即可，
-    无需 count(*) / count(DISTINCT ...) 等昂贵查询。
-    """
-    minute_dir = repo.store.data_dir / "kline_minute"
-    if not minute_dir.exists():
+    summary = minute_coverage_summary(repo.store.data_dir)
+    if summary is None:
         return None
-
-    # 从 date=YYYY-MM-DD 目录名提取交易日
-    dates: list[str] = []
-    for d in minute_dir.iterdir():
-        if d.is_dir() and d.name.startswith("date="):
-            dates.append(d.name[5:])
-
-    if not dates:
-        return None
-
-    dates.sort()
-    return {
-        "rows": 0,  # 不再查询行数
-        "earliest_date": dates[0],
-        "latest_date": dates[-1],
-        "symbols_covered": 0,  # 不再查询标的数
-        "trading_days": len(dates),
-    }
+    # 逐日明细只供服务端判断缺口，页面状态无需传输。
+    return {key: value for key, value in summary.items() if key != "dates"}
 
 
 def _safe_aggregate_supplemental(repo, dataset: str) -> dict | None:

@@ -427,6 +427,8 @@ export function Data() {
             capLimits={caps.data?.capabilities}
             customProvider={getCustomProviderName('daily')}
             auto
+            metricValue={s?.daily?.trading_days}
+            subLabel="个交易日 · A股日线"
             onShowFields={() => setSchemaTable('daily')}
             onSettings={hasData ? () => setOpenSettings(v => v === 'daily' ? null : 'daily') : undefined}
             settingsOpen={openSettings === 'daily'}
@@ -464,7 +466,8 @@ export function Data() {
             tierKey="enriched"
             capLimits={caps.data?.capabilities}
             auto
-            subLabel={status.data?.indicators_ready === false ? '字段 · 指标计算中…' : '字段 · 指标 · 信号'}
+            metricValue={(s?.enriched as any)?.fields}
+            subLabel={status.data?.indicators_ready === false ? '个字段 · 指标计算中…' : '个字段 · 指标 · 信号'}
             localBadgeSuffix={`${prefs.data?.enriched_batch_size ?? 1000}只/批`}
             onShowFields={() => setSchemaTable('enriched')}
             onSettings={hasData ? () => setOpenSettings(v => v === 'enriched' ? null : 'enriched') : undefined}
@@ -485,7 +488,8 @@ export function Data() {
             tierKey="daily"
             capLimits={caps.data?.capabilities}
             auto={indexAuto}
-            subLabel={indexOverviewLabel}
+            metricValue={indexOverviewStats?.trading_days}
+            subLabel={`个交易日 · ${indexOverviewLabel}`}
             fieldTabs={[
               { label: '维表', table: 'index_instruments' },
               { label: '日K', table: 'index_daily' },
@@ -531,6 +535,10 @@ export function Data() {
             capLimits={caps.data?.capabilities}
             customProvider={getCustomProviderName('minute')}
             auto={minuteAuto}
+            metricValue={s?.minute ? `${(s.minute as any).complete_days ?? 0} / ${s.minute.trading_days ?? 0}` : null}
+            subLabel={`完整 / 已落盘交易日 · ${(s?.minute?.rows ?? 0).toLocaleString()} 行`}
+            rangeEndLabel="最新完整日"
+            rangeEndValue={(s?.minute as any)?.latest_complete_date}
             onShowFields={() => setSchemaTable('minute')}
             onSettings={hasData ? () => setOpenSettings(v => v === 'minute' ? null : 'minute') : undefined}
             settingsOpen={openSettings === 'minute'}
@@ -605,7 +613,8 @@ export function Data() {
             tierKey="regime"
             capLimits={caps.data?.capabilities}
             auto={prefs.data?.pipeline_regime_enabled === true}
-            subLabel="状态 · 综合分 · 指标"
+            metricValue={regimeCoverage.data?.rows}
+            subLabel="个交易日 · 状态 · 综合分 · 指标"
             onSettings={hasData ? () => setOpenSettings(v => v === 'regime' ? null : 'regime') : undefined}
             settingsOpen={openSettings === 'regime'}
           />
