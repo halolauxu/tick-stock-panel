@@ -634,7 +634,7 @@ export function Data() {
       <div ref={topRef} />
       <PageHeader
         title="数据"
-        subtitle="本地数据画像 · 同步状态 · 历史记录"
+        subtitle="本地数据画像 · 同步状态"
         right={
           <div className="flex items-center gap-3">
             {!hasData && !isLoading && (
