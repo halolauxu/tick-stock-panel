@@ -13,6 +13,7 @@ import threading
 from collections.abc import Callable
 from datetime import UTC, datetime
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import polars as pl
 
@@ -26,6 +27,7 @@ _BATCH_SIZE = 100
 # 财务报表 + 历史股本表
 FINANCIAL_TABLES = ("metrics", "income", "balance_sheet", "cash_flow", "shares")
 FinancialProgressCallback = Callable[[int, int, int, int], None]
+_BEIJING_TZ = ZoneInfo("Asia/Shanghai")
 
 
 # ================================================================
@@ -507,6 +509,31 @@ class FinancialScheduler:
         except Exception as e:
             logger.warning("persist financial_sync_time(%s) failed: %s", e)
 
+    def _is_fresh_today(self, table: str, *, now: datetime | None = None) -> bool:
+        """已有落盘数据且今天成功同步过时,避免按钮重复扫描全市场。"""
+        if not self._data_dir:
+            return False
+        parquet = self._data_dir / "financials" / table / "part.parquet"
+        if not parquet.exists() or parquet.stat().st_size == 0:
+            return False
+        raw = self._last_sync.get(table)
+        if not raw:
+            return False
+        try:
+            synced_at = datetime.fromisoformat(raw)
+            if synced_at.tzinfo is None:
+                synced_at = synced_at.replace(tzinfo=UTC)
+        except (TypeError, ValueError):
+            return False
+        current = now or datetime.now(UTC)
+        if current.tzinfo is None:
+            current = current.replace(tzinfo=UTC)
+        return synced_at.astimezone(_BEIJING_TZ).date() == current.astimezone(_BEIJING_TZ).date()
+
+    def _tables_due_today(self, table: str | None) -> list[str]:
+        requested = [table] if table else list(FINANCIAL_TABLES)
+        return [name for name in requested if not self._is_fresh_today(name)]
+
     def update_capabilities(self, capset: CapabilitySet) -> None:
         """刷新调度器持有的能力集。
 
@@ -579,10 +606,10 @@ class FinancialScheduler:
             )
             self._record_sync(table)
             return {table: rows}
-        # 全部同步
+        # 全部同步只处理今天尚未成功同步的表,避免“全部同步”重复扫描已完成表。
         symbols = _get_symbols(self._data_dir)
         result: dict[str, int] = {}
-        for t in FINANCIAL_TABLES:
+        for t in self._tables_due_today(None):
             self._set_active_table(t)
             result[t] = _sync_history_table_for_symbols(
                 t,
@@ -658,6 +685,9 @@ class FinancialScheduler:
             if self._is_syncing:
                 logger.info("financial sync skipped: already running")
                 return {"_skipped": 1}
+            if not self._tables_due_today(table):
+                logger.info("financial sync skipped: already up to date: table=%s", table or "all")
+                return {"_skipped": 1, "_up_to_date": 1}
             self._begin_sync(table)
         try:
             return self._run_body(table)
@@ -683,6 +713,16 @@ class FinancialScheduler:
             if self._is_syncing:
                 logger.info("financial sync trigger skipped: already running")
                 return {"started": False, "reason": "already running"}
+            if not self._tables_due_today(table):
+                logger.info(
+                    "financial sync trigger skipped: already up to date: table=%s",
+                    table or "all",
+                )
+                return {
+                    "started": False,
+                    "reason": "already up to date",
+                    "tables": [table] if table else list(FINANCIAL_TABLES),
+                }
             # 持锁置位:保证 trigger 返回前 syncing 已为 True
             self._begin_sync(table)
 

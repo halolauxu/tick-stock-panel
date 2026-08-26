@@ -30,6 +30,14 @@ const TABLE_ICON: Record<string, typeof FileText> = {
 
 const TABLE_ORDER = ['metrics', 'income', 'balance_sheet', 'cash_flow', 'shares'] as const
 
+const isSyncedToday = (iso?: string): boolean => {
+  if (!iso) return false
+  const synced = new Date(iso)
+  if (Number.isNaN(synced.getTime())) return false
+  const dateKey = (date: Date) => date.toLocaleDateString('zh-CN', { timeZone: 'Asia/Shanghai' })
+  return dateKey(synced) === dateKey(new Date())
+}
+
 export function Financials() {
   const { data: caps } = useCapabilities()
   const { data: status, isLoading } = useFinancialStatus()
@@ -116,6 +124,10 @@ export function Financials() {
         if (!r.synced?.started) {
           if (r.synced?.reason === 'already running') {
             toast('财务数据正在同步中,请稍候', 'success')
+          } else if (r.synced?.reason === 'already up to date') {
+            toast(table === 'all'
+              ? '五张财务表今天均已更新，无需重复下载'
+              : `${TABLE_LABELS[table] ?? table}今天已更新，无需重复下载`, 'success')
           } else if (r.synced?.reason === 'no FINANCIAL capability') {
             // 能力未就绪:通常发生在升级/刷新 Key 后调度器状态未同步 —— 提示用户检查 Key
             toast('财务数据能力未就绪,请检查 API Key 或刷新页面后重试', 'error')
@@ -134,6 +146,8 @@ export function Financials() {
   const tables = status?.tables ?? {}
   const available = status?.available ?? false
   const lastSync = status?.last_sync ?? {}
+  const allFreshToday = TABLE_ORDER.every((key) =>
+    (tables[key]?.rows ?? 0) > 0 && isSyncedToday(lastSync[key]))
   // 全量同步按固定顺序推进：当前表之前为本轮已完成，之后为等待。
   // 单表同步时其他卡片保持原样，仅禁用按钮，避免误导为“五张表都在下载”。
   const tableDoneThisRound = (key: string): boolean =>
@@ -169,8 +183,10 @@ export function Financials() {
             >
               {isFullSync
                 ? <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                : allFreshToday
+                  ? <CheckCircle2 className="h-3.5 w-3.5 text-emerald-400" />
                 : <RefreshCw className="h-3.5 w-3.5" />}
-              {isFullSync ? '全部同步中…' : '全部同步'}
+              {isFullSync ? '全部同步中…' : allFreshToday ? '今日已同步' : '全部同步'}
             </button>
           </div>
         }
@@ -222,6 +238,7 @@ export function Financials() {
                 const isThisSyncing = syncing && currentSyncingTable === key
                 const isWaiting = isWaitingTable(key)
                 const lsTime = lastSync[key]
+                const freshToday = hasData && isSyncedToday(lsTime)
                 return (
                   <div
                     key={key}
@@ -256,10 +273,14 @@ export function Financials() {
                           ? `正在更新${label}，完成后刷新行数`
                           : syncing
                             ? `当前正在更新${TABLE_LABELS[currentSyncingTable ?? ''] ?? '另一张表'}`
-                            : `只更新${label}（已有标的增量更新，新标的补齐历史）`}
+                            : freshToday
+                              ? `${label}今天已更新，点击不会重复下载`
+                              : `只更新${label}（已有标的增量更新，新标的补齐历史）`}
                       >
                         {isThisSyncing
                           ? <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                          : freshToday
+                            ? <CheckCircle2 className="h-3.5 w-3.5 text-emerald-400" />
                           : <Download className="h-3.5 w-3.5" />}
                       </button>
                     </div>
