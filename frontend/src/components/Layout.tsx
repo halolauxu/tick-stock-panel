@@ -51,6 +51,7 @@ import {
   WifiOff,
   PanelLeftClose,
   PanelLeftOpen,
+  WalletCards,
 } from 'lucide-react'
 import { Logo } from './Logo'
 import { api, type IndexQuote } from '@/lib/api'
@@ -80,6 +81,7 @@ const nav = [
   { to: '/watchlist',  label: '自选',   icon: Star },
   { to: '/screener',   label: '策略',   icon: ScanSearch },
   { to: '/backtest',   label: '回测', icon: History },
+  { to: '/paper-trading', label: '模拟交易', icon: WalletCards },
   { to: '/mining',     label: '挖掘', icon: Pickaxe },
   { to: '/stock-analysis',    label: '个股分析', icon: TrendingUp },
   { to: '/limit-ladder', label: '连板梯队', icon: Flame },

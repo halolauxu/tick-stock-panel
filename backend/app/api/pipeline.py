@@ -78,6 +78,18 @@ async def run_now(request: Request) -> dict:
             job_store.succeed(job_id, result)
             invalidate_storage_cache()
             repo.refresh_cache()  # 刷新 Polars 缓存
+            # 数据与内存视图均完成后再推进模拟账户; 失败与数据任务隔离, 次日可重试。
+            try:
+                from app.services.paper_trading import run_active_accounts
+
+                summary = await loop.run_in_executor(
+                    _long_task_executor,
+                    run_active_accounts,
+                    request.app.state,
+                )
+                logger.info("manual pipeline paper trading result: %s", summary)
+            except Exception:
+                logger.exception("manual pipeline paper trading failed; data job remains succeeded")
         except JobCancelledError:
             # 已被 reap/手动取消终止: job 状态已由 terminate() 写为 failed,
             # 拉取线程在分块回调处自行退出, 这里无需(也无法)再写状态。

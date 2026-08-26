@@ -405,7 +405,12 @@ def test_insufficient_data_records_visible_skipped_prerequisite(tmp_path, monkey
 
 def test_pipeline_failure_does_not_trigger_mining(monkeypatch):
     mining_calls = []
+    paper_calls = []
     monkeypatch.setattr(daily_pipeline, "_run_tracked", lambda *_args: False)
+    monkeypatch.setattr(
+        "app.services.paper_trading.run_active_accounts",
+        lambda state: paper_calls.append(state),
+    )
     monkeypatch.setattr(
         "app.services.mining_schedule.run_weekly_mining",
         lambda state: mining_calls.append(state),
@@ -414,6 +419,26 @@ def test_pipeline_failure_does_not_trigger_mining(monkeypatch):
     daily_pipeline._scheduled_pipeline_task(lambda: None)
 
     assert mining_calls == []
+    assert paper_calls == []
+
+
+def test_successful_pipeline_runs_paper_accounts_before_mining(monkeypatch):
+    calls = []
+    state = object()
+    monkeypatch.setattr(daily_pipeline, "_run_tracked", lambda *_args: True)
+    monkeypatch.setattr(daily_pipeline, "_get_app_state", lambda: state)
+    monkeypatch.setattr(
+        "app.services.paper_trading.run_active_accounts",
+        lambda value: calls.append(("paper", value)),
+    )
+    monkeypatch.setattr(
+        "app.services.mining_schedule.run_weekly_mining",
+        lambda value: calls.append(("mining", value)),
+    )
+
+    daily_pipeline._scheduled_pipeline_task(lambda: None)
+
+    assert calls == [("paper", state), ("mining", state)]
 
 
 def test_enqueue_failure_does_not_escape_successful_pipeline(monkeypatch):

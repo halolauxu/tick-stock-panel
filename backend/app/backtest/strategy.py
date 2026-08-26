@@ -543,6 +543,10 @@ class StrategyBacktestConfig:
     # 市场环境过滤: {"states": ["strong",...], "min_score": 60}。
     # 强制 T-1: regime[T-1] 决定 entry[T](防未来函数)。None=不过滤。
     regime_filter: dict | None = None
+    # 回测保持 True; 模拟交易设 False, 保留期末持仓并产生次日待执行订单。
+    liquidate_on_end: bool = True
+    # 兼容既有回测默认值; 模拟交易账户会显式开启 A 股 T+1。
+    enforce_t_plus_one: bool = False
 
     def __post_init__(self) -> None:
         if self.entry_fill is None:
@@ -560,6 +564,8 @@ class StrategyBacktestResult:
     drawdown_curve: list[dict] = field(default_factory=list)
     benchmark_curve: list[dict] = field(default_factory=list)
     trades: list[dict] = field(default_factory=list)
+    open_positions: list[dict] = field(default_factory=list)
+    pending_orders: list[dict] = field(default_factory=list)
     per_symbol_stats: list[dict] = field(default_factory=list)
     strategy_info: dict = field(default_factory=dict)
     elapsed_ms: float = 0.0
@@ -1217,6 +1223,8 @@ class StrategyBacktestService:
             initial_capital=config.initial_capital,
             position_sizing=config.position_sizing,
             minute_fill=config.minute_fill,
+            liquidate_on_end=config.liquidate_on_end,
+            enforce_t_plus_one=config.enforce_t_plus_one,
         )
         t_signal = time.perf_counter()
         selection_stats: dict[str, int | bool]
@@ -1292,7 +1300,9 @@ class StrategyBacktestService:
                 exit_time_mask[start_id:stop_id],
             )
             timing_ms["signals_score"] = round((time.perf_counter() - t_signal) * 1000, 1)
-            if not sim_signal_matrix.entry.any():
+            if not sim_signal_matrix.entry.any() and not (
+                not config.liquidate_on_end and sim_signal_matrix.entry[-1].any()
+            ):
                 return _err("在指定区间内未产生买入信号")
 
             raw_candidates = int(sim_signal_matrix.entry.sum())
@@ -1478,7 +1488,7 @@ class StrategyBacktestService:
             exit_range = self._date_range_mask(panel, config.start, load_end) if config.mode == "full" else formal_range
             exit_mask = raw_exit_mask & exit_range
             timing_ms["signals_score"] = round((time.perf_counter() - t_signal) * 1000, 1)
-            if not entry_mask.any():
+            if not entry_mask.any() and config.liquidate_on_end:
                 return _err("在指定区间内未产生买入信号")
 
             sim_range = self._date_range_mask(panel, config.start, sim_end)
@@ -1620,6 +1630,8 @@ class StrategyBacktestService:
                 if result_policy.include_trades
                 else []
             ),
+            open_positions=result.open_positions if result_policy.include_trades else [],
+            pending_orders=result.pending_orders if result_policy.include_trades else [],
             per_symbol_stats=(
                 result.per_symbol_stats
                 if result_policy.include_per_symbol_stats

@@ -538,6 +538,8 @@ class MarketMatrix:
     close: np.ndarray
     volume: np.ndarray
     score: np.ndarray
+    raw_entry: np.ndarray
+    raw_entry_signal_code: np.ndarray
     entry: np.ndarray
     exit: np.ndarray
     tradable: np.ndarray
@@ -2346,6 +2348,8 @@ def build_market_matrix_from_signals(
         resolved_reference_price[trigger_mask] = trigger_reference[trigger_mask]
 
     _make_read_only(
+        signals.entry,
+        signals.entry_signal_code,
         entry,
         exit_,
         resolved_reference_price,
@@ -2367,6 +2371,8 @@ def build_market_matrix_from_signals(
         close=market.close,
         volume=market.volume,
         score=signals.score,
+        raw_entry=signals.entry,
+        raw_entry_signal_code=signals.entry_signal_code,
         entry=entry,
         exit=exit_,
         tradable=market.tradable,

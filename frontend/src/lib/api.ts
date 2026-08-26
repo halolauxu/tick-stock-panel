@@ -1267,6 +1267,39 @@ export interface StrategyBacktestTrade {
   exit_signal_id?: string | null
 }
 
+export interface PaperOpenPosition {
+  symbol: string
+  name?: string
+  entry_date: string
+  entry_signal_date?: string | null
+  entry_signal_id?: string | null
+  entry_price: number
+  shares: number
+  lots: number
+  entry_value: number
+  market_price: number
+  market_value: number
+  unrealized_pnl: number
+  unrealized_pnl_pct: number
+  hold_days: number
+  entry_score?: number | null
+  pending_exit_reason?: string | null
+  t_plus_one_locked?: boolean
+  blocked_exit_days?: number
+}
+
+export interface PaperPendingOrder {
+  symbol: string
+  name?: string
+  signal_date: string
+  scheduled_fill: 'open_t+1'
+  status?: 'waiting_next_open'
+  reason?: string
+  next_action?: string
+  score: number
+  entry_signal_id?: string | null
+}
+
 export interface StrategyBacktestResult {
   run_id: string
   config: Record<string, any>
@@ -1275,6 +1308,8 @@ export interface StrategyBacktestResult {
   drawdown_curve: { date: string; value: number }[]
   benchmark_curve?: { date: string; value: number; close?: number; name?: string; symbol?: string }[]
   trades: StrategyBacktestTrade[]
+  open_positions?: PaperOpenPosition[]
+  pending_orders?: PaperPendingOrder[]
   per_symbol_stats: {
     symbol: string
     n_trades: number
@@ -1304,6 +1339,52 @@ export interface StrategyBacktestResult {
   }
   elapsed_ms: number
   error: string | null
+}
+
+export interface PaperTradingConfig {
+  strategy_id: string
+  strategy_name?: string
+  asset_type: 'stock' | 'etf'
+  symbols?: string[] | null
+  params?: Record<string, any> | null
+  overrides?: Record<string, any> | null
+  entry_fill: 'close_t' | 'open_t+1'
+  exit_fill: 'close_t' | 'open_t+1' | 'signal_next_minute'
+  commission_pct: number
+  stamp_tax_pct: number
+  slippage_bps: number
+  max_positions: number
+  max_exposure_pct: number
+  initial_capital: number
+  position_sizing: 'equal' | 'score_weight'
+  holding_days: number
+  minute_fill: boolean
+  regime_filter?: Record<string, any> | null
+  enforce_t_plus_one?: boolean
+}
+
+export interface PaperTradingAccount {
+  schema_version: number
+  id: string
+  name: string
+  status: 'active' | 'paused'
+  created_at: string
+  updated_at: string
+  start_date: string
+  baseline_date?: string
+  signal_start_date?: string
+  execution_policy?: 'after_close_daily'
+  execution_state?: {
+    code: 'waiting_first_data' | 'waiting_open' | 'waiting_exit' | 'holding' | 'scanning' | 'error'
+    label: string
+    detail: string
+    next_action: string
+  }
+  last_processed_date: string | null
+  last_run_at: string | null
+  last_error: string | null
+  config: PaperTradingConfig
+  result: StrategyBacktestResult | null
 }
 
 // ===== Settings =====
@@ -2363,6 +2444,35 @@ export const api = {
     request<StrategyBacktestResult>('/api/backtest/strategy/run', {
       method: 'POST',
       body: JSON.stringify(payload),
+    }),
+
+  paperAccounts: () =>
+    request<{ items: PaperTradingAccount[] }>('/api/paper-trading/accounts'),
+
+  paperAccountCreate: (payload: PaperTradingConfig & { name: string }) =>
+    request<PaperTradingAccount>('/api/paper-trading/accounts', {
+      method: 'POST',
+      body: JSON.stringify(payload),
+    }),
+
+  paperAccountRun: (id: string) =>
+    request<PaperTradingAccount>(`/api/paper-trading/accounts/${encodeURIComponent(id)}/run`, {
+      method: 'POST',
+    }),
+
+  paperAccountPause: (id: string) =>
+    request<PaperTradingAccount>(`/api/paper-trading/accounts/${encodeURIComponent(id)}/pause`, {
+      method: 'POST',
+    }),
+
+  paperAccountResume: (id: string) =>
+    request<PaperTradingAccount>(`/api/paper-trading/accounts/${encodeURIComponent(id)}/resume`, {
+      method: 'POST',
+    }),
+
+  paperAccountDelete: (id: string) =>
+    request<{ ok: boolean; id: string; name: string }>(`/api/paper-trading/accounts/${encodeURIComponent(id)}`, {
+      method: 'DELETE',
     }),
 
   pipelineRun: () => request<{ job_id: string; reused: boolean }>(

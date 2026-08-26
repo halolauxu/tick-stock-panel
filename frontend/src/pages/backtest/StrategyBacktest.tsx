@@ -94,8 +94,9 @@ const quickRangeTitle = (range: QuickRangeConfig) => range.unit === 'all'
     ? `近 ${range.value} 年`
     : `近 ${range.value} 个月`
 
-const INPUT_CLS = `w-full px-2.5 py-1.5 rounded-input bg-surface border border-border text-xs
+export const BACKTEST_INPUT_CLS = `w-full px-2.5 py-1.5 rounded-input bg-surface border border-border text-xs
   focus:outline-none focus:border-accent transition-colors duration-150 ease-smooth`
+const INPUT_CLS = BACKTEST_INPUT_CLS
 
 /** 成交时序说明 — 黄色问号图标, 点击弹出气泡。
  * 用 fixed 定位脱离父容器 overflow 裁剪(左侧表单是 overflow-y-auto, absolute 气泡会被裁)。 */
@@ -260,7 +261,7 @@ function NumberField({ value, onChange, min, max, step, className, placeholder }
     />
   )
 }
-const strategyDefaultParams = (detail: StrategyDetail) => {
+export const strategyDefaultParams = (detail: StrategyDetail) => {
   const values: Record<string, any> = { ...detail.params_defaults }
   detail.params.forEach(p => {
     if (!(p.id in values)) values[p.id] = p.default
@@ -271,7 +272,7 @@ const mergeStrategyParams = (detail: StrategyDetail, values?: Record<string, any
   ...strategyDefaultParams(detail),
   ...(values ?? {}),
 })
-const normalizeStrategyOverrides = (detail: StrategyDetail, values?: Record<string, any> | null) => {
+export const normalizeStrategyOverrides = (detail: StrategyDetail, values?: Record<string, any> | null) => {
   const next = { ...(values ?? {}) }
   const savedScoring = next.scoring && typeof next.scoring === 'object' ? next.scoring : {}
   next.scoring = next.scoring_replace === true
@@ -290,7 +291,7 @@ const normalizeStrategyOverrides = (detail: StrategyDetail, values?: Record<stri
   }
   return next
 }
-const buildDefaultOverrides = (detail: StrategyDetail) => normalizeStrategyOverrides(detail, {
+export const buildDefaultOverrides = (detail: StrategyDetail) => normalizeStrategyOverrides(detail, {
   basic_filter: { ...detail.basic_filter },
   entry_signals: detail.entry_signals.map(toSignalId),
   exit_signals: detail.exit_signals.map(toSignalId),

@@ -846,9 +846,16 @@ def _run_tracked(fn, job_label: str) -> bool:
 
 
 def _scheduled_pipeline_task(pipeline_fn) -> None:
-    """Run weekly mining only after the tracked daily pipeline has fully succeeded."""
+    """Run paper accounts and weekly mining only after the daily pipeline succeeded."""
     if not _run_tracked(pipeline_fn, "daily_pipeline"):
         return
+    try:
+        from app.services.paper_trading import run_active_accounts
+
+        result = run_active_accounts(_get_app_state())
+        logger.info("scheduled paper trading result: %s", result)
+    except Exception:
+        logger.exception("scheduled paper trading failed; daily pipeline remains succeeded")
     try:
         from app.services.mining_schedule import run_weekly_mining
 

@@ -10,7 +10,7 @@ import threading
 import time
 from collections import OrderedDict
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import date
 from typing import Literal
 
@@ -72,6 +72,10 @@ class MatcherConfig:
     # 分钟K精确成交: 开启后, 信号触发日的成交价用当日分钟K优化
     # (有参考线→穿越价, 无参考线→VWAP)。数据缺失时降级为日K口径。
     minute_fill: bool = False
+    # 回测默认在区间末日强制清仓; 模拟交易必须保留真实未平仓状态。
+    liquidate_on_end: bool = True
+    # 兼容既有回测默认值; 模拟交易等真实账户口径需显式开启 T+1。
+    enforce_t_plus_one: bool = False
 
     def __post_init__(self) -> None:
         # 解析最终口径: 优先 entry_fill/exit_fill, 否则回退到 matching (向后兼容)。
@@ -129,6 +133,8 @@ class SimResult:
     trades: list[TradeRecord]
     per_symbol_stats: list[dict]
     stats: dict
+    open_positions: list[dict] = field(default_factory=list)
+    pending_orders: list[dict] = field(default_factory=list)
 
 
 @dataclass(frozen=True)
@@ -1695,7 +1701,9 @@ class BacktestEngine:
             exit_signal_ids=exit_signal_ids,
             minute_exit_trigger=config.exit_fill == "signal_next_minute",
         )
-        if not matrix.entry.any():
+        if not matrix.entry.any() and not (
+            not config.liquidate_on_end and matrix.raw_entry.any()
+        ):
             return self._empty_result()
         return self._simulate_portfolio_matrix(matrix, config, progress_cb, cancel_event)
 
@@ -1708,7 +1716,9 @@ class BacktestEngine:
         options: SimulationOptions | None = None,
     ) -> SimResult:
         """Run the production Python matcher on a prebuilt MarketMatrix."""
-        if not matrix.entry.any():
+        if not matrix.entry.any() and not (
+            not config.liquidate_on_end and matrix.raw_entry.any()
+        ):
             return self._empty_result()
         return self._simulate_portfolio_matrix(matrix, config, progress_cb, cancel_event, options)
 
@@ -1750,6 +1760,7 @@ class BacktestEngine:
             "sell_invalid_price": 0,
             "sell_suspended": 0,
             "sell_limit_down": 0,
+            "sell_t_plus_one": 0,
             "pending_exit": 0,
         }
 
@@ -1921,21 +1932,24 @@ class BacktestEngine:
             sold_today: set[int],
             override: float | None = None,
         ) -> bool:
+            pos = positions[asset_id]
             signal_id = (
                 _signal_id(int(matrix.exit_signal_code[time_id, asset_id]), matrix.exit_signal_ids)
                 if reason == "signal" else None
             )
+            if config.enforce_t_plus_one and pos["entry_date"] == matrix.timestamp_labels[time_id][:10]:
+                _mark_pending(asset_id, reason, signal_date, signal_id, next_open=True)
+                _count("sell_t_plus_one")
+                return False
+            if pos.get("pending_exit_next_open") and override is None:
+                override = float(matrix.open[time_id, asset_id])
             minute_trigger = config.exit_fill == "signal_next_minute" and reason == "signal"
             if minute_trigger and override is None:
-                pos = positions[asset_id]
-                if pos.get("pending_exit_next_open"):
-                    override = float(matrix.open[time_id, asset_id])
-                else:
-                    override = _minute_trigger_price(time_id, asset_id)
-                    if override is None:
-                        _mark_pending(asset_id, reason, signal_date, signal_id, next_open=True)
-                        _count("sell_minute_trigger_fallback")
-                        return False
+                override = _minute_trigger_price(time_id, asset_id)
+                if override is None:
+                    _mark_pending(asset_id, reason, signal_date, signal_id, next_open=True)
+                    _count("sell_minute_trigger_fallback")
+                    return False
             ok, blocked = _can_sell(time_id, asset_id, override)
             if not ok:
                 _mark_pending(
@@ -1968,12 +1982,15 @@ class BacktestEngine:
                         pass
 
             sold_today: set[int] = set()
+            bought_today: set[int] = set()
             for pos in positions.values():
                 pos["hold_days"] += 1
 
             for asset_id in list(positions):
                 pos = positions.get(asset_id)
-                if pos is None or pos.get("pending_exit_reason") or pos["entry_date"] == date_text:
+                if pos is None or pos.get("pending_exit_reason"):
+                    continue
+                if pos["entry_date"] == date_text and config.entry_fill == "close_t":
                     continue
                 if not matrix.tradable[time_id, asset_id] or pos["entry_price"] <= 0:
                     continue
@@ -2024,12 +2041,12 @@ class BacktestEngine:
                     signal_date = _signal_date(int(matrix.exit_signal_time[time_id, asset_id]), date_text)
                 elif config.max_hold_days is not None and pos["hold_days"] >= config.max_hold_days:
                     reason = "max_hold"
-                elif time_id == time_count - 1:
+                elif config.liquidate_on_end and time_id == time_count - 1:
                     reason = "end"
                 if reason:
                     _try_sell(time_id, asset_id, reason, signal_date, sold_today)
 
-            if time_id < time_count - 1 and max_positions > 0:
+            if (time_id < time_count - 1 or not config.liquidate_on_end) and max_positions > 0:
                 candidates: list[tuple[int, float]] = []
                 for asset_id in np.flatnonzero(matrix.entry[time_id]):
                     asset = int(asset_id)
@@ -2117,6 +2134,35 @@ class BacktestEngine:
                                 "pending_exit_next_open": False,
                                 "blocked_exit_days": 0,
                             }
+                            bought_today.add(asset_id)
+
+            # 次日开盘建仓发生在当日盘中风控及收盘信号之前。此前撮合循环先卖后买,
+            # 会漏掉建仓日的止损/止盈和收盘退出。股票账户不能同日卖出,
+            # 但必须把已触发退出冻结为下一交易日待执行, 不能静默丢失。
+            for asset_id in bought_today:
+                pos = positions.get(asset_id)
+                if pos is None:
+                    continue
+                if config.entry_fill != "close_t":
+                    entry_price = float(pos["entry_price"])
+                    low_price = float(matrix.low[time_id, asset_id])
+                    high_price = float(matrix.high[time_id, asset_id])
+                    if config.stop_loss_pct is not None:
+                        stop_price = entry_price * (1 - abs(float(config.stop_loss_pct)))
+                        if _valid_price(low_price) and low_price <= stop_price:
+                            _try_sell(time_id, asset_id, "stop_loss", date_text, sold_today, stop_price)
+                    if asset_id in positions and not positions[asset_id].get("pending_exit_reason") and config.take_profit_pct is not None:
+                        take_profit = entry_price * (1 + abs(float(config.take_profit_pct)))
+                        if _valid_price(high_price) and high_price >= take_profit:
+                            _try_sell(time_id, asset_id, "take_profit", date_text, sold_today, take_profit)
+                if asset_id in positions and not positions[asset_id].get("pending_exit_reason") and matrix.exit[time_id, asset_id]:
+                    _try_sell(
+                        time_id,
+                        asset_id,
+                        "signal",
+                        _signal_date(int(matrix.exit_signal_time[time_id, asset_id]), date_text),
+                        sold_today,
+                    )
 
             for asset_id, pos in positions.items():
                 high_price = float(matrix.high[time_id, asset_id])
@@ -2163,6 +2209,70 @@ class BacktestEngine:
         stats["pending_exit_positions"] = sum(1 for pos in positions.values() if pos.get("pending_exit_reason"))
         stats["market_matrix_shape"] = [time_count, asset_count]
         stats["market_matrix_bytes"] = matrix.nbytes
+        open_positions: list[dict] = []
+        for asset_id, pos in positions.items():
+            mark = float(last_close[asset_id])
+            if not _valid_price(mark):
+                mark = float(pos["entry_price"])
+            market_value = float(pos["shares"]) * mark
+            unrealized_pnl = market_value - float(pos["entry_value"])
+            entry_value = float(pos["entry_value"])
+            open_positions.append({
+                "symbol": matrix.symbols[asset_id],
+                "name": matrix.names[asset_id],
+                "entry_date": str(pos["entry_date"]),
+                "entry_signal_date": str(pos["entry_signal_date"]),
+                "entry_signal_id": pos.get("entry_signal_id"),
+                "entry_price": round(float(pos["entry_price"]), 4),
+                "shares": round(float(pos["shares"]), 4),
+                "lots": round(float(pos["lots"]), 2),
+                "entry_value": round(entry_value, 2),
+                "market_price": round(mark, 4),
+                "market_value": round(market_value, 2),
+                "unrealized_pnl": round(unrealized_pnl, 2),
+                "unrealized_pnl_pct": round(
+                    unrealized_pnl / entry_value if entry_value > 0 else 0.0,
+                    6,
+                ),
+                "hold_days": int(pos["hold_days"]),
+                "entry_score": round(float(pos["entry_score"]), 2),
+                "pending_exit_reason": pos.get("pending_exit_reason"),
+                "t_plus_one_locked": bool(
+                    config.enforce_t_plus_one and pos["entry_date"] == matrix.timestamp_labels[-1][:10]
+                ),
+                "blocked_exit_days": int(pos.get("blocked_exit_days", 0)),
+            })
+        open_positions.sort(key=lambda item: item["symbol"])
+
+        pending_orders: list[dict] = []
+        if not config.liquidate_on_end and config.entry_fill == "open_t+1" and time_count:
+            slots = max(max_positions - len(positions), 0)
+            candidates: list[tuple[int, float]] = []
+            for asset_id in np.flatnonzero(matrix.raw_entry[-1]):
+                asset = int(asset_id)
+                if asset in positions:
+                    continue
+                score = float(matrix.score[-1, asset])
+                if config.score_min is not None and score < config.score_min:
+                    continue
+                if config.score_max is not None and score > config.score_max:
+                    continue
+                candidates.append((asset, score))
+            candidates.sort(key=lambda item: item[1], reverse=True)
+            signal_date = matrix.timestamp_labels[-1][:10]
+            for asset_id, score in candidates[:slots]:
+                code = int(matrix.raw_entry_signal_code[-1, asset_id])
+                pending_orders.append({
+                    "symbol": matrix.symbols[asset_id],
+                    "name": matrix.names[asset_id],
+                    "signal_date": signal_date,
+                    "scheduled_fill": "open_t+1",
+                    "status": "waiting_next_open",
+                    "reason": "完整日线信号已确认",
+                    "next_action": "下一完整交易日按开盘价及停牌、涨跌停约束判定成交",
+                    "score": round(score, 2),
+                    "entry_signal_id": _signal_id(code, matrix.entry_signal_ids),
+                })
         return SimResult(
             equity_curve=equity_curve if options.include_curves else [],
             drawdown_curve=drawdown_curve if options.include_curves else [],
@@ -2173,6 +2283,8 @@ class BacktestEngine:
                 else []
             ),
             stats=stats,
+            open_positions=open_positions,
+            pending_orders=pending_orders,
         )
 
     def simulate_portfolio_legacy(
@@ -2339,6 +2451,7 @@ class BacktestEngine:
             "sell_invalid_price": 0,
             "sell_suspended": 0,
             "sell_limit_down": 0,
+            "sell_t_plus_one": 0,
             "pending_exit": 0,
         }
 

@@ -518,3 +518,154 @@ def test_minute_signal_exit_without_next_bar_falls_back_to_next_open():
     assert result.trades[0].exit_date == "2024-01-04"
     assert result.trades[0].exit_price == 8.8
     assert result.stats["execution"]["sell_minute_trigger_fallback"] == 1
+
+
+def test_paper_mode_keeps_position_open_at_latest_complete_day():
+    panel = _panel(
+        ["A"],
+        days=3,
+        overrides={
+            ("A", 1): {"open": 10, "high": 10.5, "low": 9.8, "close": 10.2},
+            ("A", 2): {"open": 10.3, "high": 11, "low": 10.1, "close": 10.8},
+        },
+    )
+    entries = _mask(panel, {("A", 0)})
+
+    result = _engine().simulate_portfolio(
+        panel,
+        entries,
+        _mask(panel, set()),
+        MatcherConfig(
+            entry_fill="open_t+1",
+            exit_fill="open_t+1",
+            fees_pct=0,
+            slippage_bps=0,
+            max_positions=1,
+            initial_capital=100_000,
+            liquidate_on_end=False,
+        ),
+    )
+
+    assert result.trades == []
+    assert result.equity_curve[-1]["positions"] == 1
+    assert result.open_positions == [{
+        "symbol": "A",
+        "name": "A",
+        "entry_date": "2024-01-02",
+        "entry_signal_date": "2024-01-01",
+        "entry_signal_id": None,
+        "entry_price": 10.0,
+        "shares": 10000.0,
+        "lots": 100.0,
+        "entry_value": 100000.0,
+        "market_price": 10.8,
+        "market_value": 108000.0,
+        "unrealized_pnl": 8000.0,
+        "unrealized_pnl_pct": 0.08,
+        "hold_days": 1,
+        "entry_score": 4.0,
+        "pending_exit_reason": None,
+        "t_plus_one_locked": False,
+        "blocked_exit_days": 0,
+    }]
+
+
+def test_paper_mode_exposes_next_open_order_from_latest_signal():
+    panel = _panel(["A"], days=2)
+    entries = _mask(panel, {("A", 1)})
+
+    result = _engine().simulate_portfolio(
+        panel,
+        entries,
+        _mask(panel, set()),
+        MatcherConfig(
+            entry_fill="open_t+1",
+            exit_fill="open_t+1",
+            fees_pct=0,
+            slippage_bps=0,
+            max_positions=1,
+            initial_capital=100_000,
+            liquidate_on_end=False,
+        ),
+    )
+
+    assert result.trades == []
+    assert result.open_positions == []
+    assert result.pending_orders == [{
+        "symbol": "A",
+        "name": "A",
+        "signal_date": "2024-01-02",
+        "scheduled_fill": "open_t+1",
+        "status": "waiting_next_open",
+        "reason": "完整日线信号已确认",
+        "next_action": "下一完整交易日按开盘价及停牌、涨跌停约束判定成交",
+        "score": 4.0,
+        "entry_signal_id": None,
+    }]
+
+
+def test_stock_position_cannot_exit_on_entry_day_and_sells_next_open():
+    panel = _panel(
+        ["A"],
+        days=4,
+        overrides={
+            ("A", 1): {"open": 10, "high": 10.5, "low": 9.8, "close": 10.2},
+            ("A", 2): {"open": 9.6, "high": 10, "low": 9.5, "close": 9.8},
+        },
+    )
+    entries = _mask(panel, {("A", 0)})
+    exits = _mask(panel, {("A", 1)})
+
+    result = _engine().simulate_portfolio(
+        panel,
+        entries,
+        exits,
+        MatcherConfig(
+            entry_fill="open_t+1",
+            exit_fill="close_t",
+            fees_pct=0,
+            slippage_bps=0,
+            max_positions=1,
+            initial_capital=100_000,
+            enforce_t_plus_one=True,
+        ),
+    )
+
+    assert len(result.trades) == 1
+    assert result.trades[0].entry_date == "2024-01-02"
+    assert result.trades[0].exit_date == "2024-01-03"
+    assert result.trades[0].exit_price == 9.6
+    assert result.stats["execution"]["sell_t_plus_one"] == 1
+
+
+def test_entry_day_stop_is_frozen_by_t_plus_one_and_exits_next_open():
+    panel = _panel(
+        ["A"],
+        days=4,
+        overrides={
+            ("A", 1): {"open": 10, "high": 10.2, "low": 8.8, "close": 9.2},
+            ("A", 2): {"open": 10.5, "high": 10.8, "low": 10.2, "close": 10.6},
+        },
+    )
+
+    result = _engine().simulate_portfolio(
+        panel,
+        _mask(panel, {("A", 0)}),
+        _mask(panel, set()),
+        MatcherConfig(
+            entry_fill="open_t+1",
+            exit_fill="open_t+1",
+            stop_loss_pct=0.1,
+            fees_pct=0,
+            slippage_bps=0,
+            max_positions=1,
+            initial_capital=100_000,
+            enforce_t_plus_one=True,
+        ),
+    )
+
+    assert len(result.trades) == 1
+    assert result.trades[0].exit_reason == "stop_loss"
+    assert result.trades[0].exit_date == "2024-01-03"
+    assert result.trades[0].exit_price == 10.5
+    assert result.stats["execution"]["sell_t_plus_one"] == 1

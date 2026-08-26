@@ -39,6 +39,9 @@ export function Backtest() {
     const search = next.toString()
     return <Navigate to={search ? `/mining?${search}` : '/mining'} replace />
   }
+  if (requestedTab === 'paper') {
+    return <Navigate to="/paper-trading" replace />
+  }
 
   const activeTab: Tab = requestedTab && requestedTab in MODES
     ? requestedTab as Tab
