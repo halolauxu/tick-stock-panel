@@ -198,11 +198,38 @@ class TushareProvider:
             return pl.DataFrame()
 
         frames: list[pl.DataFrame] = []
-        for symbol in symbols:
-            rows = self._get_client().financial_records(table, symbol)
+        failures = 0
+        total = len(symbols)
+        for index, symbol in enumerate(symbols, start=1):
+            try:
+                rows = self._get_client().financial_records(table, symbol)
+            except TushareError as exc:
+                message = str(exc)
+                # Configuration/entitlement failures affect every symbol and
+                # must abort immediately. Transient single-symbol failures are
+                # isolated so the rest of a multi-hour full-market sync survives.
+                if any(marker in message for marker in ("没有接口", "没有权限", "未配置")):
+                    raise
+                failures += 1
+                logger.warning(
+                    "tushare financial symbol failed: table=%s symbol=%s: %s",
+                    table,
+                    symbol,
+                    exc,
+                )
+                rows = []
             frame = self._financial_df(table, rows, latest_only=latest_only)
             if not frame.is_empty():
                 frames.append(frame)
+            if index % 100 == 0 or index == total:
+                logger.info(
+                    "tushare financial progress: table=%s symbols=%d/%d rows=%d failures=%d",
+                    table,
+                    index,
+                    total,
+                    sum(frame.height for frame in frames),
+                    failures,
+                )
         if not frames:
             return pl.DataFrame()
         return pl.concat(frames, how="diagonal_relaxed").sort(

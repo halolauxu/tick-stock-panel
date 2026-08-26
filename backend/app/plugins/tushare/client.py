@@ -6,11 +6,14 @@ raised error messages.
 """
 from __future__ import annotations
 
+import logging
 import threading
 import time
 from datetime import datetime
 
 import httpx
+
+logger = logging.getLogger(__name__)
 
 BASE_URL = "https://api.tushare.pro"
 MINUTE_FIELDS = (
@@ -80,13 +83,17 @@ class TushareClient:
         *,
         base_url: str = BASE_URL,
         timeout: float = 30.0,
-        min_interval_s: float = 0.15,
+        min_interval_s: float = 0.32,
+        rate_limit_pause_s: float = 61.0,
+        max_rate_limit_retries: int = 2,
     ) -> None:
         token = token.strip()
         if not token:
             raise TushareError("未配置 TUSHARE_TOKEN")
         self._token = token
         self._min_interval_s = max(0.0, float(min_interval_s))
+        self._rate_limit_pause_s = max(0.0, float(rate_limit_pause_s))
+        self._max_rate_limit_retries = max(0, int(max_rate_limit_retries))
         self._pace_lock = threading.Lock()
         self._last_request_at = 0.0
         self._http = httpx.Client(
@@ -113,23 +120,36 @@ class TushareClient:
             "params": params,
             "fields": ",".join(fields),
         }
-        self._wait_for_turn()
-        try:
-            response = self._http.post("/", json=body)
-        except httpx.HTTPError as exc:
-            raise TushareError(f"Tushare 网络请求失败: {exc}") from exc
-        if response.status_code != 200:
-            raise TushareError(f"Tushare HTTP {response.status_code}")
-        try:
-            payload = response.json()
-        except ValueError as exc:
-            raise TushareError("Tushare 响应不是 JSON") from exc
-        if not isinstance(payload, dict):
-            raise TushareError("Tushare 响应结构无效")
+        payload: dict = {}
+        for attempt in range(self._max_rate_limit_retries + 1):
+            self._wait_for_turn()
+            try:
+                response = self._http.post("/", json=body)
+            except httpx.HTTPError as exc:
+                raise TushareError(f"Tushare 网络请求失败: {exc}") from exc
+            if response.status_code != 200:
+                raise TushareError(f"Tushare HTTP {response.status_code}")
+            try:
+                payload = response.json()
+            except ValueError as exc:
+                raise TushareError("Tushare 响应不是 JSON") from exc
+            if not isinstance(payload, dict):
+                raise TushareError("Tushare 响应结构无效")
 
-        code = payload.get("code")
-        if code not in (0, "0"):
+            code = payload.get("code")
+            if code in (0, "0"):
+                break
             message = str(payload.get("msg") or "未知错误").strip()
+            if "频率超限" in message and attempt < self._max_rate_limit_retries:
+                logger.warning(
+                    "Tushare %s rate limited; retrying after %.0fs (%d/%d)",
+                    api_name,
+                    self._rate_limit_pause_s,
+                    attempt + 1,
+                    self._max_rate_limit_retries,
+                )
+                time.sleep(self._rate_limit_pause_s)
+                continue
             raise TushareError(f"Tushare API 错误 code={code}: {message[:500]}")
 
         data = payload.get("data") or {}

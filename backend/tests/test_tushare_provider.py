@@ -43,6 +43,16 @@ class _HTTP:
         pass
 
 
+class _HTTPSequence(_HTTP):
+    def __init__(self, payloads: list[dict]) -> None:
+        super().__init__({})
+        self.payloads = list(payloads)
+
+    def post(self, path: str, json: dict):
+        self.calls.append((path, json))
+        return _Response(self.payloads.pop(0))
+
+
 def _patch_http(monkeypatch, payload: dict) -> _HTTP:
     fake = _HTTP(payload)
     monkeypatch.setattr(tc.httpx, "Client", lambda **kwargs: fake)
@@ -79,6 +89,29 @@ def test_client_api_error_never_exposes_token(monkeypatch):
         client.stock_minutes("000017.SZ")
     assert "2002" in str(exc.value)
     assert "top-secret-token" not in str(exc.value)
+
+
+def test_client_waits_and_retries_tushare_rate_limit(monkeypatch):
+    fields = list(tc.MINUTE_FIELDS)
+    fake = _HTTPSequence([
+        {"code": 40203, "msg": "访问接口频率超限(200次/分钟)", "data": None},
+        {"code": 0, "msg": None, "data": {"fields": fields, "items": _sample_items()}},
+    ])
+    monkeypatch.setattr(tc.httpx, "Client", lambda **kwargs: fake)
+    pauses: list[float] = []
+    monkeypatch.setattr(tc.time, "sleep", lambda seconds: pauses.append(seconds))
+    client = TushareClient(
+        "secret-token",
+        min_interval_s=0,
+        rate_limit_pause_s=61,
+        max_rate_limit_retries=1,
+    )
+
+    rows = client.stock_minutes("000017.SZ")
+
+    assert len(rows) == 2
+    assert len(fake.calls) == 2
+    assert pauses == [61]
 
 
 class _FakeClient:
