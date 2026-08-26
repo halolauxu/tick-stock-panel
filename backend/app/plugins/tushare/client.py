@@ -258,8 +258,10 @@ class TushareClient:
         return self.query(
             f"irm_qa_{normalized}",
             {
-                "pub_start": pub_start.strftime("%Y%m%d"),
-                "pub_end": pub_end.strftime("%Y%m%d"),
+                # irm_qa_* 的 pub_start/pub_end 是发布时间，而不是 YYYYMMDD
+                # 日期参数。使用完整日边界，避免服务端将无效格式按空结果处理。
+                "pub_start": pub_start.strftime("%Y-%m-%d 00:00:00"),
+                "pub_end": pub_end.strftime("%Y-%m-%d 23:59:59"),
             },
             IRM_QA_FIELDS[normalized],
         )

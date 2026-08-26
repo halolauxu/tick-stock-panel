@@ -311,7 +311,10 @@ def test_client_posts_auction_and_irm_qa_contracts(monkeypatch):
     assert auction["fields"] == ",".join(tc.AUCTION_FIELDS)
     qa = fake.calls[1][1]
     assert qa["api_name"] == "irm_qa_sz"
-    assert qa["params"] == {"pub_start": "20260824", "pub_end": "20260826"}
+    assert qa["params"] == {
+        "pub_start": "2026-08-24 00:00:00",
+        "pub_end": "2026-08-26 23:59:59",
+    }
     assert qa["fields"] == ",".join(tc.IRM_QA_FIELDS["sz"])
 
 
