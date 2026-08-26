@@ -13,6 +13,10 @@ export const STAGE_LABELS: Record<string, string> = {
   sync_adj: '同步除权因子',
   compute_enriched: '计算技术指标',
   sync_minute: '同步分钟 K',
+  sync_auction: '同步集合竞价',
+  sync_irm_qa: '同步董秘问答',
+  backfill_auction: '补采集合竞价',
+  backfill_irm_qa: '补采董秘问答',
   extend_history: '扩展日K历史',
   extend_minute: '扩展分钟K历史',
   rebuild_enriched: '全量计算',
@@ -112,6 +116,16 @@ export function ActiveJobCard({ job }: { job: PipelineJob }) {
       <LogViewer log={job.log} />
 
       {job.status === 'succeeded' && job.result && (() => {
+        if (job.result.dataset === 'auction' || job.result.dataset === 'irm_qa') {
+          const isAuction = job.result.dataset === 'auction'
+          return (
+            <div className="mt-3 grid grid-cols-1 md:grid-cols-3 gap-3 text-xs">
+              <Pill label="数据集" value={isAuction ? '集合竞价' : '董秘问答'} />
+              <Pill label="补采范围" value={`${job.result.start_date ?? '—'} ~ ${job.result.end_date ?? '—'}`} />
+              <Pill label="接口返回" value={`${isAuction ? (job.result.auction_rows ?? 0) : (job.result.irm_qa_rows ?? 0)} 行`} />
+            </div>
+          )
+        }
         const skipped = new Set(job.result.skipped_stages ?? [])
         const cell = (stage: string | null, v: string) =>
           stage && skipped.has(stage) ? '跳过' : v

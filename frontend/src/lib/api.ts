@@ -2368,6 +2368,17 @@ export const api = {
   pipelineRun: () => request<{ job_id: string; reused: boolean }>(
     '/api/pipeline/run', { method: 'POST' },
   ),
+  backfillTushareSupplemental: (dataset: 'auction' | 'irm_qa', startDate: string, endDate: string) =>
+    request<{
+      job_id: string
+      reused: boolean
+      dataset?: 'auction' | 'irm_qa'
+      start_date?: string
+      end_date?: string
+    }>('/api/pipeline/tushare-supplemental/backfill', {
+      method: 'POST',
+      body: JSON.stringify({ dataset, start_date: startDate, end_date: endDate }),
+    }),
   pipelineJob: (id: string) => request<PipelineJob>(`/api/pipeline/jobs/${id}`),
   pipelineJobs: (limit = 20) =>
     request<{ active_id: string | null; jobs: PipelineJobSummary[] }>(
@@ -3069,15 +3080,18 @@ export interface PipelineJob {
   finished_at: string | null
   duration_s: number | null
   result: {
-    universe_size: number
-    daily_days: number
-    adj_factor_symbols: number
-    enriched_days: number
+    universe_size?: number
+    daily_days?: number
+    adj_factor_symbols?: number
+    enriched_days?: number
     index_count?: number
     index_daily_rows?: number
-    minute_rows: number
+    minute_rows?: number
     auction_rows?: number
     irm_qa_rows?: number
+    dataset?: 'auction' | 'irm_qa'
+    start_date?: string
+    end_date?: string
     skipped_stages?: string[]
   } | null
   error: string | null

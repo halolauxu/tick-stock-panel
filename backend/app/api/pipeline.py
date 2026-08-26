@@ -4,9 +4,13 @@ from __future__ import annotations
 import asyncio
 import concurrent.futures as _cf
 import logging
+from datetime import date
+from typing import Literal
 
 from fastapi import APIRouter, HTTPException, Request
+from pydantic import BaseModel
 
+from app.api.data import invalidate_storage_cache
 from app.jobs import daily_pipeline
 from app.services.pipeline_jobs import (
     JobCancelledError,
@@ -14,7 +18,6 @@ from app.services.pipeline_jobs import (
     release_run_slot,
     try_acquire_run_slot,
 )
-from app.api.data import invalidate_storage_cache
 
 # 长时间任务专用线程池（隔离于 FastAPI 默认线程池，防止阻塞请求处理）
 _long_task_executor = _cf.ThreadPoolExecutor(max_workers=2, thread_name_prefix="long-task")
@@ -22,6 +25,12 @@ _long_task_executor = _cf.ThreadPoolExecutor(max_workers=2, thread_name_prefix="
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/pipeline", tags=["pipeline"])
+
+
+class SupplementalBackfillRequest(BaseModel):
+    dataset: Literal["auction", "irm_qa"]
+    start_date: date
+    end_date: date
 
 
 @router.post("/run")
@@ -82,6 +91,109 @@ async def run_now(request: Request) -> dict:
 
     asyncio.create_task(task())
     return {"job_id": job_id, "reused": False}
+
+
+@router.post("/tushare-supplemental/backfill")
+async def backfill_tushare_supplemental(
+    request: Request,
+    body: SupplementalBackfillRequest,
+) -> dict:
+    """Backfill one Tushare supplemental dataset over an explicit date range."""
+    from app.api.data import invalidate_data_cache
+    from app.market_time import cn_today
+    from app.services import tushare_supplemental_sync
+
+    if body.start_date > body.end_date:
+        raise HTTPException(status_code=422, detail="开始日期不能晚于结束日期")
+    if body.end_date > cn_today():
+        raise HTTPException(status_code=422, detail="结束日期不能晚于今天")
+    days = (body.end_date - body.start_date).days + 1
+    if days > 3660:
+        raise HTTPException(status_code=422, detail="单次补采最多 10 年,请分段执行")
+
+    job_store.reap_stale()
+    job_id, is_new = job_store.create(long_running=True)
+    if not is_new:
+        return {"job_id": job_id, "reused": True}
+
+    dataset = body.dataset
+    start_date = body.start_date
+    end_date = body.end_date
+    data_dir = request.app.state.repo.store.data_dir
+    stage = f"backfill_{dataset}"
+    dataset_label = "集合竞价" if dataset == "auction" else "董秘问答"
+
+    async def task() -> None:
+        if not try_acquire_run_slot(job_id):
+            job_store.fail(job_id, "已有数据任务在运行(或上一次任务卡死未结束),请稍后再试")
+            return
+        try:
+            job_store.start(job_id)
+            job_store.progress(
+                job_id,
+                stage,
+                2,
+                f"准备补采 {dataset_label}: {start_date} 至 {end_date}",
+                stage_pct=0,
+            )
+
+            def on_progress(done: int, total: int, label: str) -> None:
+                stage_pct = int(done / max(total, 1) * 100)
+                pct = 2 + int(stage_pct * 0.96)
+                job_store.progress(
+                    job_id,
+                    stage,
+                    pct,
+                    f"{label} · {done}/{total}",
+                    stage_pct=stage_pct,
+                    skip_log=True,
+                )
+
+            def run() -> int:
+                fn = (
+                    tushare_supplemental_sync.sync_auction_range
+                    if dataset == "auction"
+                    else tushare_supplemental_sync.sync_irm_qa_range
+                )
+                return fn(
+                    data_dir,
+                    start_date=start_date,
+                    end_date=end_date,
+                    on_progress=on_progress,
+                )
+
+            rows = await asyncio.get_event_loop().run_in_executor(_long_task_executor, run)
+            invalidate_data_cache(dataset)
+            job_store.progress(
+                job_id,
+                "done",
+                100,
+                f"{dataset_label}补采完成,本次接口返回 {rows} 行",
+                stage_pct=100,
+            )
+            job_store.succeed(job_id, {
+                "dataset": dataset,
+                "start_date": start_date.isoformat(),
+                "end_date": end_date.isoformat(),
+                f"{dataset}_rows": rows,
+            })
+        except JobCancelledError:
+            logger.warning("supplemental backfill job %s cancelled", job_id)
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("supplemental backfill failed")
+            job_store.fail(job_id, str(exc))
+            invalidate_data_cache(dataset)
+        finally:
+            release_run_slot(job_id)
+
+    asyncio.create_task(task())
+    return {
+        "job_id": job_id,
+        "reused": False,
+        "dataset": dataset,
+        "start_date": start_date.isoformat(),
+        "end_date": end_date.isoformat(),
+    }
 
 
 @router.get("/jobs/{job_id}")

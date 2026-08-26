@@ -30,10 +30,28 @@ def sync_auction(
     on_progress: ProgressCb | None = None,
 ) -> int:
     """Sync opening and closing auction rows for a short calendar lookback."""
-    days = [
-        end_date - timedelta(days=offset)
-        for offset in range(max(1, lookback_days) - 1, -1, -1)
-    ]
+    start_date = end_date - timedelta(days=max(1, lookback_days) - 1)
+    return sync_auction_range(
+        data_dir,
+        start_date=start_date,
+        end_date=end_date,
+        on_progress=on_progress,
+    )
+
+
+def sync_auction_range(
+    data_dir: Path,
+    *,
+    start_date: date,
+    end_date: date,
+    on_progress: ProgressCb | None = None,
+) -> int:
+    """Backfill auction history one date/session at a time.
+
+    A daily partition is merged immediately after each response, so a retry is
+    idempotent and a long range never accumulates all rows in memory.
+    """
+    days = _date_range(start_date, end_date)
     work = [(day, session) for day in days for session in ("open", "close")]
     provider = TushareProvider()
     fetched = 0
@@ -53,9 +71,9 @@ def sync_auction(
     finally:
         provider.close()
     logger.info(
-        "tushare auction sync: end=%s lookback=%d fetched=%d",
+        "tushare auction sync: [%s ~ %s] fetched=%d",
+        start_date,
         end_date,
-        lookback_days,
         fetched,
     )
     return fetched
@@ -70,15 +88,38 @@ def sync_irm_qa(
 ) -> int:
     """Sync newly published SH/SZ investor-relations Q&A."""
     start_date = end_date - timedelta(days=max(1, lookback_days) - 1)
+    return sync_irm_qa_range(
+        data_dir,
+        start_date=start_date,
+        end_date=end_date,
+        on_progress=on_progress,
+    )
+
+
+def sync_irm_qa_range(
+    data_dir: Path,
+    *,
+    start_date: date,
+    end_date: date,
+    on_progress: ProgressCb | None = None,
+) -> int:
+    """Backfill IR Q&A by publish date and exchange.
+
+    Tushare limits each IR response to 3,000 rows. Fetching one publish date at
+    a time makes truncation explicit (the provider raises at the limit) while
+    retaining late answers whose original question date is older.
+    """
+    days = _date_range(start_date, end_date)
     exchanges = ("sh", "sz")
+    work = [(day, exchange) for day in days for exchange in exchanges]
     provider = TushareProvider()
     fetched = 0
     try:
-        for index, exchange in enumerate(exchanges, start=1):
+        for index, (day, exchange) in enumerate(work, start=1):
             frame = provider.get_irm_qa(
                 exchange,
-                pub_start=start_date,
-                pub_end=end_date,
+                pub_start=day,
+                pub_end=day,
             )
             fetched += frame.height
             _merge_partitions(
@@ -89,7 +130,7 @@ def sync_irm_qa(
             )
             if on_progress is not None:
                 label = "上证E互动" if exchange == "sh" else "深证互动易"
-                on_progress(index, len(exchanges), label)
+                on_progress(index, len(work), f"{day.isoformat()} {label}")
     finally:
         provider.close()
     logger.info(
@@ -99,6 +140,15 @@ def sync_irm_qa(
         fetched,
     )
     return fetched
+
+
+def _date_range(start_date: date, end_date: date) -> list[date]:
+    if start_date > end_date:
+        raise ValueError("start_date must not be after end_date")
+    return [
+        start_date + timedelta(days=offset)
+        for offset in range((end_date - start_date).days + 1)
+    ]
 
 
 def _merge_partitions(

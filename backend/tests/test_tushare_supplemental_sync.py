@@ -73,3 +73,48 @@ def test_supplemental_sync_is_idempotent_and_partitioned(tmp_path, monkeypatch):
         "symbols_covered": 2,
         "trading_days": 1,
     }
+
+
+def test_historical_ranges_are_split_by_day_and_source(tmp_path, monkeypatch):
+    calls: list[tuple[str, str, str]] = []
+    progress: list[tuple[int, int, str]] = []
+
+    class RecordingProvider(_Provider):
+        def get_auction(self, day: date, session: str) -> pl.DataFrame:
+            calls.append(("auction", day.isoformat(), session))
+            return super().get_auction(day, session)
+
+        def get_irm_qa(self, exchange: str, *, pub_start: date, pub_end: date) -> pl.DataFrame:
+            assert pub_start == pub_end
+            calls.append(("irm_qa", pub_start.isoformat(), exchange))
+            return super().get_irm_qa(exchange, pub_start=pub_start, pub_end=pub_end)
+
+    monkeypatch.setattr(sync, "TushareProvider", RecordingProvider)
+
+    auction_rows = sync.sync_auction_range(
+        tmp_path,
+        start_date=date(2026, 8, 25),
+        end_date=date(2026, 8, 26),
+        on_progress=lambda done, total, label: progress.append((done, total, label)),
+    )
+    qa_rows = sync.sync_irm_qa_range(
+        tmp_path,
+        start_date=date(2026, 8, 25),
+        end_date=date(2026, 8, 26),
+        on_progress=lambda done, total, label: progress.append((done, total, label)),
+    )
+
+    assert auction_rows == 4
+    assert qa_rows == 4
+    assert calls == [
+        ("auction", "2026-08-25", "open"),
+        ("auction", "2026-08-25", "close"),
+        ("auction", "2026-08-26", "open"),
+        ("auction", "2026-08-26", "close"),
+        ("irm_qa", "2026-08-25", "sh"),
+        ("irm_qa", "2026-08-25", "sz"),
+        ("irm_qa", "2026-08-26", "sh"),
+        ("irm_qa", "2026-08-26", "sz"),
+    ]
+    assert progress[0][:2] == (1, 4)
+    assert progress[-1][:2] == (4, 4)

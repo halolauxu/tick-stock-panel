@@ -44,6 +44,7 @@ import { ExtendHistoryPanel } from '@/components/data/ExtendHistoryPanel'
 import { RepairDailyPanel } from '@/components/data/RepairDailyPanel'
 import { EnrichedRebuildPanel } from '@/components/data/EnrichedRebuildPanel'
 import { MinuteSyncConfig } from '@/components/data/MinuteSyncConfig'
+import { TushareSupplementalBackfill } from '@/components/data/TushareSupplementalBackfill'
 import { RegimeConfigCard } from '@/components/data/RegimeConfigCard'
 import { PipelineScopeConfig } from '@/components/data/PipelineScopeConfig'
 import { PageSettingsModal, getCardVisibility, getCardOrder, type CardKey } from '@/components/data/PageSettingsModal'
@@ -348,6 +349,8 @@ export function Data() {
     extend_minute: 'minute',
     sync_auction: 'auction',
     sync_irm_qa: 'irm_qa',
+    backfill_auction: 'auction',
+    backfill_irm_qa: 'irm_qa',
     compute_regime: 'regime',
     // regime 软失败时入 skipped_stages 的是 'regime'(非 stage 名), 也映射到该卡片
     regime: 'regime',
@@ -548,8 +551,8 @@ export function Data() {
             auto={supplementalAuto}
             subLabel={`行 · ${s?.auction?.symbols_covered ?? 0} 只标的 · 开/收盘`}
             onShowFields={() => setSchemaTable('auction')}
-            onSettings={() => setOpenSettings('pipeline-scope')}
-            settingsOpen={openSettings === 'pipeline-scope'}
+            onSettings={() => setOpenSettings('auction')}
+            settingsOpen={openSettings === 'auction'}
           />
         )
       case 'irm_qa':
@@ -567,8 +570,8 @@ export function Data() {
             auto={supplementalAuto}
             subLabel="行 · 上证E互动 · 深证互动易"
             onShowFields={() => setSchemaTable('irm_qa')}
-            onSettings={() => setOpenSettings('pipeline-scope')}
-            settingsOpen={openSettings === 'pipeline-scope'}
+            onSettings={() => setOpenSettings('irm_qa')}
+            settingsOpen={openSettings === 'irm_qa'}
           />
         )
       case 'financials': {
@@ -1075,6 +1078,32 @@ export function Data() {
         {openSettings === 'pipeline-scope' && (
           <SettingsModal title="盘后管道 · 拉取内容" onClose={() => setOpenSettings(null)}>
             <PipelineScopeConfig />
+          </SettingsModal>
+        )}
+      </AnimatePresence>
+
+      <AnimatePresence>
+        {openSettings === 'auction' && (
+          <SettingsModal title="集合竞价 · 自动同步与历史补采" onClose={() => setOpenSettings(null)}>
+            <TushareSupplementalBackfill
+              dataset="auction"
+              earliestDate={s?.auction?.earliest_date ?? null}
+              isRunning={isRunning}
+              onJobStart={(jobId) => { setActiveJobId(jobId); setOpenSettings(null) }}
+            />
+          </SettingsModal>
+        )}
+      </AnimatePresence>
+
+      <AnimatePresence>
+        {openSettings === 'irm_qa' && (
+          <SettingsModal title="董秘问答 · 自动同步与历史补采" onClose={() => setOpenSettings(null)}>
+            <TushareSupplementalBackfill
+              dataset="irm_qa"
+              earliestDate={s?.irm_qa?.earliest_date ?? null}
+              isRunning={isRunning}
+              onJobStart={(jobId) => { setActiveJobId(jobId); setOpenSettings(null) }}
+            />
           </SettingsModal>
         )}
       </AnimatePresence>
