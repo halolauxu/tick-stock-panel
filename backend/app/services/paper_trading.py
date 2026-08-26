@@ -8,11 +8,13 @@ import re
 import threading
 import uuid
 from datetime import date, datetime, timedelta
+from datetime import time as dt_time
 from pathlib import Path
 from typing import Any
 
 from app.backtest.strategy import StrategyBacktestConfig
 from app.backtest.worker import make_worker_task, run_worker_task
+from app.market_time import CN_TZ, cn_now
 
 logger = logging.getLogger(__name__)
 
@@ -26,23 +28,67 @@ class PaperTradingStoreError(RuntimeError):
     pass
 
 
+def _previous_weekday(value: date) -> date:
+    candidate = value - timedelta(days=1)
+    while candidate.weekday() >= 5:
+        candidate -= timedelta(days=1)
+    return candidate
+
+
+def _activation_signal_start(baseline: date, created_at: datetime) -> date:
+    """决定账户首个可处理信号日。
+
+    完整基线日的收盘信号可以生成下一交易日开盘订单。若基线落后于创建日,
+    仅在周末或开盘前且它仍是最近工作日时沿用; 其余情况从创建日向前运行,
+    避免盘中/盘后用陈旧数据倒填已经过去的开盘成交。
+    """
+    if created_at.tzinfo is None:
+        created_at = created_at.replace(tzinfo=CN_TZ)
+    else:
+        created_at = created_at.astimezone(CN_TZ)
+    created_day = created_at.date()
+    if baseline >= created_day:
+        return baseline
+    recent_previous_day = baseline >= _previous_weekday(created_day)
+    before_open = created_at.time() < dt_time(9, 30)
+    if recent_previous_day and (created_day.weekday() >= 5 or before_open):
+        return baseline
+    return created_day
+
+
 def _normalise_account(account: dict[str, Any]) -> dict[str, Any]:
-    """兼容首版账户, 并补齐严格前向运行所需的激活边界。"""
+    """兼容旧账户, 并修正完整基线日可产生次日开盘订单的激活边界。"""
     account = dict(account)
-    if int(account.get("schema_version", 1)) >= 2:
+    if int(account.get("schema_version", 1)) >= 3:
         return account
-    original_start = date.fromisoformat(str(account["start_date"]))
+    baseline = date.fromisoformat(str(account.get("baseline_date") or account["start_date"]))
     try:
-        created_day = date.fromisoformat(str(account.get("created_at", ""))[:10])
+        created_at = datetime.fromisoformat(str(account.get("created_at", "")))
     except ValueError:
-        created_day = original_start + timedelta(days=1)
-    signal_start = max(original_start + timedelta(days=1), created_day)
+        created_at = datetime.combine(baseline, dt_time(15, 30), tzinfo=CN_TZ)
+    previous_start = date.fromisoformat(str(account.get("signal_start_date") or account["start_date"]))
+    signal_start = _activation_signal_start(baseline, created_at)
     account.update({
-        "schema_version": 2,
-        "baseline_date": original_start.isoformat(),
+        "schema_version": 3,
+        "baseline_date": baseline.isoformat(),
         "signal_start_date": signal_start.isoformat(),
+        "start_date": signal_start.isoformat(),
         "execution_policy": "after_close_daily",
+        "activation_policy": "completed_baseline_or_next_forward_day",
     })
+    if signal_start < previous_start:
+        account.update({
+            "last_processed_date": None,
+            "last_run_at": None,
+            "last_error": None,
+            "result": None,
+            "execution_state": {
+                "code": "waiting_rebuild",
+                "label": "待按完整基线日重算",
+                "detail": f"账户将从 {signal_start.isoformat()} 的完整收盘信号开始运行",
+                "next_action": "按现有完整数据同步账户",
+            },
+        })
     return account
 
 
@@ -84,7 +130,14 @@ class PaperTradingStore:
         accounts.sort(key=lambda item: item.get("created_at", ""), reverse=True)
         return accounts
 
-    def create(self, *, name: str, start_date: date, config: dict[str, Any]) -> dict[str, Any]:
+    def create(
+        self,
+        *,
+        name: str,
+        start_date: date,
+        config: dict[str, Any],
+        created_at: datetime | None = None,
+    ) -> dict[str, Any]:
         clean_name = str(name).strip()
         if not clean_name:
             raise ValueError("模拟账户名称不能为空")
@@ -92,10 +145,16 @@ class PaperTradingStore:
             json.dumps(config, ensure_ascii=False, allow_nan=False)
         except (TypeError, ValueError) as exc:
             raise ValueError("模拟账户配置无法序列化") from exc
-        now = datetime.now().astimezone().isoformat(timespec="seconds")
-        signal_start = start_date + timedelta(days=1)
+        now_dt = created_at or cn_now()
+        now_dt = (
+            now_dt.replace(tzinfo=CN_TZ)
+            if now_dt.tzinfo is None
+            else now_dt.astimezone(CN_TZ)
+        )
+        now = now_dt.isoformat(timespec="seconds")
+        signal_start = _activation_signal_start(start_date, now_dt)
         account = {
-            "schema_version": 2,
+            "schema_version": 3,
             "id": uuid.uuid4().hex[:12],
             "name": clean_name[:80],
             "status": "active",
@@ -105,11 +164,12 @@ class PaperTradingStore:
             "signal_start_date": signal_start.isoformat(),
             "start_date": signal_start.isoformat(),
             "execution_policy": "after_close_daily",
+            "activation_policy": "completed_baseline_or_next_forward_day",
             "execution_state": {
                 "code": "waiting_first_data",
-                "label": "等待首个前向交易日",
-                "detail": f"只处理 {signal_start.isoformat()} 及之后新完成的数据, 不倒填创建前订单",
-                "next_action": "等待盘后日线与指标完整落盘",
+                "label": "准备处理首个完整信号日",
+                "detail": f"首个可处理信号日为 {signal_start.isoformat()}, 完整收盘信号将生成下一交易日开盘订单",
+                "next_action": "按当前完整数据计算账户",
             },
             "last_processed_date": None,
             "last_run_at": None,

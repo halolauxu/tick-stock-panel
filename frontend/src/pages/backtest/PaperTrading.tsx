@@ -405,7 +405,7 @@ export function PaperTrading() {
 
         <div className="rounded-btn border border-border bg-surface p-3">
           <div className="flex items-center gap-1.5 text-xs font-medium text-foreground"><CalendarCheck className="h-3.5 w-3.5 text-accent" />运行口径</div>
-          <p className="mt-1.5 text-[10px] leading-4 text-muted">创建时只冻结数据基线，不执行基线日的历史信号。首个新交易日数据完整后，才开始严格前向选股、成交和更新净值。</p>
+          <p className="mt-1.5 text-[10px] leading-4 text-muted">创建时冻结策略与最新完整数据日。若该日收盘信号尚未经过下一次开盘，会立即生成待执行订单；否则从账户创建后的首个完整数据日开始，不倒填已经过去的成交。</p>
           <input value={accountName} onChange={event => setAccountName(event.target.value)} placeholder="模拟账户名称" className={`${BACKTEST_INPUT_CLS} mt-2`} />
         </div>
 
@@ -498,53 +498,29 @@ export function PaperTrading() {
           </div>
         </div>
 
-        <div className="mb-3 flex flex-wrap items-center justify-between gap-2">
-          <div className="flex min-w-0 flex-1 gap-1 overflow-x-auto">
+        <div className="mb-3 rounded-card border border-border bg-surface/60 p-2.5">
+          <div className="mb-2 flex flex-wrap items-center justify-between gap-2">
+            <div className="flex items-center gap-2">
+              <WalletCards className="h-3.5 w-3.5 text-accent" />
+              <span className="text-xs font-medium text-foreground">账户切换</span>
+              <span className="rounded-full bg-elevated px-1.5 py-0.5 text-[10px] text-muted">{accountItems.length} 个</span>
+            </div>
+            <span className="text-[10px] text-muted">先选择账户；下方管理操作只作用于高亮账户</span>
+          </div>
+          <div className="flex min-w-0 gap-1.5 overflow-x-auto pb-0.5">
             {accountItems.map(item => (
               <button
                 key={item.id}
                 type="button"
                 onClick={() => setSelectedAccountId(item.id)}
-                className={`shrink-0 rounded-btn border px-3 py-1.5 text-xs ${account?.id === item.id ? 'border-accent/50 bg-accent/10 text-accent' : 'border-border bg-surface text-secondary'}`}
+                aria-pressed={account?.id === item.id}
+                className={`shrink-0 rounded-btn border px-3 py-1.5 text-xs transition-colors ${account?.id === item.id ? 'border-accent bg-accent/15 text-accent shadow-[0_0_0_1px_rgba(59,130,246,0.15)]' : 'border-border bg-surface text-secondary hover:border-accent/40'}`}
               >
                 <span className={`mr-1.5 inline-block h-1.5 w-1.5 rounded-full ${item.status === 'active' ? 'bg-emerald-400' : 'bg-muted'}`} />
                 {item.name}
               </button>
             ))}
           </div>
-          {account && (
-            <div className="flex items-center gap-1.5">
-              <button
-                type="button"
-                onClick={() => toggleAccount.mutate(account)}
-                disabled={toggleAccount.isPending}
-                className="inline-flex h-8 items-center gap-1.5 rounded-btn border border-border bg-surface px-2.5 text-xs text-secondary hover:border-accent/40"
-              >
-                {account.status === 'active' ? <Pause className="h-3.5 w-3.5" /> : <Play className="h-3.5 w-3.5" />}
-                {account.status === 'active' ? '暂停' : '恢复'}
-              </button>
-              <button
-                type="button"
-                onClick={() => runAccount.mutate(account.id)}
-                disabled={runAccount.isPending}
-                title="仅使用本地已完整落盘的数据重算账户，不触发行情补采"
-                className="inline-flex h-8 items-center gap-1.5 rounded-btn border border-accent/40 bg-accent/10 px-2.5 text-xs text-accent"
-              >
-                <RefreshCw className={`h-3.5 w-3.5 ${runAccount.isPending ? 'animate-spin' : ''}`} />
-                按现有数据同步
-              </button>
-              <button
-                type="button"
-                onClick={() => setDeleteTarget(account)}
-                disabled={deleteAccount.isPending}
-                title="永久删除该模拟账户及其持仓、订单和成交记录"
-                className="inline-flex h-8 items-center gap-1.5 rounded-btn border border-red-500/30 bg-red-500/5 px-2.5 text-xs text-red-400 hover:bg-red-500/10 disabled:opacity-50"
-              >
-                <Trash2 className="h-3.5 w-3.5" />
-                删除
-              </button>
-            </div>
-          )}
         </div>
 
         {accounts.isLoading && <div className="grid h-full place-items-center text-sm text-muted"><Loader2 className="mr-2 inline h-4 w-4 animate-spin" />加载模拟账户…</div>}
@@ -560,6 +536,7 @@ export function PaperTrading() {
           <div className="space-y-3">
             <div className="flex flex-wrap items-start justify-between gap-3 rounded-card border border-border bg-surface px-4 py-3">
               <div>
+                <div className="mb-1 text-[10px] font-medium uppercase tracking-wide text-accent">当前账户</div>
                 <div className="flex items-center gap-2">
                   <h2 className="text-sm font-semibold text-foreground">{account.name}</h2>
                   <span className={`rounded border px-1.5 py-0.5 text-[10px] ${account.status === 'active' ? 'border-emerald-400/30 bg-emerald-400/10 text-emerald-400' : 'border-border bg-elevated text-muted'}`}>
@@ -568,14 +545,47 @@ export function PaperTrading() {
                 </div>
                 <div className="mt-1 text-[11px] text-muted">{accountStrategyName} · {account.config.asset_type === 'stock' ? '股票' : 'ETF'} · 前向信号起始 {account.signal_start_date ?? account.start_date}</div>
               </div>
-              <div className="text-right text-[11px] text-muted">
-                <div className="flex items-center justify-end gap-1"><CalendarCheck className="h-3.5 w-3.5" />数据截至 {account.last_processed_date ?? '尚未运行'}</div>
-                <div className="mt-1 flex items-center justify-end gap-1"><Clock3 className="h-3.5 w-3.5" />{account.last_run_at ? new Date(account.last_run_at).toLocaleString('zh-CN', { hour12: false }) : '等待首次同步'}</div>
+              <div className="flex flex-wrap items-center justify-end gap-3">
+                <div className="text-right text-[11px] text-muted">
+                  <div className="flex items-center justify-end gap-1"><CalendarCheck className="h-3.5 w-3.5" />数据截至 {account.last_processed_date ?? '尚未运行'}</div>
+                  <div className="mt-1 flex items-center justify-end gap-1"><Clock3 className="h-3.5 w-3.5" />{account.last_run_at ? new Date(account.last_run_at).toLocaleString('zh-CN', { hour12: false }) : '等待首次同步'}</div>
+                </div>
+                <div className="flex items-center gap-1.5 border-l border-border pl-3" aria-label={`管理当前账户 ${account.name}`}>
+                  <button
+                    type="button"
+                    onClick={() => toggleAccount.mutate(account)}
+                    disabled={toggleAccount.isPending}
+                    className="inline-flex h-8 items-center gap-1.5 rounded-btn border border-border bg-base px-2.5 text-xs text-secondary hover:border-accent/40"
+                  >
+                    {account.status === 'active' ? <Pause className="h-3.5 w-3.5" /> : <Play className="h-3.5 w-3.5" />}
+                    {account.status === 'active' ? '暂停此账户' : '恢复此账户'}
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => runAccount.mutate(account.id)}
+                    disabled={runAccount.isPending}
+                    title="仅使用已完整落盘的数据重算当前账户，不触发行情补采"
+                    className="inline-flex h-8 items-center gap-1.5 rounded-btn border border-accent/40 bg-accent/10 px-2.5 text-xs text-accent"
+                  >
+                    <RefreshCw className={`h-3.5 w-3.5 ${runAccount.isPending ? 'animate-spin' : ''}`} />
+                    同步此账户
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setDeleteTarget(account)}
+                    disabled={deleteAccount.isPending}
+                    title={`永久删除当前账户「${account.name}」`}
+                    className="inline-flex h-8 items-center gap-1.5 rounded-btn border border-red-500/30 bg-red-500/5 px-2.5 text-xs text-red-400 hover:bg-red-500/10 disabled:opacity-50"
+                  >
+                    <Trash2 className="h-3.5 w-3.5" />
+                    删除此账户
+                  </button>
+                </div>
               </div>
             </div>
 
             {account.execution_state && (
-              <div className={`rounded-card border px-3 py-2.5 ${account.execution_state.code === 'error' ? 'border-red-500/30 bg-red-500/5' : account.execution_state.code === 'waiting_first_data' || account.execution_state.code === 'waiting_open' || account.execution_state.code === 'waiting_exit' ? 'border-amber-400/30 bg-amber-400/5' : 'border-accent/25 bg-accent/5'}`}>
+              <div className={`rounded-card border px-3 py-2.5 ${account.execution_state.code === 'error' ? 'border-red-500/30 bg-red-500/5' : account.execution_state.code === 'waiting_first_data' || account.execution_state.code === 'waiting_rebuild' || account.execution_state.code === 'waiting_open' || account.execution_state.code === 'waiting_exit' ? 'border-amber-400/30 bg-amber-400/5' : 'border-accent/25 bg-accent/5'}`}>
                 <div className="flex flex-wrap items-center justify-between gap-2">
                   <span className="text-xs font-medium text-foreground">{account.execution_state.label}</span>
                   <span className="text-[10px] text-muted">下一步：{account.execution_state.next_action}</span>
@@ -694,9 +704,9 @@ export function PaperTrading() {
             closeOnBackdrop={!deleteAccount.isPending}
             panelClassName="w-[92vw] max-w-md rounded-card border border-border bg-surface p-5 shadow-2xl"
           >
-            <h3 id="paper-account-delete-title" className="text-sm font-semibold text-foreground">删除模拟账户</h3>
+            <h3 id="paper-account-delete-title" className="text-sm font-semibold text-foreground">删除「{deleteTarget.name}」</h3>
             <p className="mt-2 text-xs leading-5 text-secondary">
-              确认永久删除「{deleteTarget.name}」？该账户的配置、持仓、待执行订单、净值和历史成交都会一并删除，此操作不可撤销。
+              你正在删除当前选中的模拟账户。该账户的配置、持仓、待执行订单、净值和历史成交都会一并删除，此操作不可撤销。
             </p>
             <div className="mt-5 flex justify-end gap-2">
               <button

@@ -1374,8 +1374,9 @@ export interface PaperTradingAccount {
   baseline_date?: string
   signal_start_date?: string
   execution_policy?: 'after_close_daily'
+  activation_policy?: 'completed_baseline_or_next_forward_day'
   execution_state?: {
-    code: 'waiting_first_data' | 'waiting_open' | 'waiting_exit' | 'holding' | 'scanning' | 'error'
+    code: 'waiting_first_data' | 'waiting_rebuild' | 'waiting_open' | 'waiting_exit' | 'holding' | 'scanning' | 'error'
     label: string
     detail: string
     next_action: string

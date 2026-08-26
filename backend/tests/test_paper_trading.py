@@ -1,11 +1,13 @@
 from __future__ import annotations
 
-from datetime import date
+import json
+from datetime import date, datetime
 from types import SimpleNamespace
 
 import pytest
 
 from app.api import paper_trading as paper_api
+from app.market_time import CN_TZ
 from app.services import paper_trading
 
 
@@ -38,14 +40,16 @@ def test_account_store_persists_frozen_backtest_config(tmp_path):
         name="新低反转模拟盘",
         start_date=date(2026, 8, 26),
         config=_config(),
+        created_at=datetime(2026, 8, 26, 16, 0, tzinfo=CN_TZ),
     )
 
     loaded = paper_trading.PaperTradingStore(tmp_path).get(created["id"])
     assert loaded["status"] == "active"
-    assert loaded["schema_version"] == 2
+    assert loaded["schema_version"] == 3
     assert loaded["baseline_date"] == "2026-08-26"
-    assert loaded["signal_start_date"] == "2026-08-27"
-    assert loaded["start_date"] == "2026-08-27"
+    assert loaded["signal_start_date"] == "2026-08-26"
+    assert loaded["start_date"] == "2026-08-26"
+    assert loaded["activation_policy"] == "completed_baseline_or_next_forward_day"
     assert loaded["config"] == _config()
     assert loaded["last_processed_date"] is None
     assert loaded["result"] is None
@@ -57,6 +61,7 @@ def test_run_account_reuses_backtest_worker_and_is_idempotent(monkeypatch, tmp_p
         name="新低反转模拟盘",
         start_date=date(2026, 8, 20),
         config=_config(),
+        created_at=datetime(2026, 8, 20, 16, 0, tzinfo=CN_TZ),
     )
     tasks: list[dict] = []
 
@@ -100,7 +105,7 @@ def test_run_account_reuses_backtest_worker_and_is_idempotent(monkeypatch, tmp_p
     assert second == first
     assert len(tasks) == 1
     assert tasks[0]["kind"] == "backtest"
-    assert tasks[0]["config"]["start"] == "2026-08-21"
+    assert tasks[0]["config"]["start"] == "2026-08-20"
     assert tasks[0]["config"]["end"] == "2026-08-26"
     assert tasks[0]["config"]["liquidate_on_end"] is False
 
@@ -111,6 +116,7 @@ def test_new_account_waits_for_post_activation_data_without_retroactive_order(mo
         name="严格前向模拟盘",
         start_date=date(2026, 8, 25),
         config=_config(),
+        created_at=datetime(2026, 8, 26, 22, 0, tzinfo=CN_TZ),
     )
     monkeypatch.setattr(
         paper_trading,
@@ -131,6 +137,48 @@ def test_new_account_waits_for_post_activation_data_without_retroactive_order(mo
     assert account["result"]["open_positions"] == []
     assert account["execution_state"]["code"] == "waiting_first_data"
     assert "2026-08-26" in account["execution_state"]["detail"]
+
+
+def test_preopen_account_uses_latest_complete_day_for_next_open(tmp_path):
+    store = paper_trading.PaperTradingStore(tmp_path)
+
+    created = store.create(
+        name="盘前模拟盘",
+        start_date=date(2026, 8, 26),
+        config=_config(),
+        created_at=datetime(2026, 8, 27, 8, 0, tzinfo=CN_TZ),
+    )
+
+    assert created["baseline_date"] == "2026-08-26"
+    assert created["signal_start_date"] == "2026-08-26"
+
+
+def test_v2_account_is_migrated_to_rebuild_complete_baseline_day(tmp_path):
+    store = paper_trading.PaperTradingStore(tmp_path)
+    created = store.create(
+        name="旧版模拟盘",
+        start_date=date(2026, 8, 26),
+        config=_config(),
+        created_at=datetime(2026, 8, 26, 22, 0, tzinfo=CN_TZ),
+    )
+    legacy = {
+        **created,
+        "schema_version": 2,
+        "signal_start_date": "2026-08-27",
+        "start_date": "2026-08-27",
+        "last_processed_date": "2026-08-26",
+        "result": {"pending_orders": []},
+    }
+    path = tmp_path / "paper_trading" / "accounts" / f"{created['id']}.json"
+    path.write_text(json.dumps(legacy), encoding="utf-8")
+
+    migrated = store.get(created["id"])
+
+    assert migrated["schema_version"] == 3
+    assert migrated["signal_start_date"] == "2026-08-26"
+    assert migrated["last_processed_date"] is None
+    assert migrated["result"] is None
+    assert migrated["execution_state"]["code"] == "waiting_rebuild"
 
 
 def test_corrupt_account_file_fails_closed(tmp_path):
@@ -186,6 +234,11 @@ def test_delete_account_api_returns_receipt_and_missing_account_is_404(tmp_path)
 
 def test_api_creates_account_from_latest_complete_day(monkeypatch, tmp_path):
     monkeypatch.setattr(
+        paper_trading,
+        "cn_now",
+        lambda: datetime(2026, 8, 26, 22, 0, tzinfo=CN_TZ),
+    )
+    monkeypatch.setattr(
         paper_api.StrategyEngine,
         "validate_context",
         lambda *_args, **_kwargs: None,
@@ -208,8 +261,8 @@ def test_api_creates_account_from_latest_complete_day(monkeypatch, tmp_path):
     )
 
     assert account["baseline_date"] == "2026-08-26"
-    assert account["signal_start_date"] == "2026-08-27"
-    assert account["start_date"] == "2026-08-27"
+    assert account["signal_start_date"] == "2026-08-26"
+    assert account["start_date"] == "2026-08-26"
     assert account["config"]["strategy_id"] == "n_day_low_reversal"
     assert account["config"]["entry_fill"] == "open_t+1"
     assert paper_api.list_accounts(request)["items"][0]["id"] == account["id"]
