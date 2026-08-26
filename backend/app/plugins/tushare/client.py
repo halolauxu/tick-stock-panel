@@ -9,7 +9,7 @@ from __future__ import annotations
 import logging
 import threading
 import time
-from datetime import datetime
+from datetime import date, datetime
 
 import httpx
 
@@ -26,6 +26,23 @@ MINUTE_FIELDS = (
     "vol",
     "amount",
 )
+
+AUCTION_FIELDS = (
+    "ts_code",
+    "trade_date",
+    "close",
+    "open",
+    "high",
+    "low",
+    "vol",
+    "amount",
+    "vwap",
+)
+
+IRM_QA_FIELDS: dict[str, tuple[str, ...]] = {
+    "sh": ("ts_code", "name", "trade_date", "q", "a", "pub_time"),
+    "sz": ("ts_code", "name", "trade_date", "q", "a", "pub_time", "industry"),
+}
 
 FINANCIAL_FIELDS: dict[str, tuple[str, ...]] = {
     "metrics": (
@@ -190,3 +207,37 @@ class TushareClient:
         except KeyError as exc:
             raise TushareError(f"Tushare 不支持财务表: {table}") from exc
         return self.query(api_name, {"ts_code": symbol}, fields)
+
+    def auction_records(self, session: str, trade_date: date) -> list[dict]:
+        """Fetch one market-wide opening or closing auction snapshot."""
+        api_name = {
+            "open": "stk_auction_o",
+            "close": "stk_auction_c",
+        }.get(session)
+        if api_name is None:
+            raise TushareError(f"Tushare 不支持集合竞价时段: {session}")
+        return self.query(
+            api_name,
+            {"trade_date": trade_date.strftime("%Y%m%d")},
+            AUCTION_FIELDS,
+        )
+
+    def irm_qa_records(
+        self,
+        exchange: str,
+        *,
+        pub_start: date,
+        pub_end: date,
+    ) -> list[dict]:
+        """Fetch newly published exchange IR questions and answers."""
+        normalized = exchange.strip().lower()
+        if normalized not in IRM_QA_FIELDS:
+            raise TushareError(f"Tushare 不支持董秘问答交易所: {exchange}")
+        return self.query(
+            f"irm_qa_{normalized}",
+            {
+                "pub_start": pub_start.strftime("%Y%m%d"),
+                "pub_end": pub_end.strftime("%Y%m%d"),
+            },
+            IRM_QA_FIELDS[normalized],
+        )

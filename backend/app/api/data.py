@@ -43,6 +43,8 @@ _table_cache: dict[str, dict | None] = {
     "etf_enriched": None,
     "etf_instruments": None,
     "minute": None,
+    "auction": None,
+    "irm_qa": None,
     "adj_factor": None,
     "instruments": None,
     "financials": None,
@@ -406,6 +408,41 @@ def _safe_aggregate_minute(repo) -> dict | None:
     }
 
 
+def _safe_aggregate_supplemental(repo, dataset: str) -> dict | None:
+    """Tushare 盘后特色数据统计。只扫描 symbol 列,日期范围读分区名。"""
+    root = repo.store.data_dir / "tushare_supplemental" / dataset
+    if not root.exists():
+        return None
+    dates = sorted(
+        child.name[5:]
+        for child in root.iterdir()
+        if child.is_dir() and child.name.startswith("date=")
+    )
+    if not dates:
+        return None
+    try:
+        import polars as pl
+        stats = (
+            pl.scan_parquet(str(root / "date=*" / "*.parquet"))
+            .select(
+                pl.len().alias("rows"),
+                pl.col("symbol").n_unique().alias("symbols"),
+            )
+            .collect()
+            .row(0)
+        )
+    except Exception as e:  # noqa: BLE001
+        logger.debug("aggregate tushare supplemental %s failed: %s", dataset, e)
+        return None
+    return {
+        "rows": int(stats[0] or 0),
+        "earliest_date": dates[0],
+        "latest_date": dates[-1],
+        "symbols_covered": int(stats[1] or 0),
+        "trading_days": len(dates),
+    }
+
+
 def _safe_aggregate_financials(repo) -> dict | None:
     """财务数据统计 — 检查各表文件是否存在及行数。"""
     data_dir = repo.store.data_dir
@@ -496,6 +533,8 @@ def _compute_storage(data_dir: Path) -> dict:
         "adj_factor": data_dir / "adj_factor",
         "instruments": data_dir / "instruments",
         "ext_data": data_dir / "ext_data",
+        "auction": data_dir / "tushare_supplemental" / "auction",
+        "irm_qa": data_dir / "tushare_supplemental" / "irm_qa",
     }
     stats = {}
     total_size = 0
@@ -596,6 +635,8 @@ def status(request: Request) -> dict:
     "etf_enriched":      _get_table_stats("etf_enriched",      lambda: _safe_aggregate_etf_enriched(repo)),
     "etf_instruments":   _get_table_stats("etf_instruments",   lambda: _safe_aggregate_etf_instruments(repo)),
     "minute":      _get_table_stats("minute",      lambda: _safe_aggregate_minute(repo)),
+        "auction":     _get_table_stats("auction",     lambda: _safe_aggregate_supplemental(repo, "auction")),
+        "irm_qa":      _get_table_stats("irm_qa",      lambda: _safe_aggregate_supplemental(repo, "irm_qa")),
         "adj_factor":  _get_table_stats("adj_factor",  lambda: _safe_aggregate_adj_factor(repo)),
         "instruments": _get_table_stats("instruments", lambda: _safe_aggregate_instruments(repo)),
         "financials":  _get_table_stats("financials",  lambda: _safe_aggregate_financials(repo)),
@@ -634,6 +675,7 @@ def clear_data(request: Request):
         "kline_daily", "kline_daily_enriched", "kline_index_daily", "kline_index_enriched",
         "kline_etf_daily", "kline_etf_enriched", "kline_etf_minute", "kline_minute",
         "adj_factor", "adj_factor_etf", "instruments", "instruments_index", "instruments_etf", "pools", "financials",
+        "tushare_supplemental",
         "backtest_results", "screener_results", "ai_cache",
     ):
         d = data_dir / sub
@@ -783,6 +825,29 @@ _TABLE_FIELD_DESC: dict[str, dict[str, str]] = {
         "asset_type": "资产类型(etf)",
         "source": "数据源",
     },
+    "auction": {
+        "symbol": "股票代码",
+        "date": "交易日期",
+        "session": "竞价时段(open/close)",
+        "open": "竞价区间开盘价",
+        "high": "竞价区间最高价",
+        "low": "竞价区间最低价",
+        "close": "竞价成交价",
+        "volume_shares": "成交量(股)",
+        "amount": "成交额(元)",
+        "vwap": "成交均价",
+    },
+    "irm_qa": {
+        "symbol": "股票代码",
+        "name": "股票名称",
+        "date": "发布日期",
+        "trade_date": "提问日期",
+        "question": "投资者提问",
+        "answer": "公司回复",
+        "pub_time": "回复发布时间",
+        "industry": "行业(深交所)",
+        "exchange": "交易所",
+    },
 }
 
 # view 名 → DuckDB 视图名
@@ -808,6 +873,11 @@ def table_schema(request: Request, table: str) -> list[dict]:
     优先从 DuckDB DESCRIBE 读取(有数据时含精确类型)；
     视图不存在(无数据)时回退到 _TABLE_FIELD_DESC 静态定义。
     """
+    if table in {"auction", "irm_qa"}:
+        return [
+            {"name": name, "type": "VARCHAR", "desc": desc}
+            for name, desc in _TABLE_FIELD_DESC[table].items()
+        ]
     view = _SCHEMA_VIEWS.get(table)
     if not view:
         return []

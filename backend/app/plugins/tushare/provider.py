@@ -1,4 +1,4 @@
-"""Tushare A-share historical-minute and financial provider.
+"""Tushare A-share minute, financial and post-market supplemental provider.
 
 The user's independently purchased ``stk_mins`` entitlement covers historical
 A-share minute bars, while the standard (non-VIP) financial APIs cover per-stock
@@ -19,7 +19,7 @@ import contextlib
 import logging
 from collections.abc import Callable
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import date, datetime
 
 import polars as pl
 
@@ -42,6 +42,14 @@ _MINUTE_CANONICAL = [
     "close",
     "volume",
     "amount",
+]
+_AUCTION_CANONICAL = [
+    "symbol", "date", "session", "open", "high", "low", "close",
+    "volume_shares", "amount", "vwap",
+]
+_IRM_QA_CANONICAL = [
+    "symbol", "name", "date", "trade_date", "question", "answer",
+    "pub_time", "industry", "exchange",
 ]
 _FINANCIAL_NUMERIC_FIELDS: dict[str, tuple[str, ...]] = {
     "metrics": (
@@ -145,7 +153,7 @@ def probe_api_key(api_key: str) -> tuple[bool, str]:
 @dataclass
 class _TushareConfig:
     name: str = "tushare"
-    display_name: str = "Tushare (A股分钟与财务)"
+    display_name: str = "Tushare (分钟/财务/盘后特色数据)"
     datasets: dict = field(default_factory=lambda: dict.fromkeys(_DATASETS))
     path: None = None
     builtin: bool = True
@@ -293,6 +301,104 @@ class TushareProvider:
             descending=[False, True],
         )
 
+    def get_auction(self, trade_date: date, session: str) -> pl.DataFrame:
+        """Return one day's market-wide opening or closing auction rows."""
+        rows = self._get_client().auction_records(session, trade_date)
+        if len(rows) >= 10_000:
+            raise TushareError(
+                f"{session} 集合竞价返回 {len(rows)} 行,达到接口上限,拒绝保存可能被截断的数据"
+            )
+        records: list[dict] = []
+        for source in rows:
+            symbol = _canonical_symbol(source.get("ts_code"))
+            day = _canonical_date(source.get("trade_date"))
+            if not symbol or not day:
+                continue
+            records.append({
+                "symbol": symbol,
+                "date": day,
+                "session": session,
+                "open": _number(source, "open"),
+                "high": _number(source, "high"),
+                "low": _number(source, "low"),
+                "close": _number(source, "close"),
+                "volume_shares": _number(source, "vol"),
+                "amount": _number(source, "amount"),
+                "vwap": _number(source, "vwap"),
+            })
+        if not records:
+            return pl.DataFrame()
+        return (
+            pl.DataFrame(
+                records,
+                schema_overrides={
+                    "symbol": pl.Utf8,
+                    "date": pl.Utf8,
+                    "session": pl.Utf8,
+                    **dict.fromkeys(_AUCTION_CANONICAL[3:], pl.Float64),
+                },
+                strict=False,
+                infer_schema_length=None,
+            )
+            .select(_AUCTION_CANONICAL)
+            .unique(subset=["symbol", "date", "session"], keep="last")
+            .sort(["date", "symbol", "session"])
+        )
+
+    def get_irm_qa(
+        self,
+        exchange: str,
+        *,
+        pub_start: date,
+        pub_end: date,
+    ) -> pl.DataFrame:
+        """Return newly published Shanghai or Shenzhen IR Q&A rows."""
+        normalized_exchange = exchange.strip().lower()
+        rows = self._get_client().irm_qa_records(
+            normalized_exchange,
+            pub_start=pub_start,
+            pub_end=pub_end,
+        )
+        if len(rows) >= 3_000:
+            raise TushareError(
+                f"{normalized_exchange.upper()} 董秘问答返回 {len(rows)} 行,达到接口上限,"
+                "拒绝保存可能被截断的数据"
+            )
+        records: list[dict] = []
+        for source in rows:
+            symbol = _canonical_symbol(source.get("ts_code"), normalized_exchange)
+            trade_date = _canonical_date(source.get("trade_date"))
+            pub_time = str(source.get("pub_time") or "").strip()
+            published_date = _canonical_datetime_date(pub_time) or trade_date
+            question = str(source.get("q") or "").strip()
+            answer = str(source.get("a") or "").strip()
+            if not symbol or not published_date or not question:
+                continue
+            records.append({
+                "symbol": symbol,
+                "name": str(source.get("name") or "").strip(),
+                "date": published_date,
+                "trade_date": trade_date,
+                "question": question,
+                "answer": answer,
+                "pub_time": pub_time,
+                "industry": str(source.get("industry") or "").strip(),
+                "exchange": normalized_exchange.upper(),
+            })
+        if not records:
+            return pl.DataFrame()
+        return (
+            pl.DataFrame(
+                records,
+                schema_overrides=dict.fromkeys(_IRM_QA_CANONICAL, pl.Utf8),
+                strict=False,
+                infer_schema_length=None,
+            )
+            .select(_IRM_QA_CANONICAL)
+            .unique(subset=["symbol", "pub_time", "question"], keep="last")
+            .sort(["date", "pub_time", "symbol"])
+        )
+
     @staticmethod
     def _financial_df(
         table: str,
@@ -432,6 +538,34 @@ def _canonical_date(value: object) -> str | None:
     if len(raw) != 8 or not raw.isdigit():
         return None
     return f"{raw[:4]}-{raw[4:6]}-{raw[6:]}"
+
+
+def _canonical_datetime_date(value: object) -> str | None:
+    raw = str(value or "").strip()
+    digits = "".join(ch for ch in raw[:10] if ch.isdigit())
+    return _canonical_date(digits)
+
+
+def _canonical_symbol(value: object, exchange: str | None = None) -> str | None:
+    raw = str(value or "").strip().upper()
+    if not raw:
+        return None
+    if "." in raw:
+        return raw
+    code = "".join(ch for ch in raw if ch.isdigit())
+    if len(code) != 6:
+        return None
+    suffix = (exchange or "").strip().upper()
+    if suffix not in {"SH", "SZ", "BJ"}:
+        if code.startswith(("6", "68")):
+            suffix = "SH"
+        elif code.startswith(("0", "2", "3")):
+            suffix = "SZ"
+        elif code.startswith(("4", "8", "9")):
+            suffix = "BJ"
+        else:
+            return None
+    return f"{code}.{suffix}"
 
 
 def _number(source: dict, *fields: str, scale: float = 1.0) -> float | None:

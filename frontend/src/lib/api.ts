@@ -1468,6 +1468,7 @@ export interface Preferences {
   minute_sync_enabled: boolean
   minute_sync_days: number
   minute_sync_segment_days: number
+  tushare_supplemental_sync_enabled: boolean
   daily_data_provider?: string
   adj_factor_provider?: string
   minute_data_provider?: string
@@ -1664,6 +1665,14 @@ export const api = {
         ...(segmentDays != null ? { minute_sync_segment_days: segmentDays } : {}),
       }),
     }),
+  updateTushareSupplementalSync: (enabled: boolean) =>
+    request<Pick<Preferences, 'tushare_supplemental_sync_enabled'>>(
+      '/api/settings/preferences/tushare-supplemental-sync',
+      {
+        method: 'PUT',
+        body: JSON.stringify({ tushare_supplemental_sync_enabled: enabled }),
+      },
+    ),
   updatePipelinePullTypes: (cfg: Partial<Pick<Preferences, 'pipeline_pull_a_share' | 'pipeline_pull_etf' | 'pipeline_pull_index'>>) =>
     request<{
       pipeline_pull_a_share: boolean
@@ -3067,6 +3076,8 @@ export interface PipelineJob {
     index_count?: number
     index_daily_rows?: number
     minute_rows: number
+    auction_rows?: number
+    irm_qa_rows?: number
     skipped_stages?: string[]
   } | null
   error: string | null
@@ -3100,6 +3111,8 @@ export interface DataStatus {
   etf_enriched: TableStats | null
   etf_instruments: InstrumentsStats | null
   minute: TableStats | null
+  auction: TableStats | null
+  irm_qa: TableStats | null
   adj_factor: TableStats | null
   instruments: InstrumentsStats | null
   financials: { rows: number; tables: Record<string, { rows: number; symbols: number }> } | null
@@ -3124,6 +3137,10 @@ export interface DataStatus {
     etf_adj_factor_size_mb?: number
     minute_files: number
     minute_size_mb: number
+    auction_files?: number
+    auction_size_mb?: number
+    irm_qa_files?: number
+    irm_qa_size_mb?: number
     adj_factor_files: number
     adj_factor_size_mb: number
     instruments_files: number

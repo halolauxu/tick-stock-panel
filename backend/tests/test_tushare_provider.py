@@ -254,6 +254,75 @@ def test_client_posts_standard_financial_contract(monkeypatch):
     assert body["fields"] == ",".join(tc.FINANCIAL_FIELDS["metrics"])
 
 
+def test_client_posts_auction_and_irm_qa_contracts(monkeypatch):
+    fake = _patch_http(
+        monkeypatch,
+        {"code": 0, "data": {"fields": [], "items": []}},
+    )
+    client = TushareClient("secret-token", min_interval_s=0)
+
+    client.auction_records("open", date(2026, 8, 26))
+    client.irm_qa_records(
+        "sz",
+        pub_start=date(2026, 8, 24),
+        pub_end=date(2026, 8, 26),
+    )
+
+    auction = fake.calls[0][1]
+    assert auction["api_name"] == "stk_auction_o"
+    assert auction["params"] == {"trade_date": "20260826"}
+    assert auction["fields"] == ",".join(tc.AUCTION_FIELDS)
+    qa = fake.calls[1][1]
+    assert qa["api_name"] == "irm_qa_sz"
+    assert qa["params"] == {"pub_start": "20260824", "pub_end": "20260826"}
+    assert qa["fields"] == ",".join(tc.IRM_QA_FIELDS["sz"])
+
+
+def test_provider_normalizes_auction_and_irm_qa():
+    class _SupplementalClient(_FakeClient):
+        def auction_records(self, session: str, trade_date: date):
+            return [{
+                "ts_code": "600000.SH",
+                "trade_date": "20260826",
+                "close": 10.2,
+                "open": 10.0,
+                "high": 10.3,
+                "low": 9.9,
+                "vol": 123400,
+                "amount": 1_250_000,
+                "vwap": 10.13,
+            }]
+
+        def irm_qa_records(self, exchange: str, *, pub_start: date, pub_end: date):
+            return [{
+                "ts_code": "002254",
+                "name": "泰和新材",
+                "trade_date": "20260820",
+                "q": "问题",
+                "a": "回复",
+                "pub_time": "2026-08-26 18:02:00",
+                "industry": "化工",
+            }]
+
+    provider = TushareProvider()
+    provider._client = _SupplementalClient()
+
+    auction = provider.get_auction(date(2026, 8, 26), "open")
+    qa = provider.get_irm_qa(
+        "sz",
+        pub_start=date(2026, 8, 24),
+        pub_end=date(2026, 8, 26),
+    )
+
+    assert auction.columns == tp._AUCTION_CANONICAL
+    assert auction.row(0, named=True)["volume_shares"] == 123400
+    assert auction.row(0, named=True)["session"] == "open"
+    assert qa.columns == tp._IRM_QA_CANONICAL
+    assert qa.row(0, named=True)["symbol"] == "002254.SZ"
+    assert qa.row(0, named=True)["date"] == "2026-08-26"
+    assert qa.row(0, named=True)["trade_date"] == "2026-08-20"
+
+
 class _FinancialClient(_FakeClient):
     def __init__(self, table_rows: dict[str, list[dict]]) -> None:
         super().__init__(rows=[])

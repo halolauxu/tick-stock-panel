@@ -201,6 +201,7 @@ export function Data() {
   }
 
   const minuteAuto = prefs.data?.minute_sync_enabled ?? false
+  const supplementalAuto = prefs.data?.tushare_supplemental_sync_enabled ?? false
   const pipelineSched = prefs.data?.pipeline_schedule ?? { hour: 15, minute: 30 }
   const instrumentsSched = prefs.data?.instruments_schedule ?? { hour: 9, minute: 10 }
   const indexDailyBatchSize = prefs.data?.index_daily_batch_size ?? 100
@@ -252,6 +253,7 @@ export function Data() {
     '指标',
     ...(indexAuto ? ['指数'] : []),
     ...(etfAuto ? ['ETF'] : []),
+    ...(supplementalAuto ? ['集合竞价', '董秘问答'] : []),
     ...((hasMinuteCap && minuteAuto) ? ['分钟K'] : []),
   ]
 
@@ -344,6 +346,8 @@ export function Data() {
     sync_index: 'index_daily',
     sync_minute: 'minute',
     extend_minute: 'minute',
+    sync_auction: 'auction',
+    sync_irm_qa: 'irm_qa',
     compute_regime: 'regime',
     // regime 软失败时入 skipped_stages 的是 'regime'(非 stage 名), 也映射到该卡片
     regime: 'regime',
@@ -527,6 +531,44 @@ export function Data() {
             onShowFields={() => setSchemaTable('minute')}
             onSettings={hasData ? () => setOpenSettings(v => v === 'minute' ? null : 'minute') : undefined}
             settingsOpen={openSettings === 'minute'}
+          />
+        )
+      case 'auction':
+        return (
+          <StatCard
+            title="集合竞价"
+            hint="开盘 / 收盘 · 近 3 日增量"
+            stats={s?.auction}
+            loading={isLoading}
+            active={activeCard === 'auction'}
+            done={doneStages.has('auction')}
+            skipped={skippedCards.has('auction')}
+            stagePct={activeCard === 'auction' ? (job.data?.stage_pct ?? 0) : 0}
+            customProvider="Tushare"
+            auto={supplementalAuto}
+            subLabel={`行 · ${s?.auction?.symbols_covered ?? 0} 只标的 · 开/收盘`}
+            onShowFields={() => setSchemaTable('auction')}
+            onSettings={() => setOpenSettings('pipeline-scope')}
+            settingsOpen={openSettings === 'pipeline-scope'}
+          />
+        )
+      case 'irm_qa':
+        return (
+          <StatCard
+            title="董秘问答"
+            hint="按回复发布日期增量"
+            stats={s?.irm_qa}
+            loading={isLoading}
+            active={activeCard === 'irm_qa'}
+            done={doneStages.has('irm_qa')}
+            skipped={skippedCards.has('irm_qa')}
+            stagePct={activeCard === 'irm_qa' ? (job.data?.stage_pct ?? 0) : 0}
+            customProvider="Tushare"
+            auto={supplementalAuto}
+            subLabel="行 · 上证E互动 · 深证互动易"
+            onShowFields={() => setSchemaTable('irm_qa')}
+            onSettings={() => setOpenSettings('pipeline-scope')}
+            settingsOpen={openSettings === 'pipeline-scope'}
           />
         )
       case 'financials': {
@@ -860,6 +902,8 @@ export function Data() {
                 { label: '除权因子', files: s?.storage.adj_factor_files,  size: s?.storage.adj_factor_size_mb },
                 { label: 'Enriched', files: s?.storage.enriched_files,    size: s?.storage.enriched_size_mb },
                 { label: '分钟 K',   files: s?.storage.minute_files,      size: s?.storage.minute_size_mb },
+                { label: '集合竞价', files: s?.storage.auction_files,     size: s?.storage.auction_size_mb },
+                { label: '董秘问答', files: s?.storage.irm_qa_files,      size: s?.storage.irm_qa_size_mb },
                 { label: '财务数据', files: s?.storage.financials_files,   size: s?.storage.financials_size_mb },
               ].map((item) => (
                 <div key={item.label} className="flex items-center justify-between text-[11px]">

@@ -393,6 +393,10 @@ class MinuteSyncPrefs(BaseModel):
     minute_sync_segment_days: int | None = None
 
 
+class TushareSupplementalSyncPrefs(BaseModel):
+    tushare_supplemental_sync_enabled: bool
+
+
 class DataProvidersIn(BaseModel):
     daily_data_provider: str | None = None
     adj_factor_provider: str | None = None
@@ -478,6 +482,7 @@ def get_preferences() -> dict:
         "minute_sync_enabled": preferences.get_minute_sync_enabled(),
         "minute_sync_days": preferences.get_minute_sync_days(),
         "minute_sync_segment_days": preferences.get_minute_sync_segment_days(),
+        "tushare_supplemental_sync_enabled": preferences.get_tushare_supplemental_sync_enabled(),
         "daily_data_provider": preferences.get_daily_data_provider(),
         "adj_factor_provider": preferences.get_adj_factor_provider(),
         "minute_data_provider": preferences.get_minute_data_provider(),
@@ -839,6 +844,15 @@ def update_minute_sync(req: MinuteSyncPrefs) -> dict:
         "minute_sync_days": days,
         "minute_sync_segment_days": preferences.get_minute_sync_segment_days(),
     }
+
+
+@router.put("/preferences/tushare-supplemental-sync")
+def update_tushare_supplemental_sync(req: TushareSupplementalSyncPrefs) -> dict:
+    """保存 Tushare 集合竞价与董秘问答的盘后自动同步开关。"""
+    from app.services import preferences
+    enabled = bool(req.tushare_supplemental_sync_enabled)
+    preferences.save({"tushare_supplemental_sync_enabled": enabled})
+    return {"tushare_supplemental_sync_enabled": enabled}
 
 
 class RealtimeQuotesPrefs(BaseModel):

@@ -122,6 +122,11 @@ def get_minute_sync_enabled() -> bool:
     return load().get("minute_sync_enabled", False)
 
 
+def get_tushare_supplemental_sync_enabled() -> bool:
+    """盘后自动同步集合竞价与董秘问答。默认关闭,需显式启用。"""
+    return load().get("tushare_supplemental_sync_enabled", False)
+
+
 def get_minute_intraday_refresh() -> bool:
     """自选列表分时图是否跟随实时行情刷新。
 

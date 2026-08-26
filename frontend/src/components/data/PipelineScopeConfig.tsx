@@ -30,6 +30,14 @@ export function PipelineScopeConfig() {
     },
   })
 
+  const updateSupplemental = useMutation({
+    mutationFn: (enabled: boolean) => api.updateTushareSupplementalSync(enabled),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: QK.preferences })
+      qc.invalidateQueries({ queryKey: QK.dataStatus })
+    },
+  })
+
   const getValue = (key: PullKey, def: boolean) => prefs.data?.[key] ?? def
 
   return (
@@ -72,14 +80,44 @@ export function PipelineScopeConfig() {
             </div>
           )
         })}
+        <label
+          className={`flex items-start gap-2.5 rounded-card border px-3 py-2.5 cursor-pointer transition-colors ${
+            (prefs.data?.tushare_supplemental_sync_enabled ?? false)
+              ? 'border-accent/40 bg-accent/[0.05]'
+              : 'border-border bg-base/30 hover:border-border/70'
+          }`}
+        >
+          <button
+            type="button"
+            onClick={() => updateSupplemental.mutate(!(prefs.data?.tushare_supplemental_sync_enabled ?? false))}
+            disabled={updateSupplemental.isPending}
+            className={`mt-0.5 flex h-4 w-4 shrink-0 items-center justify-center rounded border transition-colors ${
+              (prefs.data?.tushare_supplemental_sync_enabled ?? false)
+                ? 'bg-accent border-accent'
+                : 'bg-base border-border'
+            }`}
+            role="checkbox"
+            aria-checked={prefs.data?.tushare_supplemental_sync_enabled ?? false}
+          >
+            {(prefs.data?.tushare_supplemental_sync_enabled ?? false) && (
+              <Check className="h-3 w-3 text-white" strokeWidth={3} />
+            )}
+          </button>
+          <div className="min-w-0 flex-1">
+            <div className="text-xs font-medium text-foreground">Tushare 盘后特色数据</div>
+            <div className="text-[10px] text-muted leading-snug mt-0.5">
+              开盘/收盘集合竞价 + 上证E互动/深证互动易；每日回看 3 天并增量合并
+            </div>
+          </div>
+        </label>
       </div>
-      {updateToggle.isPending && (
+      {(updateToggle.isPending || updateSupplemental.isPending) && (
         <div className="flex items-center gap-1.5 text-[10px] text-muted">
           <Loader2 className="h-3 w-3 animate-spin" />保存中…
         </div>
       )}
       <div className="text-[10px] text-muted leading-relaxed pt-1">
-        数据通道基于免费接口,所有档位均可拉取。
+        A股/指数/ETF 沿用当前行情源；Tushare 特色数据需要已配置 Token 和对应独立权限。
       </div>
     </div>
   )

@@ -543,18 +543,79 @@ def run_now(
     else:
         skipped.append("sync_index")
 
-    # Step 2.5: 分钟 K 同步(可选) — 未启用或无 capability 时静默跳过(不 emit)
+    # Step 2.5: Tushare 盘后特色数据(可选)。使用 3 日回看 + 幂等合并,
+    # 覆盖节假日/晚到发布/失败重试,不重拉全量历史。
     from app.services import preferences
+    supplemental_on = preferences.get_tushare_supplemental_sync_enabled()
+    written_auction = 0
+    written_irm_qa = 0
+    if supplemental_on:
+        from app.services import tushare_supplemental_sync
+
+        try:
+            emit("sync_auction", 90, "同步近 3 日开盘/收盘集合竞价…")
+
+            def _auction_progress(cur: int, tot: int, label: str) -> None:
+                emit(
+                    "sync_auction",
+                    90 + int(cur / tot),
+                    f"集合竞价 {cur}/{tot} · {label}",
+                    stage_pct=int(100 * cur / tot),
+                    skip_log=cur < tot,
+                )
+
+            written_auction = tushare_supplemental_sync.sync_auction(
+                repo.store.data_dir,
+                end_date=today,
+                lookback_days=3,
+                on_progress=_auction_progress,
+            )
+            emit("sync_auction", 91, f"集合竞价完成,本次获取 {written_auction} 行")
+            _invalidate("auction")
+        except Exception as e:  # noqa: BLE001
+            logger.warning("tushare auction sync failed: %s", e)
+            emit("sync_auction", 91, f"集合竞价同步失败:{e}")
+            stage_errors.append(f"tushare auction: {e}")
+
+        try:
+            emit("sync_irm_qa", 91, "同步近 3 日新发布董秘问答…")
+
+            def _irm_qa_progress(cur: int, tot: int, label: str) -> None:
+                emit(
+                    "sync_irm_qa",
+                    91 + int(cur / tot),
+                    f"董秘问答 {cur}/{tot} · {label}",
+                    stage_pct=int(100 * cur / tot),
+                    skip_log=cur < tot,
+                )
+
+            written_irm_qa = tushare_supplemental_sync.sync_irm_qa(
+                repo.store.data_dir,
+                end_date=today,
+                lookback_days=3,
+                on_progress=_irm_qa_progress,
+            )
+            emit("sync_irm_qa", 92, f"董秘问答完成,本次获取 {written_irm_qa} 行")
+            _invalidate("irm_qa")
+        except Exception as e:  # noqa: BLE001
+            logger.warning("tushare irm qa sync failed: %s", e)
+            emit("sync_irm_qa", 92, f"董秘问答同步失败:{e}")
+            stage_errors.append(f"tushare irm qa: {e}")
+    else:
+        skipped.extend(["sync_auction", "sync_irm_qa"])
+        logger.info("tushare supplemental sync skipped: user disabled")
+
+    # Step 2.6: 分钟 K 同步(可选) — 未启用或无 capability 时静默跳过(不 emit)
     minute_on = preferences.get_minute_sync_enabled()
     minute_days = preferences.get_minute_sync_days()
     written_minute = 0
     if minute_on and capset.has(Cap.KLINE_MINUTE_BATCH):
         minute_start = today - _td(days=minute_days)
-        emit("sync_minute", 90, f"获取分钟K [{minute_start} ~ {today}]…")
+        emit("sync_minute", 92, f"获取分钟K [{minute_start} ~ {today}]…")
         logger.info("sync_minute: [%s ~ %s] start", minute_start, today)
         minute_symbols = _resolve_minute_symbols(capset, repo)
         def _minute_chunk_progress(cur: int, tot: int, seg_label: str = "") -> None:
-            emit("sync_minute", 90 + int(3 * cur / tot),
+            emit("sync_minute", 92 + int(3 * cur / tot),
                  f"分钟K 批次 {cur}/{tot}" + (f" [{seg_label}]" if seg_label else ""),
                  stage_pct=int(100 * cur / tot), skip_log=True)
         written_minute = kline_sync.sync_and_persist_minute(
@@ -563,7 +624,7 @@ def run_now(
         )
         minute_dir = repo.store.data_dir / "kline_minute"
         minute_cover_days = len(list(minute_dir.glob("date=*"))) if minute_dir.exists() else 0
-        emit("sync_minute", 93, f"分钟K完成,覆盖 {minute_cover_days} 天")
+        emit("sync_minute", 95, f"分钟K完成,覆盖 {minute_cover_days} 天")
         logger.info("sync_minute: [%s ~ %s] done, %d days", minute_start, today, minute_cover_days)
         _invalidate("minute")
     else:
@@ -573,7 +634,7 @@ def run_now(
         else:
             logger.info("sync_minute skipped: user disabled")
 
-    # Step 2.6: 市场环境(regime) 增量计算 — enriched 已就绪后聚合环境指标。
+    # Step 2.7: 市场环境(regime) 增量计算 — enriched 已就绪后聚合环境指标。
     # 双检测(缺口+stale), 自动补算遗漏/被覆写的日。软失败: 不阻断主管道。
     # 默认关闭: regime 是本地聚合计算(非拉取), 首次/regime 表为空时需全量回填
     # 多日, 内存与耗时较高。用户可在数据页「市场环境」卡片设置里开启自动计算,
@@ -585,7 +646,7 @@ def run_now(
         logger.info("compute_regime skipped: user disabled (pipeline_regime_enabled=False)")
     else:
         try:
-            emit("compute_regime", 90, "计算市场环境…")
+            emit("compute_regime", 96, "计算市场环境…")
             from app.services import regime_builder
             from app.api.regime import invalidate_regime_cache
             new_regime = regime_builder.compute_regime_incremental(repo, repo.store.data_dir)
@@ -593,7 +654,7 @@ def run_now(
             if regime_days:
                 invalidate_regime_cache()
                 logger.info("compute_regime: %d days", regime_days)
-            emit("compute_regime", 92, f"市场环境 {regime_days} 天")
+            emit("compute_regime", 97, f"市场环境 {regime_days} 天")
             # 阶段切换推送监控通知 (软失败, 不影响管道): 末两日阶段不同 = 今日发生切换。
             # 切入退潮/冰点为风险信号, 用 warn 级别; 其余 info。
             if regime_days:
@@ -606,14 +667,14 @@ def run_now(
             stage_errors.append(f"compute_regime: {e}")
             skipped.append("regime")
 
-    # Step 2.7: 市场主线(概念/行业涨停梯队聚合) 增量计算 — regime 同开关。
+    # Step 2.8: 市场主线(概念/行业涨停梯队聚合) 增量计算 — regime 同开关。
     # 只窄扫连板 >=1 的行, 增量通常 1 天, 开销可忽略。软失败: 不阻断主管道。
     mainline_rows = 0
     if not _prefs_regime.get_pipeline_regime_enabled():
         skipped.append("mainline")
     else:
         try:
-            emit("compute_mainline", 93, "计算市场主线…")
+            emit("compute_mainline", 97, "计算市场主线…")
             from app.services import market_mainline
             for _kind in ("concept", "industry"):
                 rows = market_mainline.compute_mainline_incremental(
@@ -622,14 +683,14 @@ def run_now(
                 mainline_rows += rows.height if not rows.is_empty() else 0
             if mainline_rows:
                 logger.info("compute_mainline: %d rows", mainline_rows)
-            emit("compute_mainline", 94, f"市场主线 {mainline_rows} 行")
+            emit("compute_mainline", 98, f"市场主线 {mainline_rows} 行")
         except Exception as e:
             logger.warning("compute_mainline failed (soft): %s", e)
             stage_errors.append(f"compute_mainline: {e}")
             skipped.append("mainline")
 
     # Step 3: 刷新视图
-    emit("refresh_views", 95, "刷新 DuckDB 视图…")
+    emit("refresh_views", 99, "刷新 DuckDB 视图…")
     _refresh_views(repo)
 
     emit("done", 100, "完成")
@@ -646,6 +707,8 @@ def run_now(
         "etf_daily_rows": written_etf_daily,
         "etf_adj_factor_symbols": etf_adj_symbols,
         "minute_rows": written_minute,
+        "auction_rows": written_auction,
+        "irm_qa_rows": written_irm_qa,
         "regime_days": regime_days,
         "mainline_rows": mainline_rows,
         "lagging_symbols": len(lagging_symbols),

@@ -21,7 +21,7 @@ import { storage } from '@/lib/storage'
 
 export type CardKey =
   | 'instruments' | 'daily' | 'adj_factor' | 'enriched'
-  | 'index' | 'etf' | 'minute' | 'financials' | 'regime'
+  | 'index' | 'etf' | 'minute' | 'auction' | 'irm_qa' | 'financials' | 'regime'
 
 interface CardDef {
   key: CardKey
@@ -42,6 +42,8 @@ export const DATA_CARD_DEFS: CardDef[] = [
   { key: 'index',       label: '指数',     desc: '主要市场指数日K',        defaultHiddenIfNoCap: false },
   { key: 'etf',         label: 'ETF',      desc: '场内交易基金日K',         defaultHiddenIfNoCap: false, defaultHidden: true },
   { key: 'minute',      label: '分钟 K',   desc: '分钟级K线(依赖分钟K批量数据)',  defaultHiddenIfNoCap: true },
+  { key: 'auction',     label: '集合竞价', desc: '开盘/收盘集合竞价(Tushare)',   defaultHiddenIfNoCap: false },
+  { key: 'irm_qa',      label: '董秘问答', desc: '上证E互动/深证互动易(Tushare)', defaultHiddenIfNoCap: false },
   { key: 'financials',  label: '财务数据', desc: '财报数据(依赖财务数据)',    defaultHiddenIfNoCap: true },
   { key: 'regime',      label: '市场环境', desc: '每日环境状态(本地计算)', defaultHiddenIfNoCap: false },
 ]
