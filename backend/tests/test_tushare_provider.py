@@ -94,6 +94,12 @@ class _FakeClient:
             raise self.error
         return self.rows
 
+    def financial_records(self, table: str, symbol: str):
+        self.calls.append({"table": table, "symbol": symbol})
+        if self.error:
+            raise self.error
+        return self.rows
+
     def close(self):
         pass
 
@@ -163,10 +169,106 @@ def test_probe_rejects_missing_permission(monkeypatch):
     assert "2002" in reason
 
 
-def test_manifest_declares_only_minute_and_ui_token_field():
+def test_manifest_declares_minute_financial_and_ui_token_field():
     from app.data_providers.custom import loader
 
     manifest = loader.plugin_manifest("tushare")
     assert manifest is not None
-    assert manifest["datasets"] == ["minute"]
+    assert manifest["datasets"] == ["minute", "financial"]
     assert manifest["api_key_env"] == tp.API_KEY_ENV
+
+
+def test_client_posts_standard_financial_contract(monkeypatch):
+    fields = list(tc.FINANCIAL_FIELDS["metrics"])
+    fake = _patch_http(monkeypatch, {
+        "code": 0,
+        "data": {"fields": fields, "items": [["600000.SH", "20260430", "20260331", "1", *([1.0] * (len(fields) - 4))]]},
+    })
+    client = TushareClient("secret-token", min_interval_s=0)
+
+    rows = client.financial_records("metrics", "600000.SH")
+
+    assert rows[0]["ts_code"] == "600000.SH"
+    _, body = fake.calls[0]
+    assert body["api_name"] == "fina_indicator"
+    assert body["params"] == {"ts_code": "600000.SH"}
+    assert body["fields"] == ",".join(tc.FINANCIAL_FIELDS["metrics"])
+
+
+class _FinancialClient(_FakeClient):
+    def __init__(self, table_rows: dict[str, list[dict]]) -> None:
+        super().__init__(rows=[])
+        self.table_rows = table_rows
+
+    def financial_records(self, table: str, symbol: str):
+        self.calls.append({"table": table, "symbol": symbol})
+        return self.table_rows.get(table, [])
+
+
+def test_provider_normalizes_metrics_and_prefers_current_update():
+    provider = TushareProvider()
+    provider._client = _FinancialClient({
+        "metrics": [
+            {"ts_code": "603800.SH", "ann_date": "20260430", "end_date": "20260331", "update_flag": "0", "eps": -9, "ocf_to_or": 0.01},
+            {"ts_code": "603800.SH", "ann_date": "20260430", "end_date": "20260331", "update_flag": "1", "eps": -0.08, "ocf_to_or": 0.0859},
+            {"ts_code": "603800.SH", "ann_date": "20251031", "end_date": "20250930", "update_flag": "1", "eps": 0.30, "ocf_to_or": 0.0761},
+        ],
+    })
+
+    frame = provider.get_financials("metrics", ["603800.SH"], latest_only=False)
+
+    assert frame.height == 2
+    latest = frame.filter(pl.col("period_end") == "2026-03-31").row(0, named=True)
+    assert latest["eps_basic"] == pytest.approx(-0.08)
+    assert latest["operating_cash_to_revenue"] == pytest.approx(8.59)
+    assert frame.schema["roe"] == pl.Float64
+
+
+def test_provider_maps_statements_to_panel_schema():
+    provider = TushareProvider()
+    provider._client = _FinancialClient({
+        "income": [{
+            "ts_code": "603800.SH", "ann_date": "20260429", "f_ann_date": "20260430",
+            "end_date": "20260331", "update_flag": "1", "revenue": 10,
+            "oper_cost": 6, "n_income": 2, "n_income_attr_p": 1.8,
+        }],
+        "balance_sheet": [{
+            "ts_code": "603800.SH", "ann_date": "20260430", "end_date": "20260331",
+            "update_flag": "1", "total_assets": 100, "total_liab": 60,
+            "fix_assets": None, "fix_assets_total": 12,
+        }],
+        "cash_flow": [{
+            "ts_code": "603800.SH", "ann_date": "20260430", "end_date": "20260331",
+            "update_flag": "1", "n_cashflow_act": 8, "n_cashflow_inv_act": -3,
+            "n_cash_flows_fnc_act": -2, "c_pay_acq_const_fiolta": 4,
+            "n_incr_cash_cash_equ": 3,
+        }],
+    })
+
+    income = provider.get_financials("income", ["603800.SH"])
+    balance = provider.get_financials("balance_sheet", ["603800.SH"])
+    cash = provider.get_financials("cash_flow", ["603800.SH"])
+
+    assert income.row(0, named=True)["announce_date"] == "2026-04-30"
+    assert income.row(0, named=True)["net_income_attributable"] == 1.8
+    assert balance.row(0, named=True)["fixed_assets"] == 12
+    assert cash.row(0, named=True)["net_operating_cash_flow"] == 8
+
+
+def test_provider_converts_and_compresses_daily_share_capital():
+    provider = TushareProvider()
+    provider._client = _FinancialClient({
+        "shares": [
+            {"ts_code": "603800.SH", "trade_date": "20260825", "total_share": 20783.2, "float_share": 20783.2},
+            {"ts_code": "603800.SH", "trade_date": "20260824", "total_share": 20783.2, "float_share": 20783.2},
+            {"ts_code": "603800.SH", "trade_date": "20250102", "total_share": 20000, "float_share": 18000},
+            {"ts_code": "603800.SH", "trade_date": "20250101", "total_share": 20000, "float_share": 18000},
+        ],
+    })
+
+    frame = provider.get_financials("shares", ["603800.SH"], latest_only=False)
+
+    assert frame.height == 3
+    latest = frame.filter(pl.col("period_end") == "2026-08-25").row(0, named=True)
+    assert latest["total_shares"] == pytest.approx(207_832_000)
+    assert latest["float_shares"] == pytest.approx(207_832_000)

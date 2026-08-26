@@ -121,10 +121,11 @@ class MyConfig:
 ## 现有插件参考
 
 - **`backend/app/plugins/tushare/`** — Tushare 官方 REST 数据源(runtime: none, 纯 HTTP 零依赖)
-  - 当前仅提供 `minute`，调用 `stk_mins` 获取 A 股历史分钟 K；Token 在设置页插件卡片中配置（先探后存），或通过 `.env` 配置 `TUSHARE_TOKEN`
-  - 仅接管 `stock` 类型分钟数据；ETF、指数和其他数据集会自动回退到用户为相应数据集选择的其他数据源
+  - 提供 `minute` 与 `financial`：`stk_mins` 获取 A 股历史分钟 K；标准 `income` / `balancesheet` / `cashflow` / `fina_indicator` / `daily_basic` 接口提供按股票财务数据
+  - Token 在设置页插件卡片中配置（先探后存），或通过 `.env` 配置 `TUSHARE_TOKEN`；分钟需单独开通 `stk_mins`，标准财务接口需至少 2000 积分，插件不依赖 5000 积分的 `*_vip` 批量接口
+  - 分钟仅接管 `stock` 类型；日 K、除权、实时行情以及 ETF/指数分钟会按各数据集设置回退到其他数据源
   - `client.py` — Tushare HTTP 请求、响应信封校验与限速
-  - `provider.py` — 股票代码、北京时间、成交量（Tushare 股数除以 100 转为手）、成交额和分钟 K 标准字段映射
+  - `provider.py` — 分钟 K 标准字段映射，以及财务报表金额、百分比、日期和股本单位（万股转股）的标准化
 - **`backend/app/plugins/fuyao/`** — 同花顺官方 REST 数据源(runtime: none, 纯 HTTP 零依赖)
   - 当前提供 `realtime`(A 股全市场快照, 分页拉取); Key 在设置页卡片直接配置(先探后存), 或 `.env` 配 `FUYAO_API_KEY`
   - `client.py` — httpx 客户端(X-api-key 认证 + 统一信封解包 + 分页)

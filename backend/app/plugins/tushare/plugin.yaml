@@ -1,9 +1,9 @@
 name: tushare
-display_name: "Tushare（A股历史分钟）"
+display_name: "Tushare（A股分钟与财务）"
 runtime: none
 entry: app.plugins.tushare.provider:TushareProvider
 check: app.plugins.tushare.provider:availability
-datasets: [minute]
+datasets: [minute, financial]
 api_key_env: TUSHARE_TOKEN
-description: "使用已单独开通的 stk_mins 接口提供 A 股历史 1 分钟 K。只接管股票分钟数据；日K、除权、实时行情和财务仍由其他数据源提供。历史分钟不是盘中实时行情。"
-install_hint: "在卡片中配置 Tushare Token；需已开通 A股历史分钟（stk_mins）权限。"
+description: "使用 stk_mins 提供 A 股历史分钟 K，并使用标准 income / balancesheet / cashflow / fina_indicator / daily_basic 接口提供财务分析。日K、除权与实时行情仍由其他数据源提供。"
+install_hint: "在卡片中配置 Tushare Token；分钟需单独开通 stk_mins，财务标准接口需至少 2000 积分。"

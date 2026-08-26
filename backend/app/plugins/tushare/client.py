@@ -1,8 +1,8 @@
 """Minimal HTTP client for the Tushare Pro API.
 
-Only the ``stk_mins`` endpoint is implemented.  Authentication, response-envelope
-parsing and request pacing stay here so the provider only handles normalization.
-The token is never included in logs or raised error messages.
+Authentication, response-envelope parsing and request pacing stay here so the
+provider only handles normalization.  The token is never included in logs or
+raised error messages.
 """
 from __future__ import annotations
 
@@ -23,6 +23,48 @@ MINUTE_FIELDS = (
     "vol",
     "amount",
 )
+
+FINANCIAL_FIELDS: dict[str, tuple[str, ...]] = {
+    "metrics": (
+        "ts_code", "ann_date", "end_date", "update_flag",
+        "eps", "dt_eps", "bps", "ocfps", "roe", "roe_dt", "roa",
+        "grossprofit_margin", "netprofit_margin", "debt_to_assets",
+        "or_yoy", "netprofit_yoy", "ocf_to_or", "inv_turn",
+    ),
+    "income": (
+        "ts_code", "ann_date", "f_ann_date", "end_date", "report_type",
+        "comp_type", "update_flag", "revenue", "oper_cost",
+        "operate_profit", "sell_exp", "admin_exp", "rd_exp", "fin_exp",
+        "non_oper_income", "non_oper_exp", "total_profit", "income_tax",
+        "n_income", "n_income_attr_p", "basic_eps", "diluted_eps",
+    ),
+    "balance_sheet": (
+        "ts_code", "ann_date", "f_ann_date", "end_date", "report_type",
+        "comp_type", "update_flag", "total_assets", "total_cur_assets",
+        "total_nca", "money_cap", "accounts_receiv", "inventories",
+        "fix_assets", "fix_assets_total", "intan_assets", "goodwill",
+        "total_liab", "total_cur_liab", "total_ncl", "st_borr", "lt_borr",
+        "acct_payable", "total_hldr_eqy_inc_min_int",
+        "total_hldr_eqy_exc_min_int", "undistr_porfit", "minority_int",
+    ),
+    "cash_flow": (
+        "ts_code", "ann_date", "f_ann_date", "end_date", "report_type",
+        "comp_type", "update_flag", "n_cashflow_act", "n_cashflow_inv_act",
+        "n_cash_flows_fnc_act", "c_pay_acq_const_fiolta",
+        "n_incr_cash_cash_equ",
+    ),
+    "shares": (
+        "ts_code", "trade_date", "total_share", "float_share",
+    ),
+}
+
+_FINANCIAL_APIS = {
+    "metrics": "fina_indicator",
+    "income": "income",
+    "balance_sheet": "balancesheet",
+    "cash_flow": "cashflow",
+    "shares": "daily_basic",
+}
 
 
 class TushareError(RuntimeError):
@@ -119,3 +161,12 @@ class TushareClient:
         if end_time is not None:
             params["end_date"] = end_time.strftime("%Y-%m-%d %H:%M:%S")
         return self.query("stk_mins", params, MINUTE_FIELDS)
+
+    def financial_records(self, table: str, symbol: str) -> list[dict]:
+        """Fetch one stock's standard (non-VIP) financial dataset."""
+        try:
+            api_name = _FINANCIAL_APIS[table]
+            fields = FINANCIAL_FIELDS[table]
+        except KeyError as exc:
+            raise TushareError(f"Tushare 不支持财务表: {table}") from exc
+        return self.query(api_name, {"ts_code": symbol}, fields)
