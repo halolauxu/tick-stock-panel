@@ -63,6 +63,7 @@ _EXECUTION_COLUMNS = frozenset({
 })
 _LIMIT_BASE_COLUMNS = frozenset({"raw_close", "raw_high", "raw_low"})
 _INSTRUMENT_COLUMNS = frozenset({"name", "total_shares", "float_shares"})
+_MATRIX_LOADER_DERIVED_FIELDS = frozenset({"price_limit_pct"})
 
 
 @dataclass(frozen=True)
@@ -263,10 +264,12 @@ class StrategyDependencyResolver:
             scoring_warmup_bars(scoring),
             scoring_warmup_bars(parameter_scoring),
         )
-        matrix_columns = set(base_columns) | set(instrument_columns) | {
-            "signal_limit_up",
-            "signal_limit_down",
-        }
+        matrix_columns = (
+            set(base_columns)
+            | set(instrument_columns)
+            | (required_features & set(_MATRIX_LOADER_DERIVED_FIELDS))
+            | {"signal_limit_up", "signal_limit_down"}
+        )
         return ResolvedFeaturePlan(
             base_columns=base_columns,
             intermediate_columns=frozenset(),

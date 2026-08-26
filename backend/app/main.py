@@ -350,7 +350,9 @@ async def _application_lifespan(app: FastAPI):
             fsc.stop()
         qs = getattr(app.state, "quote_service", None)
         if qs:
-            qs.stop()
+            # 应用重启/部署只停止当前进程的轮询线程, 不能把用户保存的实时行情
+            # 开关改成关闭; 下次启动由 QuoteService.boot_check() 按原偏好恢复。
+            qs.shutdown()
         dsvc = getattr(app.state, "depth_service", None)
         if dsvc:
             dsvc.stop_polling()

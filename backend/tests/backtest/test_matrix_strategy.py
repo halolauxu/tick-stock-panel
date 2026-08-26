@@ -791,6 +791,7 @@ def test_registered_builtin_matrix_strategies_share_one_cache_profile():
     assert profile.warmup_bars > 0
     assert profile.forward_bars == max(int(strategy.max_hold_days or 0) for strategy in strategies)
     assert {"open", "high", "low", "close", "volume"}.issubset(profile.field_columns)
+    assert "price_limit_pct" in profile.field_columns
 
 
 def test_chunked_matrix_score_matches_previous_full_matrix_formula():

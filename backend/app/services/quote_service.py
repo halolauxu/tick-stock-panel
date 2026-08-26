@@ -239,14 +239,27 @@ class QuoteService:
         logger.info("行情服务已启动, 轮询间隔 %.1fs", self._interval)
 
     def stop(self) -> None:
-        """停止后台行情轮询线程。"""
+        """停止后台行情轮询线程, 并持久化为用户关闭。"""
+        self._stop_runtime()
+        self._save_enabled(False)
+        logger.info("行情服务已停止")
+
+    def shutdown(self) -> None:
+        """应用停机时停止轮询线程, 但保留用户的持久化开关。
+
+        服务重启/重新部署属于进程生命周期事件, 不等同于用户主动关闭实时行情。
+        保留 preferences 后, 下一次启动可由 boot_check() 自动恢复原开启状态。
+        """
+        self._stop_runtime()
+        logger.info("行情服务已随应用停机(保留用户开关)")
+
+    def _stop_runtime(self) -> None:
+        """仅停止当前进程内的行情线程, 不修改持久化偏好。"""
         self._running = False
         self._enabled = False
         if self._thread:
             self._thread.join(timeout=10)
             self._thread = None
-        self._save_enabled(False)
-        logger.info("行情服务已停止")
 
     def enable(self) -> bool:
         """开启自动行情 (不立即启动线程，等下一个交易时段)。
