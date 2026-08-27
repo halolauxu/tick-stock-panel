@@ -431,6 +431,95 @@ class _MinuteRepo:
         return self.rows.filter(pl.col("symbol").is_in(symbols))
 
 
+class _RecordingMinuteRepo:
+    def __init__(self, rows: pl.DataFrame) -> None:
+        self.rows = rows
+        self.calls: list[tuple[tuple[str, ...], tuple[date, ...], str]] = []
+
+    def get_minute_by_dates(self, symbols, dates, asset_type="stock"):
+        self.calls.append((tuple(symbols), tuple(dates), asset_type))
+        return self.rows.filter(
+            pl.col("symbol").is_in(symbols)
+            & pl.col("datetime").dt.date().is_in(dates)
+        )
+
+
+def _minute_rows(symbols: list[str], days: int) -> pl.DataFrame:
+    rows = []
+    for symbol in symbols:
+        for offset in range(days):
+            rows.append({
+                "symbol": symbol,
+                "datetime": datetime(2024, 1, 1 + offset, 9, 30),
+                "open": 10.0,
+                "high": 10.0,
+                "low": 10.0,
+                "close": 10.0,
+                "volume": 100.0,
+                "amount": 1000.0,
+            })
+    return pl.DataFrame(rows)
+
+
+def test_minute_fill_loads_only_actual_trade_pairs_and_releases_each_day():
+    panel = _panel(["A", "B", "C"], days=3)
+    entries = _mask(panel, {("A", 0)})
+    exits = _mask(panel, {
+        ("A", 1), ("B", 1), ("C", 1),
+        ("A", 2), ("B", 2), ("C", 2),
+    })
+    repo = _RecordingMinuteRepo(_minute_rows(["A", "B", "C"], 3))
+
+    result = BacktestEngine(repo=repo).simulate_portfolio(
+        panel,
+        entries,
+        exits,
+        MatcherConfig(
+            matching="close_t",
+            minute_fill=True,
+            fees_pct=0,
+            slippage_bps=0,
+            max_positions=1,
+            initial_capital=100_000,
+        ),
+    )
+
+    assert len(result.trades) == 1
+    assert all(symbols == ("A",) for symbols, _, _ in repo.calls)
+    assert all(len(dates) == 1 for _, dates, _ in repo.calls)
+    assert result.stats["minute_fill"] == {
+        "pairs_loaded": 2,
+        "peak_cached_pairs": 1,
+        "require_complete": False,
+    }
+
+
+def test_minute_fill_missing_actual_trade_pair_fails_closed():
+    panel = _panel(["A"], days=2)
+    entries = _mask(panel, {("A", 0)})
+    repo = _RecordingMinuteRepo(pl.DataFrame())
+
+    try:
+        BacktestEngine(repo=repo).simulate_portfolio(
+            panel,
+            entries,
+            _mask(panel, set()),
+            MatcherConfig(
+                matching="close_t",
+                minute_fill=True,
+                minute_fill_require_complete=True,
+                fees_pct=0,
+                slippage_bps=0,
+                max_positions=1,
+                initial_capital=100_000,
+            ),
+        )
+    except ValueError as exc:
+        assert "分钟K成交数据缺失" in str(exc)
+    else:
+        raise AssertionError("分钟K成交数据缺失时不应静默降级到日K")
+
+
 def _minute_trigger_panel() -> tuple[pl.DataFrame, pl.Series, pl.Series]:
     panel = _panel(
         ["A"],

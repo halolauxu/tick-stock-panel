@@ -206,3 +206,42 @@ def test_job_key_includes_asset_type_and_is_consistent():
     assert k_stock != k_etf
     # 相同参数(含 asset_type)必须产出相同 key —— stream 端与 cancel 端对齐的前提
     assert _make_job_key(*args, asset_type="etf") == k_etf
+
+
+def test_cancel_query_job_key_keeps_minute_and_regime_dimensions():
+    from urllib.parse import urlencode
+
+    from app.api.backtest import _make_job_key, _strategy_job_key_from_query
+
+    regime_filter = '{"states":["strong"],"min_score":60}'
+    pairs = [
+        ("strategy_id", "s1"),
+        ("start", "2026-01-01"),
+        ("end", "2026-08-26"),
+        ("matching", "open_t+1"),
+        ("entry_fill", "open_t+1"),
+        ("exit_fill", "open_t+1"),
+        ("fees_pct", "0.0002"),
+        ("slippage_bps", "5"),
+        ("max_positions", "10"),
+        ("max_exposure_pct", "1"),
+        ("initial_capital", "200000"),
+        ("position_sizing", "equal"),
+        ("mode", "position"),
+        ("holding_days", "5"),
+        ("asset_type", "stock"),
+        ("minute_fill", "true"),
+        ("regime_filter", regime_filter),
+    ]
+    qs = urlencode(pairs)
+    expected = _make_job_key(
+        "s1", None, "2026-01-01", "2026-08-26",
+        "open_t+1", "open_t+1", "open_t+1",
+        0.0002, 5.0, 10, 1.0, 200000.0, "equal",
+        None, None, "position", 5, None, None,
+        asset_type="stock",
+        minute_fill=True,
+        regime_filter=regime_filter,
+    )
+
+    assert _strategy_job_key_from_query(qs) == expected

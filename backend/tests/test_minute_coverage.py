@@ -11,6 +11,7 @@ from app.services import kline_sync
 from app.services.kline_sync import (
     _write_minute_partition,
     find_minute_repair_start,
+    minute_backtest_coverage,
     minute_coverage_summary,
     repair_minute_quality_partitions,
     validate_minute_partitions,
@@ -105,6 +106,34 @@ def test_minute_coverage_requires_every_daily_symbol(tmp_path):
     assert summary["incomplete_days"] == 1
     assert validation["valid"] is False
     assert validation["dates"][0]["required_full_symbols"] == 2
+
+
+def test_minute_backtest_coverage_fails_closed_on_any_expected_day(tmp_path):
+    first = date(2026, 8, 13)
+    second = date(2026, 8, 14)
+    for trade_date in (first, second):
+        _daily_day(tmp_path, trade_date)
+
+    _write_minute_partition(
+        _minute_day(first, 241),
+        tmp_path / "kline_minute",
+    )
+
+    incomplete = minute_backtest_coverage(tmp_path, first, second)
+
+    assert incomplete["valid"] is False
+    assert incomplete["expected_days"] == 2
+    assert incomplete["complete_days"] == 1
+    assert incomplete["invalid_dates"] == [second.isoformat()]
+
+    _write_minute_partition(
+        _minute_day(second, 241),
+        tmp_path / "kline_minute",
+    )
+
+    complete = minute_backtest_coverage(tmp_path, first, second)
+    assert complete["valid"] is True
+    assert complete["invalid_dates"] == []
 
 
 def test_repairs_post_market_rows_and_rebuilds_complete_stats(tmp_path):

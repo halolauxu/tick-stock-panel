@@ -19,7 +19,13 @@ from typing import Literal
 import numpy as np
 import polars as pl
 
-from app.backtest.engine import BacktestEngine, MatcherConfig, SimResult, SimulationOptions
+from app.backtest.engine import (
+    BacktestEngine,
+    MatcherConfig,
+    MinuteFillDataUnavailableError,
+    SimResult,
+    SimulationOptions,
+)
 from app.backtest.fundamentals import FUNDAMENTAL_FACTOR_NAMES
 from app.backtest.matrix import (
     MarketDataMatrix,
@@ -1226,6 +1232,8 @@ class StrategyBacktestService:
             initial_capital=config.initial_capital,
             position_sizing=config.position_sizing,
             minute_fill=config.minute_fill,
+            asset_type=config.asset_type,
+            minute_fill_require_complete=config.minute_fill,
             liquidate_on_end=config.liquidate_on_end,
             enforce_t_plus_one=config.enforce_t_plus_one,
         )
@@ -1529,23 +1537,26 @@ class StrategyBacktestService:
         t_sim = time.perf_counter()
 
         # 撮合 — 两条生产路径共享同一只读 MarketMatrix。
-        if config.mode == "full":
-            result = self.engine.simulate_independent_market_matrix(
-                market_matrix,
-                raw_candidates,
-                matcher_config,
-                progress_cb,
-                cancel_event,
-                result_policy.simulation_options(),
-            )
-        else:
-            result = self.engine.simulate_market_matrix(
-                market_matrix,
-                matcher_config,
-                progress_cb,
-                cancel_event,
-                result_policy.simulation_options(),
-            )
+        try:
+            if config.mode == "full":
+                result = self.engine.simulate_independent_market_matrix(
+                    market_matrix,
+                    raw_candidates,
+                    matcher_config,
+                    progress_cb,
+                    cancel_event,
+                    result_policy.simulation_options(),
+                )
+            else:
+                result = self.engine.simulate_market_matrix(
+                    market_matrix,
+                    matcher_config,
+                    progress_cb,
+                    cancel_event,
+                    result_policy.simulation_options(),
+                )
+        except MinuteFillDataUnavailableError as exc:
+            return _err(str(exc))
         timing_ms["simulate"] = round((time.perf_counter() - t_sim) * 1000, 1)
         timing_ms["statistics"] = float(result.stats.pop("statistics_ms", 0.0))
 

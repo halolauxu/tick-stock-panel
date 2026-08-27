@@ -13,6 +13,8 @@ import type { StrategyBacktestResult } from './api'
  */
 
 export interface BacktestProgress {
+  phase?: 'queued' | 'simulation' | 'minute_simulation'
+  message?: string
   day: number
   total: number
   date: string
@@ -228,20 +230,30 @@ export function startBacktest(params: {
 export async function stopBacktest(): Promise<void> {
   // 从 reconnect key 提取 job_key (后端按参数 hash 算 job_key)
   const qs = localStorage.getItem(RECONNECT_KEY)
+  let cancelError: string | null = null
   if (qs) {
-    // 解析出参数, 用 fetch 调 cancel
     try {
-      // job_key 是后端算的 md5, 前端不知道。用 reconnect URL 里的参数重新请求 stream,
-      // 后端会找到同一个 job 并返回它的 job_key? 不行。
-      // 替代: 前端直接关闭 SSE 连接 + 调一个带参数的 cancel 接口。
-      // 简化: 关闭连接即可, 后端检测断开后 (不取消)。需要 cancel 用 POST。
-      // 这里用 cancel 接口: POST /strategy/cancel, body 带 qs 的参数。
-      await fetch('/api/backtest/strategy/cancel', {
+      const response = await fetch('/api/backtest/strategy/cancel', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ qs }),
-      }).catch(() => {})
-    } catch { /* ignore */ }
+      })
+      const payload = await response.json().catch(() => null)
+      if (!response.ok || !payload?.ok) {
+        cancelError = payload?.message ?? '后台任务未能停止，请重试'
+      }
+    } catch {
+      cancelError = '停止请求失败，后台任务可能仍在运行'
+    }
+  } else {
+    cancelError = '未找到当前回测任务，无法确认后台已停止'
+  }
+  if (cancelError) {
+    if (current?.isPending) {
+      current = { ...current, error: cancelError, reconnecting: false }
+      emit()
+    }
+    return
   }
   if (eventSource) {
     eventSource.close()

@@ -75,8 +75,10 @@ class MatcherConfig:
     initial_capital: float = 1_000_000.0
     position_sizing: Literal["equal", "score_weight"] = "equal"
     # 分钟K精确成交: 开启后, 信号触发日的成交价用当日分钟K优化
-    # (有参考线→穿越价, 无参考线→VWAP)。数据缺失时降级为日K口径。
+    # (有参考线→穿越价, 无参考线→VWAP)。生产回测要求数据完整并 fail-closed。
     minute_fill: bool = False
+    asset_type: Literal["stock", "etf"] = "stock"
+    minute_fill_require_complete: bool = False
     # 回测默认在区间末日强制清仓; 模拟交易必须保留真实未平仓状态。
     liquidate_on_end: bool = True
     # 兼容既有回测默认值; 模拟交易等真实账户口径需显式开启 T+1。
@@ -106,6 +108,91 @@ class MatcherConfig:
             stamp_tax_pct=self.stamp_tax_pct or 0.0,
             slippage_bps=self.slippage_bps,
         ).sell_cost_pct()
+
+
+class MinuteFillDataUnavailableError(ValueError):
+    """Raised when a requested minute fill cannot be proved complete."""
+
+
+class _MinuteFillSession:
+    """Bounded on-demand minute cache for actual fill pairs only."""
+
+    def __init__(
+        self,
+        engine: BacktestEngine,
+        config: MatcherConfig,
+    ) -> None:
+        self.engine = engine
+        self.config = config
+        self._date: str | None = None
+        self._cache: dict[tuple[str, str], np.ndarray] = {}
+        self.pairs_loaded = 0
+        self.peak_cached_pairs = 0
+
+    def start_day(self, date_text: str) -> None:
+        if self._date == date_text:
+            return
+        self._cache.clear()
+        self._date = date_text
+
+    def get(self, symbol: str, date_text: str) -> np.ndarray | None:
+        if not self.config.minute_fill:
+            return None
+        self.start_day(date_text)
+        key = (symbol, date_text)
+        cached = self._cache.get(key)
+        if cached is not None:
+            return cached
+
+        loaded = self.engine._load_minute_for_fills(
+            self.engine.repo,
+            [symbol],
+            {date_text},
+            self.config.asset_type,
+            require_complete=self.config.minute_fill_require_complete,
+        )
+        rows = loaded.get(key)
+        if rows is None or len(rows) == 0:
+            if self.config.minute_fill_require_complete:
+                raise MinuteFillDataUnavailableError(
+                    f"分钟K成交数据缺失: {symbol} {date_text}"
+                )
+            return None
+        if self.config.minute_fill_require_complete:
+            self._validate_complete(rows, symbol, date_text)
+
+        self._cache[key] = rows
+        self.pairs_loaded += 1
+        self.peak_cached_pairs = max(self.peak_cached_pairs, len(self._cache))
+        return rows
+
+    @staticmethod
+    def _validate_complete(rows: np.ndarray, symbol: str, date_text: str) -> None:
+        from app.services.minute_quality import REGULAR_MINUTE_BARS
+
+        if rows.ndim != 2 or rows.shape[0] != REGULAR_MINUTE_BARS or rows.shape[1] < 4:
+            raise MinuteFillDataUnavailableError(
+                f"分钟K成交数据不完整: {symbol} {date_text}; "
+                f"需要 {REGULAR_MINUTE_BARS} 根, 实际 {len(rows)} 根"
+            )
+        ohlc = rows[:, :4]
+        valid = (
+            np.isfinite(ohlc).all()
+            and (ohlc > 0).all()
+            and (ohlc[:, 1] >= np.max(ohlc[:, [0, 2, 3]], axis=1)).all()
+            and (ohlc[:, 2] <= np.min(ohlc[:, [0, 1, 3]], axis=1)).all()
+        )
+        if not bool(valid):
+            raise MinuteFillDataUnavailableError(
+                f"分钟K成交数据价格异常: {symbol} {date_text}"
+            )
+
+    def stats(self) -> dict[str, int | bool]:
+        return {
+            "pairs_loaded": self.pairs_loaded,
+            "peak_cached_pairs": self.peak_cached_pairs,
+            "require_complete": self.config.minute_fill_require_complete,
+        }
 
 
 @dataclass
@@ -857,14 +944,7 @@ class BacktestEngine:
             "pending_exit": 0,
         }
 
-        minute_cache: dict = {}
-        if config.minute_fill:
-            trigger_times, trigger_assets = np.nonzero(matrix.entry | matrix.exit)
-            dates = {matrix.timestamp_labels[int(t)][:10] for t in trigger_times}
-            symbols = {matrix.symbols[int(a)] for a in trigger_assets}
-            if dates and symbols:
-                loaded = self._load_minute_for_fills(self.repo, list(symbols), dates, "stock")
-                minute_cache = {key: value for key, value in loaded.items() if value is not None and len(value) > 0}
+        minute_session = _MinuteFillSession(self, config)
 
         def _count(key: str) -> None:
             execution_stats[key] = execution_stats.get(key, 0) + 1
@@ -885,9 +965,11 @@ class BacktestEngine:
             return matrix.timestamp_labels[signal_time][:10] if signal_time >= 0 else fallback
 
         def _refill(time_id: int, asset_id: int, side: str, daily_price: float) -> float:
-            if not config.minute_fill or not minute_cache:
+            if not config.minute_fill:
                 return daily_price
-            rows = minute_cache.get((matrix.symbols[asset_id], matrix.timestamp_labels[time_id][:10]))
+            rows = minute_session.get(
+                matrix.symbols[asset_id], matrix.timestamp_labels[time_id][:10]
+            )
             if rows is None:
                 return daily_price
             reference = float(matrix.reference_price[time_id, asset_id])
@@ -897,9 +979,11 @@ class BacktestEngine:
             return precise if precise is not None else daily_price
 
         def _minute_trigger_price(time_id: int, asset_id: int) -> float | None:
-            if not config.minute_fill or not minute_cache:
+            if not config.minute_fill:
                 return None
-            rows = minute_cache.get((matrix.symbols[asset_id], matrix.timestamp_labels[time_id][:10]))
+            rows = minute_session.get(
+                matrix.symbols[asset_id], matrix.timestamp_labels[time_id][:10]
+            )
             if rows is None:
                 return None
             reference = float(matrix.reference_price[time_id, asset_id])
@@ -1052,9 +1136,17 @@ class BacktestEngine:
             asset_id = int(entry_assets[order_pos])
             if cancel_event is not None and cancel_event.is_set():
                 break
-            if progress_cb is not None and (seq == 1 or seq % 500 == 0):
+            minute_session.start_day(matrix.timestamp_labels[time_id][:10])
+            if progress_cb is not None and (
+                config.minute_fill or seq == 1 or seq % 500 == 0
+            ):
                 try:
                     progress_cb({
+                        "phase": "minute_simulation" if config.minute_fill else "simulation",
+                        "message": (
+                            "正在按实际成交加载分钟K并撮合"
+                            if config.minute_fill else "正在执行回测撮合"
+                        ),
                         "day": seq,
                         "total": len(order),
                         "date": matrix.timestamp_labels[time_id][:10],
@@ -1141,6 +1233,8 @@ class BacktestEngine:
         )
         result.stats["market_matrix_shape"] = list(matrix.shape)
         result.stats["market_matrix_bytes"] = matrix.nbytes
+        if config.minute_fill:
+            result.stats["minute_fill"] = minute_session.stats()
         return result
 
     def simulate_independent_market_matrix(
@@ -1640,6 +1734,8 @@ class BacktestEngine:
         symbols: list[str],
         dates_needed: set,
         asset_type: str,
+        *,
+        require_complete: bool = False,
     ) -> dict:
         """按触发日加载分钟K, 返回 {(symbol, date_str): float64 2D ndarray}。
 
@@ -1680,6 +1776,40 @@ class BacktestEngine:
                     continue
                 sym = sub["symbol"][0]
                 d_str = sub["_d_str"][0]
+                if require_complete:
+                    from app.services.minute_quality import (
+                        REGULAR_MINUTE_BARS,
+                        minute_quality_payload,
+                    )
+
+                    try:
+                        quality = minute_quality_payload(sub)
+                    except (TypeError, ValueError) as exc:
+                        raise MinuteFillDataUnavailableError(
+                            f"分钟K成交数据无法校验: {sym} {d_str}: {exc}"
+                        ) from exc
+                    issue_keys = (
+                        "null_datetime",
+                        "null_ohlc",
+                        "invalid_ohlc",
+                        "duplicate_symbol_datetime",
+                        "out_of_regular_session",
+                        "extra_symbols",
+                    )
+                    issues = {
+                        key: int(quality[key])
+                        for key in issue_keys
+                        if int(quality[key])
+                    }
+                    if (
+                        int(quality["min_bars"]) != REGULAR_MINUTE_BARS
+                        or int(quality["max_bars"]) != REGULAR_MINUTE_BARS
+                    ):
+                        issues["bars"] = int(quality["max_bars"])
+                    if issues:
+                        raise MinuteFillDataUnavailableError(
+                            f"分钟K成交数据不完整: {sym} {d_str}: {issues}"
+                        )
                 cols = [c for c in numeric_cols if c in sub.columns]
                 cache[(sym, d_str)] = sub.select(
                     [pl.col(c).cast(pl.Float64) for c in cols]
@@ -1774,20 +1904,7 @@ class BacktestEngine:
             "pending_exit": 0,
         }
 
-        minute_cache: dict = {}
-        if config.minute_fill:
-            trigger_times, trigger_assets = np.nonzero(matrix.entry | matrix.exit)
-            trigger_dates = {matrix.timestamp_labels[int(t)][:10] for t in trigger_times}
-            trigger_symbols = {matrix.symbols[int(a)] for a in trigger_assets}
-            if trigger_dates and trigger_symbols:
-                asset_type = "etf" if all(
-                    symbol.endswith(".SH") and symbol.startswith("5")
-                    for symbol in list(trigger_symbols)[:5]
-                ) else "stock"
-                loaded = self._load_minute_for_fills(
-                    self.repo, list(trigger_symbols), trigger_dates, asset_type,
-                )
-                minute_cache = {key: value for key, value in loaded.items() if value is not None and len(value) > 0}
+        minute_session = _MinuteFillSession(self, config)
 
         def _count(key: str) -> None:
             execution_stats[key] = execution_stats.get(key, 0) + 1
@@ -1811,10 +1928,11 @@ class BacktestEngine:
             return total
 
         def _refill_price(time_id: int, asset_id: int, side: str, daily_price: float) -> float:
-            if not config.minute_fill or not minute_cache:
+            if not config.minute_fill:
                 return daily_price
-            key = (matrix.symbols[asset_id], matrix.timestamp_labels[time_id][:10])
-            minute_rows = minute_cache.get(key)
+            minute_rows = minute_session.get(
+                matrix.symbols[asset_id], matrix.timestamp_labels[time_id][:10]
+            )
             if minute_rows is None:
                 return daily_price
             reference = float(matrix.reference_price[time_id, asset_id])
@@ -1826,10 +1944,11 @@ class BacktestEngine:
             return precise if precise is not None else daily_price
 
         def _minute_trigger_price(time_id: int, asset_id: int) -> float | None:
-            if not config.minute_fill or not minute_cache:
+            if not config.minute_fill:
                 return None
-            key = (matrix.symbols[asset_id], matrix.timestamp_labels[time_id][:10])
-            minute_rows = minute_cache.get(key)
+            minute_rows = minute_session.get(
+                matrix.symbols[asset_id], matrix.timestamp_labels[time_id][:10]
+            )
             if minute_rows is None:
                 return None
             reference = float(matrix.reference_price[time_id, asset_id])
@@ -1978,13 +2097,19 @@ class BacktestEngine:
 
         for time_id, date_label in enumerate(matrix.timestamp_labels):
             date_text = date_label[:10]
-            if time_id % 20 == 0:
-                if cancel_event is not None and cancel_event.is_set():
-                    logger.info("回测被用户取消 (第 %d/%d 天)", time_id, time_count)
-                    break
+            minute_session.start_day(date_text)
+            if cancel_event is not None and cancel_event.is_set():
+                logger.info("回测被用户取消 (第 %d/%d 天)", time_id, time_count)
+                break
+            if config.minute_fill or time_id % 20 == 0:
                 if progress_cb is not None:
                     try:
                         progress_cb({
+                            "phase": "minute_simulation" if config.minute_fill else "simulation",
+                            "message": (
+                                "正在按实际成交加载分钟K并撮合"
+                                if config.minute_fill else "正在执行回测撮合"
+                            ),
                             "day": time_id + 1,
                             "total": time_count,
                             "date": date_text,
@@ -2221,6 +2346,8 @@ class BacktestEngine:
         stats["pending_exit_positions"] = sum(1 for pos in positions.values() if pos.get("pending_exit_reason"))
         stats["market_matrix_shape"] = [time_count, asset_count]
         stats["market_matrix_bytes"] = matrix.nbytes
+        if config.minute_fill:
+            stats["minute_fill"] = minute_session.stats()
         open_positions: list[dict] = []
         for asset_id, pos in positions.items():
             mark = float(last_close[asset_id])

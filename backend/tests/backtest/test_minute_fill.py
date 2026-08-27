@@ -13,12 +13,13 @@
 """
 from __future__ import annotations
 
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 
 import numpy as np
 import polars as pl
+import pytest
 
-from app.backtest.engine import BacktestEngine
+from app.backtest.engine import BacktestEngine, MinuteFillDataUnavailableError
 from app.backtest.minute_trigger import build_minute_exit_reference
 
 NUMERIC_COLS = BacktestEngine._MINUTE_NUMERIC_COLS  # open/high/low/close/volume/amount
@@ -162,3 +163,36 @@ def test_load_minute_for_fills_handles_missing_dates():
         repo, ["000001.SZ"], {"2024-01-02", "2024-01-03"}, "stock",
     )
     assert result == {}
+
+
+def test_load_minute_for_fills_fails_closed_on_duplicate_timestamp():
+    trade_date = date(2024, 1, 2)
+    timestamps = [
+        datetime.combine(trade_date, datetime.min.time()).replace(hour=9, minute=30)
+        + timedelta(minutes=offset)
+        for offset in range(121)
+    ] + [
+        datetime.combine(trade_date, datetime.min.time()).replace(hour=13, minute=1)
+        + timedelta(minutes=offset)
+        for offset in range(120)
+    ]
+    timestamps[-1] = timestamps[-2]
+    rows = pl.DataFrame({
+        "symbol": ["000001.SZ"] * 241,
+        "datetime": timestamps,
+        "open": [10.0] * 241,
+        "high": [10.0] * 241,
+        "low": [10.0] * 241,
+        "close": [10.0] * 241,
+        "volume": [100.0] * 241,
+        "amount": [1000.0] * 241,
+    })
+
+    with pytest.raises(MinuteFillDataUnavailableError, match="duplicate_symbol_datetime"):
+        BacktestEngine._load_minute_for_fills(
+            _FakeRepo(rows),
+            ["000001.SZ"],
+            {trade_date.isoformat()},
+            "stock",
+            require_complete=True,
+        )

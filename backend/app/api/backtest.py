@@ -62,6 +62,44 @@ def _guard_server_backtest_range(start: date, end: date):
         raise HTTPException(status_code=400, detail=BACKTEST_SERVER_GUARD_MESSAGE)
 
 
+def _minute_backtest_preflight_error(
+    request: Request,
+    start: date,
+    end: date,
+    asset_type: str,
+    symbols: str | list[str] | None,
+) -> str | None:
+    from app.tickflow.capabilities import Cap
+
+    capset = request.app.state.capabilities
+    if not capset.has(Cap.KLINE_MINUTE_BATCH):
+        return "分钟K精确回测需要分钟K批量数据能力"
+
+    # 全市场回测必须先证明整个目标窗口完整。指定股票仍在实际成交对加载时
+    # 逐对校验, 避免用无关股票的数据缺口阻断小范围研究。
+    if symbols:
+        return None
+    from app.services.kline_sync import minute_backtest_coverage
+
+    coverage = minute_backtest_coverage(
+        request.app.state.repo.store.data_dir,
+        start,
+        end,
+        asset_type,
+    )
+    if coverage["valid"]:
+        return None
+    invalid_dates = list(coverage["invalid_dates"])
+    examples = "、".join(invalid_dates[:3])
+    suffix = f" (如 {examples})" if examples else ""
+    return (
+        "分钟K完整性校验未通过: "
+        f"目标 {coverage['expected_days']} 个交易日, 完整 {coverage['complete_days']} 日, "
+        f"缺失或不完整 {len(invalid_dates)} 日{suffix}. "
+        "请先补齐并通过分钟K质量校验后重试。"
+    )
+
+
 # ================================================================
 # 状态
 # ================================================================
@@ -355,6 +393,16 @@ def strategy_run(req: StrategyBacktestRequest, request: Request):
     end = req.end or date.today()
     start = _resolve_start(req, end, FACTOR_DEFAULT_DAYS)
     _guard_server_backtest_range(start, end)
+    if req.minute_fill:
+        preflight_error = _minute_backtest_preflight_error(
+            request,
+            start,
+            end,
+            req.asset_type,
+            req.symbols,
+        )
+        if preflight_error:
+            raise HTTPException(status_code=400, detail=preflight_error)
 
     cfg = StrategyBacktestConfig(
         strategy_id=req.strategy_id,
@@ -458,6 +506,44 @@ def _make_job_key(
     return hashlib.md5(raw.encode()).hexdigest()[:12]
 
 
+def _strategy_job_key_from_query(qs: str) -> str:
+    from urllib.parse import parse_qs
+
+    parsed = parse_qs(qs)
+
+    def _get(key: str, default: str = "") -> str:
+        return parsed.get(key, [default])[0]
+
+    def _get_opt_float(key: str) -> float | None:
+        value = _get(key)
+        return float(value) if value else None
+
+    return _make_job_key(
+        _get("strategy_id"),
+        _get("symbols") or None,
+        _get("start") or None,
+        _get("end") or None,
+        _get("matching", "open_t+1"),
+        _get("entry_fill") or None,
+        _get("exit_fill") or None,
+        float(_get("fees_pct", "0.0002")),
+        float(_get("slippage_bps", "5")),
+        int(_get("max_positions", "10")),
+        float(_get("max_exposure_pct", "1")),
+        float(_get("initial_capital", "1000000")),
+        _get("position_sizing", "equal"),
+        _get("params") or None,
+        _get("overrides") or None,
+        _get("mode", "position"),
+        int(_get("holding_days", "5")),
+        commission_pct=_get_opt_float("commission_pct"),
+        stamp_tax_pct=_get_opt_float("stamp_tax_pct"),
+        asset_type=_get("asset_type", "stock"),
+        minute_fill=_get("minute_fill", "false").lower() == "true",
+        regime_filter=_get("regime_filter") or None,
+    )
+
+
 @router.get("/strategy/stream")
 async def strategy_stream(
     request: Request,
@@ -513,6 +599,22 @@ async def strategy_stream(
         if days > BACKTEST_MAX_SERVER_DAYS:
             guard_violated = True
 
+    preflight_error = BACKTEST_SERVER_GUARD_MESSAGE if guard_violated else None
+    if minute_fill and preflight_error is None:
+        preflight_error = _minute_backtest_preflight_error(
+            request,
+            start_date,
+            end_date,
+            asset_type,
+            symbols,
+        )
+    if preflight_error:
+
+        async def error_generator():
+            yield f"event: error\ndata: {json.dumps({'message': preflight_error}, ensure_ascii=False)}\n\n"
+
+        return StreamingResponse(error_generator(), media_type="text/event-stream")
+
     job_key = _make_job_key(
         strategy_id, symbols, start, end,
         matching, entry_fill, exit_fill,
@@ -532,33 +634,20 @@ async def strategy_stream(
         job = _running_jobs.get(job_key)
         if job is None:
             job = _BacktestJob(job_key)
+            job.progress.append({
+                "phase": "queued",
+                "message": "正在准备回测数据与策略信号",
+                "day": 0,
+                "total": 0,
+                "date": start_date.isoformat(),
+                "equity": 0,
+            })
             _running_jobs[job_key] = job
             is_new = True
         else:
             is_new = False
 
     async def event_generator():
-        # 范围保护: 直接报错
-        if guard_violated:
-            yield f"event: error\ndata: {json.dumps({'message': BACKTEST_SERVER_GUARD_MESSAGE}, ensure_ascii=False)}\n\n"
-            return
-
-        # 分钟K精确回测: Pro+ 门控 + 数据范围检查
-        if minute_fill:
-            capset = request.app.state.capabilities
-            from app.tickflow.capabilities import Cap
-            if not capset.has(Cap.KLINE_MINUTE_BATCH):
-                yield f"event: error\ndata: {json.dumps({'message': '分钟K精确回测需要 Pro+ 权限 (kline.minute.batch)'}, ensure_ascii=False)}\n\n"
-                return
-            # 检查本地分钟K历史是否覆盖回测区间
-            repo = request.app.state.repo
-            earliest_minute = repo.earliest_minute_date() if hasattr(repo, "earliest_minute_date") else None
-            if earliest_minute is not None and start_date < earliest_minute:
-                msg = (f"本地分钟K历史最早到 {earliest_minute}, 无法覆盖回测起始日 {start_date}。"
-                       f"请先用「扩展分钟K历史」功能拉取更多数据, 或缩小回测区间。")
-                yield f"event: error\ndata: {json.dumps({'message': msg}, ensure_ascii=False)}\n\n"
-                return
-
         # 如果是新任务, 启动回测线程
         if is_new and not job.done:
             cfg = StrategyBacktestConfig(
@@ -659,37 +748,7 @@ async def strategy_cancel(request: Request):
     """取消正在运行的回测任务 (前端传 query string, 后端算 job_key)。"""
     body = await request.json()
     qs = body.get("qs", "")
-    # 解析 qs 得到参数
-    from urllib.parse import parse_qs
-    p = parse_qs(qs)
-    def _get(key: str, default: str = "") -> str:
-        return p.get(key, [default])[0]
-    def _get_opt_float(key: str) -> float | None:
-        # 可选成本参数: 缺省或空串 → None (与 stream 侧 float | None 口径一致, 保证 job_key 对齐)。
-        v = _get(key)
-        return float(v) if v else None
-    job_key = _make_job_key(
-        _get("strategy_id"),
-        _get("symbols") or None,
-        _get("start") or None,
-        _get("end") or None,
-        _get("matching", "open_t+1"),
-        _get("entry_fill") or None,
-        _get("exit_fill") or None,
-        float(_get("fees_pct", "0.0002")),
-        float(_get("slippage_bps", "5")),
-        int(_get("max_positions", "10")),
-        float(_get("max_exposure_pct", "1")),
-        float(_get("initial_capital", "1000000")),
-        _get("position_sizing", "equal"),
-        _get("params") or None,
-        _get("overrides") or None,
-        _get("mode", "position"),
-        int(_get("holding_days", "5")),
-        commission_pct=_get_opt_float("commission_pct"),
-        stamp_tax_pct=_get_opt_float("stamp_tax_pct"),
-        asset_type=_get("asset_type", "stock"),
-    )
+    job_key = _strategy_job_key_from_query(qs)
     # 持锁读任务表: 与 _cleanup_stale_jobs 的 pop、stream 的写入互斥
     with _jobs_lock:
         job = _running_jobs.get(job_key)

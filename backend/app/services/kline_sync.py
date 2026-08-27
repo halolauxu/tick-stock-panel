@@ -775,8 +775,13 @@ def rebuild_minute_coverage_metadata(data_dir: Path) -> int:
     return rebuilt
 
 
-def _daily_expected_symbols(data_dir: Path, trade_date: str) -> int:
-    day_dir = data_dir / "kline_daily" / f"date={trade_date}"
+def _daily_expected_symbols(
+    data_dir: Path,
+    trade_date: str,
+    asset_type: str = "stock",
+) -> int:
+    daily_dataset = "kline_etf_daily" if asset_type == "etf" else "kline_daily"
+    day_dir = data_dir / daily_dataset / f"date={trade_date}"
     files = sorted(day_dir.glob("*.parquet")) if day_dir.exists() else []
     if not files:
         return 0
@@ -793,9 +798,13 @@ def _daily_expected_symbols(data_dir: Path, trade_date: str) -> int:
         return 0
 
 
-def minute_coverage_summary(data_dir: Path) -> dict[str, object] | None:
+def minute_coverage_summary(
+    data_dir: Path,
+    asset_type: str = "stock",
+) -> dict[str, object] | None:
     """Read per-day sidecars and classify full-market minute coverage."""
-    minute_dir = data_dir / "kline_minute"
+    minute_dataset = "kline_etf_minute" if asset_type == "etf" else "kline_minute"
+    minute_dir = data_dir / minute_dataset
     if not minute_dir.exists():
         return None
     records: list[dict[str, object]] = []
@@ -813,14 +822,28 @@ def minute_coverage_summary(data_dir: Path) -> dict[str, object] | None:
                 "metadata_missing": True,
             }
         trade_date = day_dir.name[5:]
-        expected = _daily_expected_symbols(data_dir, trade_date)
+        expected = _daily_expected_symbols(data_dir, trade_date, asset_type)
         symbols = int(stats.get("symbols") or 0)
         full_symbols = int(stats.get("full_symbols") or 0)
+        min_bars = int(stats.get("min_bars") or 0)
         max_bars = int(stats.get("max_bars") or 0)
         baseline = expected or symbols
         required = baseline
+        structural_ok = all(
+            int(stats.get(key) or 0) == 0
+            for key in (
+                "null_datetime",
+                "null_ohlc",
+                "invalid_ohlc",
+                "duplicate_symbol_datetime",
+                "out_of_regular_session",
+                "extra_symbols",
+            )
+        ) and not stats.get("metadata_missing")
         complete = bool(
-            max_bars == REGULAR_MINUTE_BARS
+            structural_ok
+            and min_bars == REGULAR_MINUTE_BARS
+            and max_bars == REGULAR_MINUTE_BARS
             and required
             and full_symbols >= required
         )
@@ -850,6 +873,51 @@ def minute_coverage_summary(data_dir: Path) -> dict[str, object] | None:
         ),
         "metadata_complete": all(not record.get("metadata_missing") for record in records),
         "dates": records,
+    }
+
+
+def minute_backtest_coverage(
+    data_dir: Path,
+    start_date: date,
+    end_date: date,
+    asset_type: str = "stock",
+) -> dict[str, object]:
+    """Return lightweight fail-closed minute coverage for a backtest range.
+
+    Expected trading days come from daily partitions.  A day is usable only
+    when its minute sidecar proves complete full-market coverage; missing or
+    stale sidecars remain incomplete instead of triggering an expensive scan
+    in the request path.
+    """
+    data_dir = Path(data_dir)
+    daily_dataset = "kline_etf_daily" if asset_type == "etf" else "kline_daily"
+    daily_dir = data_dir / daily_dataset
+    expected_dates: list[str] = []
+    if daily_dir.exists():
+        for day_dir in sorted(daily_dir.glob("date=*")):
+            trade_date = day_dir.name[5:]
+            try:
+                parsed = date.fromisoformat(trade_date)
+            except ValueError:
+                continue
+            if start_date <= parsed <= end_date:
+                expected_dates.append(trade_date)
+
+    summary = minute_coverage_summary(data_dir, asset_type)
+    complete_dates = {
+        str(record["date"])
+        for record in (summary or {}).get("dates", [])
+        if record.get("complete") and record.get("date")
+    }
+    invalid_dates = [trade_date for trade_date in expected_dates if trade_date not in complete_dates]
+    return {
+        "valid": bool(expected_dates) and not invalid_dates,
+        "asset_type": asset_type,
+        "start_date": start_date.isoformat(),
+        "end_date": end_date.isoformat(),
+        "expected_days": len(expected_dates),
+        "complete_days": len(expected_dates) - len(invalid_dates),
+        "invalid_dates": invalid_dates,
     }
 
 

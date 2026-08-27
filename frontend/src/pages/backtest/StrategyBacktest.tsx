@@ -984,6 +984,10 @@ export function StrategyBacktest() {
 
   const backtestTask = useBacktestTask()
   const isPending = backtestTask?.isPending ?? false
+  const backtestProgressTotal = backtestTask?.progress?.total ?? 0
+  const backtestProgressPct = backtestProgressTotal > 0
+    ? ((backtestTask?.progress?.day ?? 0) / backtestProgressTotal) * 100
+    : null
   const saveCandidate = useMutation({
     mutationFn: () => {
       if (!result) throw new Error('暂无策略结果')
@@ -1880,7 +1884,11 @@ export function StrategyBacktest() {
                   {backtestTask?.reconnecting
                     ? '连接中断，重试中…'
                     : backtestTask?.progress
-                      ? `回测中 · 第 ${backtestTask.progress.day}/${backtestTask.progress.total} 天 (${backtestTask.progress.date})`
+                      ? backtestTask.progress.message
+                        ? `${backtestTask.progress.message}${backtestTask.progress.total > 0
+                          ? ` · 第 ${backtestTask.progress.day}/${backtestTask.progress.total} (${backtestTask.progress.date})`
+                          : ''}`
+                        : `回测中 · 第 ${backtestTask.progress.day}/${backtestTask.progress.total} 天 (${backtestTask.progress.date})`
                       : '正在重新计算回测…'}
                 </div>
                 <div className="mt-0.5 text-[11px] text-secondary">
@@ -1889,9 +1897,9 @@ export function StrategyBacktest() {
                     : result ? '当前展示上次结果，完成后自动替换' : '正在加载回测数据…'}
                 </div>
               </div>
-              {backtestTask?.progress && (
+              {backtestProgressPct != null && (
                 <span className="ml-auto shrink-0 font-mono text-sm font-semibold text-accent">
-                  {((backtestTask.progress.day / backtestTask.progress.total) * 100).toFixed(0)}%
+                  {backtestProgressPct.toFixed(0)}%
                 </span>
               )}
               <button
@@ -1903,11 +1911,11 @@ export function StrategyBacktest() {
                 停止
               </button>
             </div>
-            {backtestTask?.progress && (
+            {backtestProgressPct != null && (
               <div className="mt-2 h-1.5 w-full overflow-hidden rounded-full bg-base/60">
                 <div
                   className="h-full rounded-full bg-accent transition-all duration-300 ease-out"
-                  style={{ width: `${(backtestTask.progress.day / backtestTask.progress.total) * 100}%` }}
+                  style={{ width: `${backtestProgressPct}%` }}
                 />
               </div>
             )}
