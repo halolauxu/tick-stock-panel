@@ -1857,7 +1857,7 @@ def evaluate_exploratory_policies(store: EventReplayStore) -> dict[str, Any]:
     rows = store.connection.execute(
         """
         SELECT o.event_id, o.decision_date, o.entry_date, o.exit_date, o.horizon,
-               o.net_return, o.benchmark_return, o.chain_return,
+               o.net_return, o.benchmark_return, o.chain_return, o.mae, o.mfe,
                f.relative_momentum_20, f.next_open_gap,
                s.event_stage,
                se.event_gate, se.newness, se.economic_bridge,
@@ -1892,14 +1892,16 @@ def evaluate_exploratory_policies(store: EventReplayStore) -> dict[str, Any]:
             "net_return": float(row[5]),
             "benchmark_return": float(row[6]),
             "chain_return": float(row[7]),
-            "relative_momentum_20": row[8],
-            "next_open_gap": row[9],
-            "event_stage": row[10],
-            "enriched_gate": row[11],
-            "enriched_newness": row[12],
-            "enriched_bridge": row[13],
-            "enriched_known_weight": float(row[14]) if row[14] is not None else 0.0,
-            "complete_score": row[15],
+            "mae": float(row[8]),
+            "mfe": float(row[9]),
+            "relative_momentum_20": row[10],
+            "next_open_gap": row[11],
+            "event_stage": row[12],
+            "enriched_gate": row[13],
+            "enriched_newness": row[14],
+            "enriched_bridge": row[15],
+            "enriched_known_weight": float(row[16]) if row[16] is not None else 0.0,
+            "complete_score": row[17],
         }
         for row in rows
     ]
