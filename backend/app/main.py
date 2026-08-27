@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import logging
 import sys
+import threading
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -177,8 +178,6 @@ async def _application_lifespan(app: FastAPI):
     # 停机缺口自检: 延迟后台扫描, 发现最近交易日的盘中快照/缺口时自动创建
     # 修复任务 (盘中停机→次日开实时场景, 不修则坏数据被"只刷今天"分支永久留存)
     try:
-        import threading
-
         from app.services.data_integrity import boot_integrity_check
 
         timer = threading.Timer(30.0, boot_integrity_check, args=(app.state,))
@@ -238,6 +237,24 @@ async def _application_lifespan(app: FastAPI):
     )
     app.state.strategy_engine = strategy_engine
     logger.info("strategy engine loaded: %d strategies", len(strategy_engine.list_strategies()))
+
+    # 模拟交易在策略引擎就绪后初始化。旧 JSON 只做幂等迁移，绝不在启动时重放回测。
+    from app.services.paper_trading import get_service as get_paper_trading_service
+
+    paper_trading_service = get_paper_trading_service(app.state)
+
+    def _recover_paper_open() -> None:
+        try:
+            result = paper_trading_service.recover_missed_open()
+            if any(result.values()):
+                logger.warning("paper open recovery result: %s", result)
+        except Exception:  # noqa: BLE001
+            logger.exception("paper open recovery failed")
+
+    paper_recovery_timer = threading.Timer(20.0, _recover_paper_open)
+    paper_recovery_timer.daemon = True
+    paper_recovery_timer.start()
+    app.state.paper_recovery_timer = paper_recovery_timer
 
     matrix_prewarm_owner = MatrixCachePrewarmOwner()
 
@@ -335,6 +352,9 @@ async def _application_lifespan(app: FastAPI):
         yield
     finally:
         repo._on_refresh_done = None  # noqa: SLF001
+        recovery_timer = getattr(app.state, "paper_recovery_timer", None)
+        if recovery_timer:
+            recovery_timer.cancel()
         if not matrix_prewarm_owner.shutdown(timeout=5.0):
             logger.warning("matrix cache prewarm did not stop within 5 seconds")
         mmanager = getattr(app.state, "mining_manager", None)

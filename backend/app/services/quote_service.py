@@ -540,6 +540,69 @@ class QuoteService:
         self._fetch_quotes()
         return self.status()
 
+    def refresh_paper_symbols(self) -> dict:
+        """Fetch only symbols required by paper execution, independent of the UI switch."""
+        paper_service = (
+            getattr(self._app_state, "paper_trading_service", None)
+            if self._app_state else None
+        )
+        tracked_symbols = sorted(paper_service.subscription_symbols()) if paper_service else []
+        if not tracked_symbols:
+            return {"fetched": 0, "records": []}
+        # 上证指数只作为开市探针。单个订单行情缺失时, 仍能确认交易日并在
+        # 09:31 将该订单置为 UNKNOWN_MARKET_DATA, 而不是无限停留在计划态。
+        symbols = sorted(set(tracked_symbols) | {"000001.SH"})
+
+        from app.tickflow.capabilities import Cap
+        from app.tickflow.client import get_paid_realtime_client
+        from app.tickflow.policy import detect_capabilities
+        from app.tickflow.rate_limits import chunked, resolve_limit, sleep_between_batches
+
+        client = get_paid_realtime_client()
+        if client is None:
+            logger.warning("模拟交易行情拉取失败: 未配置实时行情 API Key")
+            return {"fetched": 0, "records": []}
+        limit = resolve_limit(detect_capabilities(), Cap.QUOTE_BY_SYMBOL, default_batch=5)
+        responses: list[dict] = []
+        batches = chunked(symbols, limit.batch)
+        started = time.perf_counter()
+        for index, batch in enumerate(batches):
+            sleep_between_batches(index, limit.rpm)
+            try:
+                responses.extend(client.quotes.get(symbols=batch) or [])
+            except Exception as exc:
+                logger.warning(
+                    "模拟交易行情批次 %d/%d 拉取失败: %s",
+                    index + 1,
+                    len(batches),
+                    exc,
+                )
+        records = []
+        for quote in responses:
+            extension = quote.get("ext") or {}
+            records.append({
+                "symbol": quote.get("symbol"),
+                "name": quote.get("name") or extension.get("name"),
+                "last_price": quote.get("last_price"),
+                "prev_close": quote.get("prev_close"),
+                "open": quote.get("open"),
+                "high": quote.get("high"),
+                "low": quote.get("low"),
+                "volume": quote.get("volume"),
+                "amount": quote.get("amount"),
+                "timestamp": quote.get("timestamp"),
+                "session": quote.get("session"),
+            })
+        if records:
+            fetched_at = time.time() * 1000
+            with self._lock:
+                self._fetch_time = time.perf_counter()
+                self._fetch_ms = (time.perf_counter() - started) * 1000
+                self._fetched_at = fetched_at
+            _persist_last_fetch(fetched_at)
+            self._notify_paper_trading(records)
+        return {"fetched": len(records), "records": records}
+
     # ================================================================
     # 后台轮询
     # ================================================================
@@ -777,6 +840,7 @@ class QuoteService:
 
         # ---- 策略监控 + 告警评估 ----
         self._evaluate_monitors(daily_df, quote_extra)
+        self._notify_paper_trading(records)
 
     def _fetch_watchlist_quotes(self) -> None:
         """Free 档自选股实时: 按 capability batch 上限分批拉取。"""
@@ -786,7 +850,7 @@ class QuoteService:
         from app.tickflow.policy import detect_capabilities
         from app.tickflow.rate_limits import chunked, resolve_limit, sleep_between_batches
 
-        symbols = preferences.get_realtime_watchlist_symbols()
+        symbols = self._include_paper_symbols(preferences.get_realtime_watchlist_symbols())
         # 指数监控规则标的并入轮询 (与股票共享 batch 额度)
         engine = getattr(self._app_state, "monitor_engine", None) if self._app_state else None
         if engine:
@@ -899,10 +963,33 @@ class QuoteService:
 
         self._broadcast_quote_updated()
         self._evaluate_monitors(daily_df, quote_extra)
+        self._notify_paper_trading(records)
 
     # ================================================================
     # 工具
     # ================================================================
+
+    def _include_paper_symbols(self, symbols: list[str]) -> list[str]:
+        """Merge all open paper orders and positions into the realtime scope."""
+        merged = list(symbols)
+        paper_service = (
+            getattr(self._app_state, "paper_trading_service", None)
+            if self._app_state else None
+        )
+        if paper_service is not None:
+            for symbol in sorted(paper_service.subscription_symbols()):
+                if symbol not in merged:
+                    merged.append(symbol)
+        return merged
+
+    def _notify_paper_trading(self, records: list[dict]) -> None:
+        service = getattr(self._app_state, "paper_trading_service", None) if self._app_state else None
+        if service is None:
+            return
+        try:
+            service.on_quote_records(records, source="realtime")
+        except Exception:  # noqa: BLE001
+            logger.exception("模拟交易行情处理失败")
 
     @staticmethod
     def _split_records_by_asset(

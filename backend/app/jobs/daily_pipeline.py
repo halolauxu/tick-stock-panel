@@ -1,8 +1,12 @@
-"""盘后管道 + 盘前维表同步。
+"""数据管道、盘前维表同步与事件驱动模拟交易时钟。
 
 调度:
   09:10 盘前 — 同步个股维表 instruments (全量覆盖)
+  09:25 模拟交易盘前校验
+  09:30 模拟交易开盘撮合, 09:31 终态截止
+  15:05 模拟交易收盘结算
   15:30 盘后 — 日K同步 + 增量除权因子 + enriched 计算 + 刷新视图
+  数据管道成功后 — 生成并冻结下一交易日信号和订单计划
 
 盘后同步策略:
   日 K: QuoteService 交易时段已实时落盘 → 有数据时跳过 batch,首次拉 1 年区间
@@ -12,6 +16,8 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Callable
+from datetime import date as dt_date
+from datetime import time as dt_time
 from pathlib import Path
 
 import polars as pl
@@ -19,8 +25,9 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 from apscheduler.triggers.interval import IntervalTrigger
 
-from app.indicators.pipeline import run_pipeline
 from app.config import settings
+from app.indicators.pipeline import run_pipeline
+from app.market_time import cn_now
 from app.services import index_sync, instrument_sync, kline_sync, preferences as _prefs
 from app.tickflow.capabilities import Cap, CapabilitySet
 from app.tickflow.pools import DEMO_SYMBOLS, get_pool
@@ -109,7 +116,7 @@ def run_now(
     repo: KlineRepository,
     capset: CapabilitySet,
     on_progress: ProgressCb | None = None,
-    override_start_date: _date | None = None,
+    override_start_date: dt_date | None = None,
 ) -> dict:
     """立即执行一次盘后管道,支持进度回调。
 
@@ -889,14 +896,15 @@ def _run_tracked(fn, job_label: str) -> bool:
 
 
 def _scheduled_pipeline_task(pipeline_fn) -> None:
-    """Run paper accounts and weekly mining only after the daily pipeline succeeded."""
+    """Freeze the newly sealed day of paper signals after the pipeline succeeds."""
     if not _run_tracked(pipeline_fn, "daily_pipeline"):
         return
     try:
-        from app.services.paper_trading import run_active_accounts
-
-        result = run_active_accounts(_get_app_state())
-        logger.info("scheduled paper trading result: %s", result)
+        service = getattr(_get_app_state(), "paper_trading_service", None)
+        result = service.seal_daily_signals() if service else {
+            "processed": 0, "failed": 0, "orders": 0,
+        }
+        logger.info("scheduled paper signal seal result: %s", result)
     except Exception:
         logger.exception("scheduled paper trading failed; daily pipeline remains succeeded")
     try:
@@ -1110,10 +1118,97 @@ def _register_review_job(scheduler, repo, hour: int, minute: int) -> None:
     )
 
 
+def _paper_clock_call(method: str) -> None:
+    state = _get_app_state()
+    service = getattr(state, "paper_trading_service", None) if state else None
+    if service is None:
+        logger.warning("paper clock %s skipped: service not ready", method)
+        return
+    try:
+        if method in {"preflight_all", "execute_open_orders", "finalize_open_window"}:
+            quote_service = getattr(state, "quote_service", None)
+            if quote_service is not None and service.subscription_symbols():
+                refresh = getattr(quote_service, "refresh_paper_symbols", quote_service.refresh)
+                refresh()
+        result = getattr(service, method)()
+        logger.info("paper clock %s result: %s", method, result)
+    except Exception:
+        logger.exception("paper clock %s failed", method)
+
+
+def _register_paper_clock_jobs(scheduler) -> None:
+    """Register the four explicit exchange-clock boundaries for paper trading."""
+    scheduler.add_job(
+        lambda: _paper_clock_call("preflight_all"),
+        trigger=CronTrigger(day_of_week="mon-fri", hour=9, minute=25,
+                            timezone="Asia/Shanghai"),
+        id="paper_preflight",
+        misfire_grace_time=300,
+        replace_existing=True,
+    )
+    scheduler.add_job(
+        lambda: _paper_clock_call("execute_open_orders"),
+        trigger=CronTrigger(day_of_week="mon-fri", hour=9, minute=30,
+                            second="5,25,45", timezone="Asia/Shanghai"),
+        id="paper_open_execution",
+        misfire_grace_time=20,
+        coalesce=True,
+        replace_existing=True,
+    )
+    scheduler.add_job(
+        lambda: _paper_clock_call("finalize_open_window"),
+        trigger=CronTrigger(day_of_week="mon-fri", hour=9, minute=31,
+                            timezone="Asia/Shanghai"),
+        id="paper_open_deadline",
+        misfire_grace_time=300,
+        replace_existing=True,
+    )
+    scheduler.add_job(
+        lambda: _paper_clock_call("settle_all"),
+        trigger=CronTrigger(day_of_week="mon-fri", hour=15, minute=5,
+                            timezone="Asia/Shanghai"),
+        id="paper_settlement",
+        misfire_grace_time=1800,
+        replace_existing=True,
+    )
+    scheduler.add_job(
+        _paper_quote_tick,
+        trigger=IntervalTrigger(seconds=10),
+        id="paper_quote_tick",
+        misfire_grace_time=10,
+        coalesce=True,
+        max_instances=1,
+        replace_existing=True,
+    )
+
+
+def _paper_quote_tick() -> None:
+    """Keep paper orders and positions priced even when the global UI switch is off."""
+    current = cn_now().time()
+    in_market_window = (
+        dt_time(9, 25) <= current <= dt_time(11, 30)
+        or dt_time(13, 0) <= current <= dt_time(15, 0)
+    )
+    if not in_market_window:
+        return
+    state = _get_app_state()
+    service = getattr(state, "paper_trading_service", None) if state else None
+    quote_service = getattr(state, "quote_service", None) if state else None
+    if service is None or quote_service is None or not service.subscription_symbols():
+        return
+    try:
+        refresh = getattr(quote_service, "refresh_paper_symbols", quote_service.refresh)
+        refresh()
+    except Exception:
+        logger.exception("paper quote tick failed")
+
+
 def start_scheduler(repo: KlineRepository, capset: CapabilitySet) -> AsyncIOScheduler:
     """启动调度器。
 
     工作日 09:10 — 同步个股维表
+    工作日 09:25/09:30/09:31 — 盘前校验、开盘执行与终态截止
+    工作日 15:05 — 账户结算与对账
     工作日 HH:MM — 盘后管道（时间由用户偏好决定，默认 15:30）
     """
     from app.services import preferences
@@ -1139,6 +1234,8 @@ def start_scheduler(repo: KlineRepository, capset: CapabilitySet) -> AsyncIOSche
         misfire_grace_time=1800,
         replace_existing=True,
     )
+
+    _register_paper_clock_jobs(scheduler)
 
     # 盘后: 日 K + enriched（时间由偏好决定）
     def _pipeline_then_refresh(on_progress=None):

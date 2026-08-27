@@ -1,16 +1,15 @@
 """模拟交易 API。"""
 from __future__ import annotations
 
+from datetime import time as dt_time
 from typing import Literal
 
 from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel, Field
 
-from app.services.paper_trading import (
-    PaperTradingStore,
-    PaperTradingStoreError,
-    run_account,
-)
+from app.market_time import cn_now
+from app.services.paper_ledger import PaperLedgerError
+from app.services.paper_trading import PaperTradingStoreError, get_service, run_account
 from app.strategy.engine import StrategyDataContext, StrategyEngine
 from app.tickflow.capabilities import Cap
 
@@ -35,12 +34,13 @@ class PaperTradingCreateRequest(BaseModel):
     position_sizing: Literal["equal", "score_weight"] = "equal"
     holding_days: int = Field(5, ge=1, le=1000)
     minute_fill: bool = False
+    exit_mode: Literal["eod", "intraday"]
     regime_filter: dict | None = None
     enforce_t_plus_one: bool = True
 
 
-def _store(request: Request) -> PaperTradingStore:
-    return PaperTradingStore(request.app.state.repo.store.data_dir)
+def _service(request: Request):
+    return get_service(request.app.state)
 
 
 def _raise_store_error(exc: Exception) -> None:
@@ -48,7 +48,7 @@ def _raise_store_error(exc: Exception) -> None:
         raise HTTPException(status_code=404, detail="模拟账户不存在") from exc
     if isinstance(exc, ValueError):
         raise HTTPException(status_code=400, detail=str(exc)) from exc
-    if isinstance(exc, PaperTradingStoreError):
+    if isinstance(exc, PaperTradingStoreError | PaperLedgerError):
         raise HTTPException(status_code=500, detail=str(exc)) from exc
     raise HTTPException(status_code=500, detail=str(exc)) from exc
 
@@ -56,7 +56,8 @@ def _raise_store_error(exc: Exception) -> None:
 @router.get("/accounts")
 def list_accounts(request: Request) -> dict:
     try:
-        return {"items": _store(request).list()}
+        service = _service(request)
+        return {"items": service.accounts(), "system": service.system_status()}
     except Exception as exc:
         _raise_store_error(exc)
 
@@ -79,17 +80,35 @@ def create_account(body: PaperTradingCreateRequest, request: Request) -> dict:
         )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
-    if body.minute_fill:
+    if body.minute_fill or body.exit_mode == "intraday":
         capset = request.app.state.capabilities
-        if not capset.has(Cap.KLINE_MINUTE_BATCH):
-            raise HTTPException(status_code=403, detail="分钟K成交需要 Pro+ 权限")
+        quote_service = getattr(request.app.state, "quote_service", None)
+        realtime_allowed = bool(
+            quote_service is not None and quote_service.is_realtime_allowed()
+        )
+        if not realtime_allowed and not capset.has(Cap.KLINE_MINUTE_BATCH):
+            raise HTTPException(status_code=403, detail="盘中风险模式需要实时行情或分钟行情能力")
     if body.exit_fill == "signal_next_minute" and not body.minute_fill:
         raise HTTPException(status_code=400, detail="触发后下一分钟成交需要先开启分钟K成交")
 
     config = body.model_dump(exclude={"name"})
+    config["minute_fill"] = body.exit_mode == "intraday"
     config["strategy_name"] = str(getattr(strategy, "name", body.strategy_id))
     try:
-        return _store(request).create(name=body.name, start_date=latest, config=config)
+        service = _service(request)
+        created = service.ledger.create_account(
+            name=body.name,
+            baseline_date=latest,
+            config=config,
+        )
+        now = cn_now()
+        before_preflight = now.time() < dt_time(9, 25)
+        after_signal_seal = now.time() >= dt_time(15, 30)
+        if (latest < now.date() and before_preflight) or (
+            latest == now.date() and after_signal_seal
+        ):
+            service.seal_account_signals(created["id"], latest)
+        return service.account(created["id"])
     except Exception as exc:
         _raise_store_error(exc)
 
@@ -97,7 +116,7 @@ def create_account(body: PaperTradingCreateRequest, request: Request) -> dict:
 @router.get("/accounts/{account_id}")
 def get_account(account_id: str, request: Request) -> dict:
     try:
-        return _store(request).get(account_id)
+        return _service(request).account(account_id)
     except Exception as exc:
         _raise_store_error(exc)
 
@@ -105,7 +124,7 @@ def get_account(account_id: str, request: Request) -> dict:
 @router.delete("/accounts/{account_id}")
 def delete_account(account_id: str, request: Request) -> dict:
     try:
-        deleted = _store(request).delete(account_id)
+        deleted = _service(request).ledger.delete_account(account_id)
         return {"ok": True, "id": deleted["id"], "name": deleted["name"]}
     except Exception as exc:
         _raise_store_error(exc)
@@ -114,7 +133,7 @@ def delete_account(account_id: str, request: Request) -> dict:
 @router.post("/accounts/{account_id}/run")
 def run_paper_account(account_id: str, request: Request) -> dict:
     try:
-        # 暂停只关闭每日自动运行, 用户主动同步仍应按最新完整数据重算。
+        # 主动操作只核对账本并恢复错过的真实事件, 不重跑历史回测。
         return run_account(request.app.state, account_id, force=True)
     except Exception as exc:
         _raise_store_error(exc)
@@ -123,7 +142,7 @@ def run_paper_account(account_id: str, request: Request) -> dict:
 @router.post("/accounts/{account_id}/pause")
 def pause_account(account_id: str, request: Request) -> dict:
     try:
-        return _store(request).set_status(account_id, "paused")
+        return _service(request).ledger.set_status(account_id, "paused")
     except Exception as exc:
         _raise_store_error(exc)
 
@@ -131,6 +150,19 @@ def pause_account(account_id: str, request: Request) -> dict:
 @router.post("/accounts/{account_id}/resume")
 def resume_account(account_id: str, request: Request) -> dict:
     try:
-        return _store(request).set_status(account_id, "active")
+        return _service(request).ledger.set_status(account_id, "active")
+    except Exception as exc:
+        _raise_store_error(exc)
+
+
+@router.get("/status")
+def paper_trading_status(request: Request) -> dict:
+    return _service(request).system_status()
+
+
+@router.post("/accounts/{account_id}/reconcile")
+def reconcile_account(account_id: str, request: Request) -> dict:
+    try:
+        return _service(request).ledger.reconcile(account_id)
     except Exception as exc:
         _raise_store_error(exc)

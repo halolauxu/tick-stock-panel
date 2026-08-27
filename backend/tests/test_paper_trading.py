@@ -1,25 +1,36 @@
 from __future__ import annotations
 
+import inspect
 import json
 from datetime import date, datetime
 from types import SimpleNamespace
 
+import polars as pl
 import pytest
+from pydantic import ValidationError
 
 from app.api import paper_trading as paper_api
+from app.jobs import daily_pipeline
 from app.market_time import CN_TZ
-from app.services import paper_trading
+from app.services.paper_ledger import PaperLedger, PaperLedgerError
+from app.services.paper_trading import PaperTradingService, PaperTradingStore
+
+SIGNAL_DAY = date(2026, 8, 26)
+TRADE_DAY = date(2026, 8, 27)
+OPEN_TIME = datetime(2026, 8, 27, 9, 30, 5, tzinfo=CN_TZ)
 
 
-def _config() -> dict:
-    return {
+def _config(**overrides) -> dict:
+    config = {
         "strategy_id": "n_day_low_reversal",
+        "strategy_name": "新低反转",
         "asset_type": "stock",
         "symbols": None,
         "params": {"lookback": 20},
         "overrides": {"max_hold_days": 5},
         "entry_fill": "open_t+1",
         "exit_fill": "open_t+1",
+        "exit_mode": "eod",
         "commission_pct": 0.0002,
         "stamp_tax_pct": 0.001,
         "slippage_bps": 5,
@@ -31,273 +42,659 @@ def _config() -> dict:
         "regime_filter": None,
         "enforce_t_plus_one": True,
     }
+    config.update(overrides)
+    return config
 
 
-def test_account_store_persists_frozen_backtest_config(tmp_path):
-    store = paper_trading.PaperTradingStore(tmp_path)
+class FakeRepo:
+    def __init__(self, data_dir, minute_rows: list[dict] | None = None) -> None:
+        self.store = SimpleNamespace(data_dir=data_dir)
+        self.minute_rows = minute_rows or []
 
-    created = store.create(
-        name="新低反转模拟盘",
-        start_date=date(2026, 8, 26),
-        config=_config(),
-        created_at=datetime(2026, 8, 26, 16, 0, tzinfo=CN_TZ),
+    @staticmethod
+    def latest_enriched_date(_asset_type: str) -> date:
+        return SIGNAL_DAY
+
+    def get_minute_batch(self, _symbols: list[str], _trading_date: date) -> pl.DataFrame:
+        return pl.DataFrame(self.minute_rows)
+
+    @staticmethod
+    def get_daily_asset(
+        _asset_type: str,
+        _symbol: str,
+        _start: date,
+        _end: date,
+        _columns: list[str],
+    ) -> pl.DataFrame:
+        return pl.DataFrame({"raw_close": [10.0], "close": [10.0]})
+
+
+def _service(tmp_path, *, minute_rows: list[dict] | None = None) -> PaperTradingService:
+    return PaperTradingService(
+        SimpleNamespace(repo=FakeRepo(tmp_path, minute_rows))
     )
 
-    loaded = paper_trading.PaperTradingStore(tmp_path).get(created["id"])
-    assert loaded["status"] == "active"
-    assert loaded["schema_version"] == 3
-    assert loaded["baseline_date"] == "2026-08-26"
-    assert loaded["signal_start_date"] == "2026-08-26"
-    assert loaded["start_date"] == "2026-08-26"
-    assert loaded["activation_policy"] == "completed_baseline_or_next_forward_day"
-    assert loaded["config"] == _config()
-    assert loaded["last_processed_date"] is None
-    assert loaded["result"] is None
+
+def _account_with_buy_order(service: PaperTradingService, *, config: dict | None = None):
+    account = service.ledger.create_account(
+        name="事件驱动模拟盘",
+        baseline_date=SIGNAL_DAY,
+        config=config or _config(),
+        created_at=datetime(2026, 8, 26, 15, 30, tzinfo=CN_TZ),
+    )
+    _, order_id, _ = service.ledger.record_signal_and_order(
+        account_id=account["id"],
+        strategy_id="n_day_low_reversal",
+        symbol="000001.SZ",
+        name="平安银行",
+        side="BUY",
+        signal_date=SIGNAL_DAY,
+        score=88,
+        reason="strategy_entry",
+        signal_ref="entry-low-reversal",
+        requested_qty=1_000,
+        target_amount=10_000,
+        target_weight=0.05,
+        planned_session="NEXT_OPEN",
+        frozen_at=datetime(2026, 8, 26, 15, 30, tzinfo=CN_TZ),
+    )
+    return account, order_id
 
 
-def test_run_account_reuses_backtest_worker_and_is_idempotent(monkeypatch, tmp_path):
-    store = paper_trading.PaperTradingStore(tmp_path)
+def _quote(
+    *,
+    symbol: str = "000001.SZ",
+    price: float = 10.0,
+    previous: float | None = 9.9,
+    volume: float = 1_000,
+    at: datetime = OPEN_TIME,
+) -> dict:
+    return {
+        "symbol": symbol,
+        "open": price,
+        "high": price + 0.02,
+        "low": price - 0.02,
+        "last_price": price,
+        "prev_close": previous,
+        "volume": volume,
+        "quote_at": at.isoformat(),
+        "_quote_dt": at,
+        "source": "test_quote",
+    }
+
+
+def test_account_is_persisted_in_transactional_ledger(tmp_path):
+    store = PaperTradingStore(tmp_path)
     created = store.create(
         name="新低反转模拟盘",
-        start_date=date(2026, 8, 20),
+        start_date=SIGNAL_DAY,
         config=_config(),
-        created_at=datetime(2026, 8, 20, 16, 0, tzinfo=CN_TZ),
+        created_at=datetime(2026, 8, 26, 15, 30, tzinfo=CN_TZ),
     )
-    tasks: list[dict] = []
 
-    def fake_run(task):
-        tasks.append(task)
-        return {
-            "run_id": "paper-run",
-            "config": task["config"],
-            "stats": {"total_return": 0.05},
-            "equity_curve": [{
-                "date": "2026-08-26",
-                "value": 210_000,
-                "cash": 110_000,
-                "positions": 1,
-                "exposure": 0.4762,
-            }],
-            "drawdown_curve": [],
-            "benchmark_curve": [],
-            "trades": [],
-            "open_positions": [{"symbol": "000001.SZ"}],
-            "pending_orders": [],
-            "per_symbol_stats": [],
-            "strategy_info": {"id": "n_day_low_reversal", "name": "新低反转"},
-            "elapsed_ms": 12,
-            "error": None,
-        }
+    loaded = PaperTradingStore(tmp_path).get(created["id"])
 
-    monkeypatch.setattr(paper_trading, "run_worker_task", fake_run)
+    assert loaded["schema_version"] == 6
+    assert loaded["execution_policy"] == "event_driven"
+    assert loaded["summary"]["cash"] == 200_000
+    assert loaded["cash_entries"][0]["event_type"] == "INITIAL_CAPITAL"
+    assert loaded["timeline"][0]["event_type"] == "ACCOUNT_CREATED"
+
+
+def test_paper_service_has_no_backtest_replay_dependency():
+    source = inspect.getsource(PaperTradingService)
+
+    assert "run_worker_task" not in source
+    assert '"kind": "backtest"' not in source
+
+
+def test_scheduler_registers_and_dispatches_all_exchange_clock_boundaries():
+    jobs: dict[str, dict] = {}
+
+    class Scheduler:
+        @staticmethod
+        def add_job(func, **kwargs):
+            jobs[kwargs["id"]] = {"func": func, **kwargs}
+
+    calls: list[str] = []
+    service = SimpleNamespace(
+        preflight_all=lambda: calls.append("preflight"),
+        execute_open_orders=lambda: calls.append("open"),
+        finalize_open_window=lambda: calls.append("deadline"),
+        settle_all=lambda: calls.append("settlement"),
+    )
+    daily_pipeline.set_app_state(SimpleNamespace(paper_trading_service=service))
+
+    daily_pipeline._register_paper_clock_jobs(Scheduler())
+    for job_id in (
+        "paper_preflight",
+        "paper_open_execution",
+        "paper_open_deadline",
+        "paper_settlement",
+    ):
+        jobs[job_id]["func"]()
+
+    assert calls == ["preflight", "open", "deadline", "settlement"]
+    assert str(jobs["paper_preflight"]["trigger"]).startswith("cron[day_of_week='mon-fri'")
+    assert "hour='9', minute='30', second='5,25,45'" in str(
+        jobs["paper_open_execution"]["trigger"]
+    )
+    assert "interval[0:00:10]" in str(jobs["paper_quote_tick"]["trigger"])
+
+
+def test_quote_tick_refreshes_tracked_paper_symbols_during_market(monkeypatch):
+    calls: list[str] = []
     state = SimpleNamespace(
-        repo=SimpleNamespace(
-            store=SimpleNamespace(data_dir=tmp_path),
-            latest_enriched_date=lambda asset_type: date(2026, 8, 26),
+        paper_trading_service=SimpleNamespace(
+            subscription_symbols=lambda: {"000001.SZ"}
         ),
+        quote_service=SimpleNamespace(refresh=lambda: calls.append("refresh")),
+    )
+    daily_pipeline.set_app_state(state)
+    monkeypatch.setattr(
+        daily_pipeline,
+        "cn_now",
+        lambda: datetime(2026, 8, 27, 11, 25, tzinfo=CN_TZ),
     )
 
-    first = paper_trading.run_account(state, created["id"])
-    second = paper_trading.run_account(state, created["id"])
+    daily_pipeline._paper_quote_tick()
 
-    assert first["last_processed_date"] == "2026-08-26"
-    assert first["result"]["open_positions"] == [{"symbol": "000001.SZ"}]
-    assert second == first
-    assert len(tasks) == 1
-    assert tasks[0]["kind"] == "backtest"
-    assert tasks[0]["config"]["start"] == "2026-08-20"
-    assert tasks[0]["config"]["end"] == "2026-08-26"
-    assert tasks[0]["config"]["liquidate_on_end"] is False
+    assert calls == ["refresh"]
 
 
-def test_new_account_waits_for_post_activation_data_without_retroactive_order(monkeypatch, tmp_path):
-    store = paper_trading.PaperTradingStore(tmp_path)
-    created = store.create(
-        name="严格前向模拟盘",
-        start_date=date(2026, 8, 25),
-        config=_config(),
-        created_at=datetime(2026, 8, 26, 22, 0, tzinfo=CN_TZ),
+def test_system_does_not_report_stale_quotes_when_nothing_requires_quotes(
+    tmp_path, monkeypatch
+):
+    service = _service(tmp_path)
+    service.app_state.quote_service = SimpleNamespace(
+        status=lambda: {"quote_age_ms": None, "mode": "watchlist", "enabled": False}
     )
     monkeypatch.setattr(
-        paper_trading,
-        "run_worker_task",
-        lambda _task: pytest.fail("基线日不应执行回测或生成历史订单"),
+        "app.services.paper_trading.cn_now",
+        lambda: datetime(2026, 8, 27, 11, 25, tzinfo=CN_TZ),
     )
-    state = SimpleNamespace(
-        repo=SimpleNamespace(
-            store=SimpleNamespace(data_dir=tmp_path),
-            latest_enriched_date=lambda _asset_type: date(2026, 8, 25),
+
+    status = service.system_status()
+
+    assert status["tracked_symbol_count"] == 0
+    assert status["quote_stale"] is False
+    assert status["executor_health"] == "HEALTHY"
+
+
+@pytest.mark.parametrize(
+    ("at", "expected"),
+    [
+        (datetime(2026, 8, 27, 12, 0, tzinfo=CN_TZ), "LUNCH_BREAK"),
+        (datetime(2026, 8, 27, 17, 0, tzinfo=CN_TZ), "CLOSED"),
+        (datetime(2026, 8, 29, 10, 0, tzinfo=CN_TZ), "CLOSED"),
+    ],
+)
+def test_system_market_phase_describes_closed_sessions(tmp_path, monkeypatch, at, expected):
+    service = _service(tmp_path)
+    monkeypatch.setattr("app.services.paper_trading.cn_now", lambda: at)
+
+    assert service.system_status()["market_phase"] == expected
+
+
+def test_duplicate_execution_cannot_duplicate_fill_cash_or_position(tmp_path):
+    service = _service(tmp_path)
+    account, order_id = _account_with_buy_order(service)
+    service.ledger.assign_due_date(order_id, TRADE_DAY, {"market_observed": True})
+
+    first_fill = service.ledger.execute_fill(
+        order_id, price=10, quantity=1_000, quote_at=OPEN_TIME, source="open_quote"
+    )
+    second_fill = PaperLedger(tmp_path).execute_fill(
+        order_id, price=10, quantity=1_000, quote_at=OPEN_TIME, source="open_quote"
+    )
+    current = service.account(account["id"])
+
+    assert second_fill == first_fill
+    assert len(current["fills"]) == 1
+    assert current["positions"][0]["quantity"] == 1_000
+    assert current["positions"][0]["locked_qty"] == 1_000
+    assert len([row for row in current["cash_entries"] if row["event_type"] == "BUY_FILL"]) == 1
+    assert current["reconciliation"]["ok"] is True
+
+
+def test_today_pnl_uses_previous_close_and_buy_cost_without_backfill(tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        "app.services.paper_ledger.cn_now",
+        lambda: datetime(2026, 8, 27, 11, 25, tzinfo=CN_TZ),
+    )
+    service = _service(tmp_path)
+    account, order_id = _account_with_buy_order(service)
+    service.ledger.assign_due_date(order_id, TRADE_DAY, {"market_observed": True})
+    service.ledger.execute_fill(
+        order_id,
+        price=10,
+        quantity=1_000,
+        quote_at=OPEN_TIME,
+        source="open_quote",
+        previous_close=9.9,
+    )
+    service.ledger.update_marks(
+        {
+            "000001.SZ": {
+                "last_price": 10.5,
+                "prev_close": 9.9,
+                "quote_at": datetime(2026, 8, 27, 11, 25, tzinfo=CN_TZ).isoformat(),
+            }
+        },
+        source="test_quote",
+    )
+
+    current = service.account(account["id"])
+
+    assert current["summary"]["today_pnl_available"] is True
+    assert current["summary"]["today_pnl"] == pytest.approx(493.0)
+    assert current["positions"][0]["pnl_date"] == "2026-08-27"
+    assert current["positions"][0]["today_bought_qty"] == 1_000
+
+
+def test_today_pnl_keeps_realized_sell_after_position_closes(tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        "app.services.paper_ledger.cn_now",
+        lambda: datetime(2026, 8, 27, 11, 25, tzinfo=CN_TZ),
+    )
+    service = _service(tmp_path)
+    account, buy_order = _account_with_buy_order(service)
+    service.ledger.assign_due_date(buy_order, SIGNAL_DAY, {})
+    service.ledger.execute_fill(
+        buy_order,
+        price=10,
+        quantity=1_000,
+        quote_at=datetime(2026, 8, 26, 9, 30, tzinfo=CN_TZ),
+        source="open_quote",
+        previous_close=9.8,
+    )
+    service.ledger.unlock_positions(TRADE_DAY)
+    _, sell_order, _ = service.ledger.record_signal_and_order(
+        account_id=account["id"],
+        strategy_id="n_day_low_reversal",
+        symbol="000001.SZ",
+        name="平安银行",
+        side="SELL",
+        signal_date=SIGNAL_DAY,
+        score=None,
+        reason="strategy_exit",
+        signal_ref=None,
+        requested_qty=1_000,
+        target_amount=10_500,
+        target_weight=0,
+        planned_session="NEXT_OPEN",
+    )
+    service.ledger.assign_due_date(sell_order, TRADE_DAY, {})
+    service.ledger.execute_fill(
+        sell_order,
+        price=10.5,
+        quantity=1_000,
+        quote_at=OPEN_TIME,
+        source="open_quote",
+        previous_close=10.0,
+    )
+
+    current = service.account(account["id"])
+    sell_fill = next(fill for fill in current["fills"] if fill["side"] == "SELL")
+
+    assert current["positions"] == []
+    assert current["summary"]["today_pnl"] == pytest.approx(482.15)
+    assert sell_fill["day_pnl"] == pytest.approx(482.15)
+
+
+@pytest.mark.parametrize(
+    ("quote", "expected"),
+    [
+        (_quote(volume=0), "REJECTED_SUSPENDED"),
+        (
+            {**_quote(price=11.0, previous=10.0), "high": 11.0, "low": 11.0},
+            "REJECTED_LIMIT_UP",
         ),
+    ],
+)
+def test_open_executor_has_explicit_blocked_terminal_states(tmp_path, quote, expected):
+    service = _service(tmp_path)
+    account, _ = _account_with_buy_order(service)
+
+    result = service.execute_open_orders(
+        now=datetime(2026, 8, 27, 9, 31, tzinfo=CN_TZ),
+        quotes={"000001.SZ": quote},
+        finalize_missing=True,
     )
 
-    account = paper_trading.run_account(state, created["id"], force=True)
-
-    assert account["last_processed_date"] == "2026-08-25"
-    assert account["result"]["pending_orders"] == []
-    assert account["result"]["open_positions"] == []
-    assert account["execution_state"]["code"] == "waiting_first_data"
-    assert "2026-08-26" in account["execution_state"]["detail"]
+    assert result["rejected"] == 1
+    assert service.account(account["id"])["orders"][0]["status"] == expected
 
 
-def test_preopen_account_uses_latest_complete_day_for_next_open(tmp_path):
-    store = paper_trading.PaperTradingStore(tmp_path)
+def test_zero_volume_at_0930_waits_until_deadline_before_suspension(tmp_path):
+    service = _service(tmp_path)
+    account, _ = _account_with_buy_order(service)
+    quote = _quote(volume=0)
 
-    created = store.create(
-        name="盘前模拟盘",
-        start_date=date(2026, 8, 26),
-        config=_config(),
-        created_at=datetime(2026, 8, 27, 8, 0, tzinfo=CN_TZ),
+    result = service.execute_open_orders(now=OPEN_TIME, quotes={"000001.SZ": quote})
+
+    assert result["waiting"] == 1
+    assert service.account(account["id"])["orders"][0]["status"] == "PREFLIGHT_OK"
+
+
+def test_open_executor_rejects_insufficient_cash(tmp_path):
+    service = _service(tmp_path)
+    account, _ = _account_with_buy_order(service, config=_config(initial_capital=1_000))
+
+    service.execute_open_orders(now=OPEN_TIME, quotes={"000001.SZ": _quote(price=10)})
+
+    assert service.account(account["id"])["orders"][0]["status"] == (
+        "REJECTED_INSUFFICIENT_CASH"
     )
 
-    assert created["baseline_date"] == "2026-08-26"
-    assert created["signal_start_date"] == "2026-08-26"
 
+def test_0931_missing_symbol_quote_becomes_unknown_not_a_fill(tmp_path):
+    service = _service(tmp_path)
+    account, _ = _account_with_buy_order(service)
+    other = _quote(symbol="000002.SZ")
 
-def test_v2_account_is_migrated_to_rebuild_complete_baseline_day(tmp_path):
-    store = paper_trading.PaperTradingStore(tmp_path)
-    created = store.create(
-        name="旧版模拟盘",
-        start_date=date(2026, 8, 26),
-        config=_config(),
-        created_at=datetime(2026, 8, 26, 22, 0, tzinfo=CN_TZ),
+    result = service.execute_open_orders(
+        now=datetime(2026, 8, 27, 9, 31, tzinfo=CN_TZ),
+        quotes={"000002.SZ": other},
+        finalize_missing=True,
     )
-    legacy = {
-        **created,
-        "schema_version": 2,
-        "signal_start_date": "2026-08-27",
-        "start_date": "2026-08-27",
-        "last_processed_date": "2026-08-26",
-        "result": {"pending_orders": []},
-    }
-    path = tmp_path / "paper_trading" / "accounts" / f"{created['id']}.json"
-    path.write_text(json.dumps(legacy), encoding="utf-8")
+    current = service.account(account["id"])
 
-    migrated = store.get(created["id"])
-
-    assert migrated["schema_version"] == 3
-    assert migrated["signal_start_date"] == "2026-08-26"
-    assert migrated["last_processed_date"] is None
-    assert migrated["result"] is None
-    assert migrated["execution_state"]["code"] == "waiting_rebuild"
+    assert result["unknown"] == 1
+    assert current["orders"][0]["status"] == "UNKNOWN_MARKET_DATA"
+    assert current["fills"] == []
 
 
-def test_corrupt_account_file_fails_closed(tmp_path):
-    path = tmp_path / "paper_trading" / "accounts" / "abcdef123456.json"
-    path.parent.mkdir(parents=True)
-    path.write_text("{broken", encoding="utf-8")
+def test_late_recovery_preserves_missed_event_and_marks_fill_recovered_late(tmp_path):
+    minute_rows = [{
+        "symbol": "000001.SZ",
+        "datetime": datetime(2026, 8, 27, 9, 30, tzinfo=CN_TZ),
+        "open": 10.0,
+        "high": 10.05,
+        "low": 9.98,
+        "close": 10.02,
+        "volume": 12_000,
+    }]
+    service = _service(tmp_path, minute_rows=minute_rows)
+    account, _ = _account_with_buy_order(service)
 
-    with pytest.raises(paper_trading.PaperTradingStoreError, match="损坏"):
-        paper_trading.PaperTradingStore(tmp_path).get("abcdef123456")
-    assert path.read_text(encoding="utf-8") == "{broken"
-
-
-def test_account_store_delete_removes_only_requested_account(tmp_path):
-    store = paper_trading.PaperTradingStore(tmp_path)
-    first = store.create(
-        name="待删除模拟盘",
-        start_date=date(2026, 8, 26),
-        config=_config(),
+    result = service.recover_missed_open(
+        now=datetime(2026, 8, 27, 11, 25, tzinfo=CN_TZ)
     )
-    second = store.create(
-        name="保留模拟盘",
-        start_date=date(2026, 8, 26),
-        config=_config(),
+    current = service.account(account["id"])
+    event_types = {event["event_type"] for event in current["timeline"]}
+
+    assert result == {"missed": 1, "recovered": 1, "unknown": 0}
+    assert current["orders"][0]["status"] == "FILLED"
+    assert current["orders"][0]["execution_quality"] == "RECOVERED_LATE"
+    assert current["fills"][0]["quality"] == "RECOVERED_LATE"
+    assert "MISSED_EXECUTION" in event_types
+    assert "FILLED" in event_types
+    assert current["summary"]["critical_incident_count"] == 0
+
+
+def test_late_recovery_without_reliable_minute_data_stays_unknown(tmp_path):
+    service = _service(tmp_path)
+    account, _ = _account_with_buy_order(service)
+    market_quote = _quote(
+        symbol="000002.SZ", at=datetime(2026, 8, 27, 11, 25, tzinfo=CN_TZ)
+    )
+    service._quotes_from_cache = lambda: {"000002.SZ": market_quote}  # type: ignore[method-assign]
+
+    result = service.recover_missed_open(
+        now=datetime(2026, 8, 27, 11, 25, tzinfo=CN_TZ)
+    )
+    current = service.account(account["id"])
+
+    assert result == {"missed": 1, "recovered": 0, "unknown": 1}
+    assert current["orders"][0]["status"] == "UNKNOWN_MARKET_DATA"
+    assert current["orders"][0]["execution_quality"] == "NO_RELIABLE_OPEN_DATA"
+    assert current["fills"] == []
+
+
+def test_intraday_stop_on_same_day_buy_is_t1_locked_and_not_sold(tmp_path):
+    config = _config(exit_mode="intraday", overrides={"stop_loss": 0.05})
+    service = _service(tmp_path)
+    account, order_id = _account_with_buy_order(service, config=config)
+    service.ledger.assign_due_date(order_id, TRADE_DAY, {"market_observed": True})
+    service.ledger.execute_fill(
+        order_id, price=10, quantity=1_000, quote_at=OPEN_TIME, source="open_quote"
+    )
+    stop_time = datetime(2026, 8, 27, 10, 5, tzinfo=CN_TZ)
+
+    service.on_quote_records(
+        [{
+            "symbol": "000001.SZ",
+            "timestamp": stop_time,
+            "open": 9.4,
+            "high": 9.45,
+            "low": 9.35,
+            "close": 9.4,
+            "volume": 20_000,
+        }],
+        source="minute_k",
+    )
+    current = service.account(account["id"])
+
+    assert current["positions"][0]["pending_exit_reason"] == "stop_loss"
+    assert current["positions"][0]["pending_exit_date"] == "2026-08-27"
+    assert current["positions"][0]["available_qty"] == 0
+    assert current["positions"][0]["locked_qty"] == 1_000
+    assert len(current["fills"]) == 1
+    assert any(
+        event["event_type"] == "EXIT_TRIGGERED_T1_LOCKED"
+        for event in current["timeline"]
     )
 
-    deleted = store.delete(first["id"])
 
-    assert deleted["id"] == first["id"]
+def test_settlement_and_reconciliation_are_idempotent(tmp_path):
+    service = _service(tmp_path)
+    account, order_id = _account_with_buy_order(service)
+    service.ledger.assign_due_date(order_id, TRADE_DAY, {"market_observed": True})
+    service.ledger.execute_fill(
+        order_id, price=10, quantity=1_000, quote_at=OPEN_TIME, source="open_quote"
+    )
+    settlement_day = date(2026, 8, 28)
+
+    service.ledger.settle_account(account["id"], settlement_day, source="15:05_close")
+    service.ledger.settle_account(account["id"], settlement_day, source="15:05_close")
+    current = service.account(account["id"])
+
+    assert current["positions"][0]["hold_days"] == 1
+    assert len(current["nav"]) == 1
+    assert len([e for e in current["timeline"] if e["event_type"] == "ACCOUNT_SETTLED"]) == 1
+    assert current["reconciliation"]["ok"] is True
+
+
+def test_signal_day_without_orders_is_marked_once(tmp_path):
+    ledger = PaperLedger(tmp_path)
+    account = ledger.create_account(
+        name="空信号模拟盘", baseline_date=SIGNAL_DAY, config=_config()
+    )
+
+    ledger.mark_signal_day(account["id"], SIGNAL_DAY)
+    ledger.mark_signal_day(account["id"], SIGNAL_DAY)
+
+    assert ledger.get_account(account["id"])["last_processed_date"] == "2026-08-26"
+
+
+def test_delete_only_hides_selected_account_and_retains_audit_ledger(tmp_path):
+    store = PaperTradingStore(tmp_path)
+    first = store.create(name="待删除模拟盘", start_date=SIGNAL_DAY, config=_config())
+    second = store.create(name="保留模拟盘", start_date=SIGNAL_DAY, config=_config())
+
+    receipt = store.delete(first["id"])
+
+    assert receipt["id"] == first["id"]
     with pytest.raises(KeyError):
         store.get(first["id"])
     assert store.get(second["id"])["name"] == "保留模拟盘"
+    assert PaperLedger(tmp_path).account_row(
+        first["id"], include_deleted=True
+    )["status"] == "deleted"
 
 
-def test_delete_account_api_returns_receipt_and_missing_account_is_404(tmp_path):
-    request = SimpleNamespace(app=SimpleNamespace(state=SimpleNamespace(
-        repo=SimpleNamespace(store=SimpleNamespace(data_dir=tmp_path)),
-    )))
-    created = paper_trading.PaperTradingStore(tmp_path).create(
-        name="API 删除模拟盘",
-        start_date=date(2026, 8, 26),
-        config=_config(),
+def test_legacy_migration_keeps_snapshot_but_does_not_import_fake_fills(tmp_path):
+    legacy_root = tmp_path / "paper_trading" / "accounts"
+    legacy_root.mkdir(parents=True)
+    payload = {
+        "id": "legacy123456",
+        "name": "旧模拟盘",
+        "created_at": "2026-08-27T00:16:00+08:00",
+        "baseline_date": "2026-08-26",
+        "config": _config(),
+        "result": {
+            "trades": [{"symbol": "000001.SZ", "entry_price": 9.9}],
+            "pending_orders": [{
+                "symbol": "000001.SZ",
+                "name": "平安银行",
+                "signal_date": "2026-08-26",
+                "score": 70,
+                "status": "pending",
+            }],
+        },
+    }
+    (legacy_root / "legacy123456.json").write_text(
+        json.dumps(payload, ensure_ascii=False), encoding="utf-8"
     )
 
-    assert paper_api.delete_account(created["id"], request) == {
-        "ok": True,
-        "id": created["id"],
-        "name": "API 删除模拟盘",
-    }
+    account = _service(tmp_path).account("legacy123456")
+
+    assert len(account["orders"]) == 1
+    assert account["orders"][0]["status"] == "PLANNED"
+    assert account["fills"] == []
+    assert any(
+        event["event_type"] == "LEGACY_REPLAY_MIGRATED" for event in account["timeline"]
+    )
+
+
+def test_delete_account_api_targets_route_account_id(tmp_path):
+    state = SimpleNamespace(repo=FakeRepo(tmp_path))
+    request = SimpleNamespace(app=SimpleNamespace(state=state))
+    first = PaperTradingStore(tmp_path).create(
+        name="API 删除模拟盘", start_date=SIGNAL_DAY, config=_config()
+    )
+    second = PaperTradingStore(tmp_path).create(
+        name="API 保留模拟盘", start_date=SIGNAL_DAY, config=_config()
+    )
+
+    assert paper_api.delete_account(first["id"], request)["id"] == first["id"]
+    assert paper_api.get_account(second["id"], request)["id"] == second["id"]
     with pytest.raises(paper_api.HTTPException) as exc:
-        paper_api.delete_account(created["id"], request)
+        paper_api.delete_account(first["id"], request)
     assert exc.value.status_code == 404
 
 
-def test_api_creates_account_from_latest_complete_day(monkeypatch, tmp_path):
+def test_create_account_api_freezes_exit_mode_without_running_backtest(monkeypatch, tmp_path):
     monkeypatch.setattr(
-        paper_trading,
+        paper_api,
         "cn_now",
-        lambda: datetime(2026, 8, 26, 22, 0, tzinfo=CN_TZ),
+        lambda: datetime(2026, 8, 27, 10, 0, tzinfo=CN_TZ),
     )
     monkeypatch.setattr(
         paper_api.StrategyEngine,
         "validate_context",
         lambda *_args, **_kwargs: None,
     )
-    request = SimpleNamespace(app=SimpleNamespace(state=SimpleNamespace(
-        repo=SimpleNamespace(
-            store=SimpleNamespace(data_dir=tmp_path),
-            latest_enriched_date=lambda _asset_type: date(2026, 8, 26),
+    state = SimpleNamespace(
+        repo=FakeRepo(tmp_path),
+        strategy_engine=SimpleNamespace(
+            get=lambda _strategy_id: SimpleNamespace(name="新低反转")
         ),
-        strategy_engine=SimpleNamespace(get=lambda _strategy_id: object()),
-    )))
+        capabilities=SimpleNamespace(has=lambda _cap: False),
+    )
+    request = SimpleNamespace(app=SimpleNamespace(state=state))
 
     account = paper_api.create_account(
         paper_api.PaperTradingCreateRequest(
-            name="新低反转模拟盘",
+            name="API 事件账户",
             strategy_id="n_day_low_reversal",
             initial_capital=200_000,
+            exit_mode="eod",
         ),
         request,
     )
 
-    assert account["baseline_date"] == "2026-08-26"
-    assert account["signal_start_date"] == "2026-08-26"
-    assert account["start_date"] == "2026-08-26"
-    assert account["config"]["strategy_id"] == "n_day_low_reversal"
-    assert account["config"]["entry_fill"] == "open_t+1"
-    assert paper_api.list_accounts(request)["items"][0]["id"] == account["id"]
+    assert account["execution_policy"] == "event_driven"
+    assert account["config"]["exit_mode"] == "eod"
+    assert account["orders"] == []
 
 
-def test_manual_api_run_forces_sync_even_when_daily_run_is_paused(monkeypatch):
-    calls = []
-    expected = {"id": "abcdef123456", "status": "paused"}
+def test_intraday_account_requires_realtime_or_minute_capability(monkeypatch, tmp_path):
     monkeypatch.setattr(
-        paper_api,
-        "run_account",
-        lambda state, account_id, *, force: calls.append((state, account_id, force)) or expected,
+        paper_api.StrategyEngine,
+        "validate_context",
+        lambda *_args, **_kwargs: None,
     )
-    state = SimpleNamespace()
+    state = SimpleNamespace(
+        repo=FakeRepo(tmp_path),
+        strategy_engine=SimpleNamespace(get=lambda _strategy_id: object()),
+        capabilities=SimpleNamespace(has=lambda _cap: False),
+    )
     request = SimpleNamespace(app=SimpleNamespace(state=state))
 
-    assert paper_api.run_paper_account("abcdef123456", request) == expected
-    assert calls == [(state, "abcdef123456", True)]
+    with pytest.raises(paper_api.HTTPException) as exc:
+        paper_api.create_account(
+            paper_api.PaperTradingCreateRequest(
+                name="无行情盘中账户",
+                strategy_id="n_day_low_reversal",
+                exit_mode="intraday",
+            ),
+            request,
+        )
+
+    assert exc.value.status_code == 403
+    assert "实时行情或分钟行情" in exc.value.detail
 
 
-@pytest.mark.parametrize("field", ["entry_fill", "exit_fill"])
-def test_after_close_account_rejects_retroactive_close_fill(monkeypatch, tmp_path, field):
-    request = SimpleNamespace(app=SimpleNamespace(state=SimpleNamespace(
-        repo=SimpleNamespace(
-            store=SimpleNamespace(data_dir=tmp_path),
-            latest_enriched_date=lambda _asset_type: date(2026, 8, 26),
-        ),
-    )))
-    body = paper_api.PaperTradingCreateRequest(
-        name="不允许倒填",
-        strategy_id="n_day_low_reversal",
-        **{field: "close_t"},
+def test_create_api_requires_an_explicit_exit_mode():
+    with pytest.raises(ValidationError):
+        paper_api.PaperTradingCreateRequest(
+            name="未选择退出模式",
+            strategy_id="n_day_low_reversal",
+        )
+
+
+def test_direct_fill_refuses_sell_when_t1_locked(tmp_path):
+    service = _service(tmp_path)
+    account, buy_order = _account_with_buy_order(service)
+    service.ledger.assign_due_date(buy_order, TRADE_DAY, {})
+    service.ledger.execute_fill(
+        buy_order, price=10, quantity=1_000, quote_at=OPEN_TIME, source="open_quote"
     )
+    _, sell_order, _ = service.ledger.record_signal_and_order(
+        account_id=account["id"],
+        strategy_id="n_day_low_reversal",
+        symbol="000001.SZ",
+        name="平安银行",
+        side="SELL",
+        signal_date=TRADE_DAY,
+        score=None,
+        reason="stop_loss",
+        signal_ref=None,
+        requested_qty=1_000,
+        target_amount=9_400,
+        target_weight=0,
+        planned_session="NEXT_QUOTE",
+    )
+    service.ledger.assign_due_date(sell_order, TRADE_DAY, {})
 
-    with pytest.raises(paper_api.HTTPException, match="收盘") as exc:
-        paper_api.create_account(body, request)
+    with pytest.raises(PaperLedgerError, match="T\\+1"):
+        service.ledger.execute_fill(
+            sell_order,
+            price=9.4,
+            quantity=1_000,
+            quote_at=datetime(2026, 8, 27, 10, 5, tzinfo=CN_TZ),
+            source="minute_k",
+        )
 
-    assert exc.value.status_code == 400
+
+def test_soft_deleted_account_is_removed_from_quote_subscription(tmp_path):
+    service = _service(tmp_path)
+    account, _ = _account_with_buy_order(service)
+
+    assert service.subscription_symbols() == {"000001.SZ"}
+
+    service.ledger.delete_account(account["id"])
+
+    assert service.subscription_symbols() == set()

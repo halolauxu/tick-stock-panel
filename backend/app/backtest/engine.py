@@ -29,6 +29,11 @@ from app.config import settings
 from app.enriched_generation import EnrichedGenerationUnavailableError
 from app.parquet import scan_enriched_parquet
 from app.tickflow.repository import KlineRepository
+from app.trading_rules import (
+    TradingCostModel,
+    is_same_day_t_plus_one_locked,
+    is_same_price_bar,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -89,13 +94,18 @@ class MatcherConfig:
         return self.commission_pct if self.commission_pct is not None else self.fees_pct
 
     def buy_cost_pct(self) -> float:
-        # 买入腿: 佣金 + 滑点。
-        return self._commission_pct() + self.slippage_bps / 10000.0
+        return TradingCostModel(
+            commission_pct=self._commission_pct(),
+            stamp_tax_pct=self.stamp_tax_pct or 0.0,
+            slippage_bps=self.slippage_bps,
+        ).buy_cost_pct()
 
     def sell_cost_pct(self) -> float:
-        # 卖出腿: 佣金 + 印花税 + 滑点。印花税未设时为 0 (向后兼容)。
-        stamp = self.stamp_tax_pct if self.stamp_tax_pct is not None else 0.0
-        return self._commission_pct() + stamp + self.slippage_bps / 10000.0
+        return TradingCostModel(
+            commission_pct=self._commission_pct(),
+            stamp_tax_pct=self.stamp_tax_pct or 0.0,
+            slippage_bps=self.slippage_bps,
+        ).sell_cost_pct()
 
 
 @dataclass
@@ -907,7 +917,7 @@ class BacktestEngine:
             ]
             if not all(_valid_price(value) for value in prices):
                 return False
-            same = max(prices) - min(prices) <= max(abs(prices[3]) * 1e-4, 0.01)
+            same = is_same_price_bar(*prices)
             flags = matrix.limit_up_locked if direction == "up" else matrix.limit_down_locked
             return bool(flags[time_id, asset_id]) and same
 
@@ -1310,7 +1320,7 @@ class BacktestEngine:
             if not valid_bar:
                 return True
             if has_volume and float(volumes[idx] or 0) <= 0:
-                same_price = max(o, h, l, c) - min(o, h, l, c) <= max(abs(c) * 1e-4, 0.01)
+                same_price = is_same_price_bar(o, h, l, c)
                 if same_price:
                     return True
             return False
@@ -1324,7 +1334,7 @@ class BacktestEngine:
             c = float(close_prices[idx])
             if not all(_valid_price(x) for x in (o, h, l, c)):
                 return False
-            same_price = max(o, h, l, c) - min(o, h, l, c) <= max(abs(c) * 1e-4, 0.01)
+            same_price = is_same_price_bar(o, h, l, c)
             if direction == "up":
                 return bool(limit_up_flags[idx]) and same_price
             return bool(limit_down_flags[idx]) and same_price
@@ -1839,7 +1849,7 @@ class BacktestEngine:
             )
             if not all(_valid_price(value) for value in prices):
                 return False
-            same_price = max(prices) - min(prices) <= max(abs(prices[3]) * 1e-4, 0.01)
+            same_price = is_same_price_bar(*prices)
             flag = matrix.limit_up_locked if direction == "up" else matrix.limit_down_locked
             return bool(flag[time_id, asset_id]) and same_price
 
@@ -1937,7 +1947,9 @@ class BacktestEngine:
                 _signal_id(int(matrix.exit_signal_code[time_id, asset_id]), matrix.exit_signal_ids)
                 if reason == "signal" else None
             )
-            if config.enforce_t_plus_one and pos["entry_date"] == matrix.timestamp_labels[time_id][:10]:
+            if config.enforce_t_plus_one and is_same_day_t_plus_one_locked(
+                pos["entry_date"], matrix.timestamp_labels[time_id][:10]
+            ):
                 _mark_pending(asset_id, reason, signal_date, signal_id, next_open=True)
                 _count("sell_t_plus_one")
                 return False
@@ -2238,7 +2250,10 @@ class BacktestEngine:
                 "entry_score": round(float(pos["entry_score"]), 2),
                 "pending_exit_reason": pos.get("pending_exit_reason"),
                 "t_plus_one_locked": bool(
-                    config.enforce_t_plus_one and pos["entry_date"] == matrix.timestamp_labels[-1][:10]
+                    config.enforce_t_plus_one
+                    and is_same_day_t_plus_one_locked(
+                        pos["entry_date"], matrix.timestamp_labels[-1][:10]
+                    )
                 ),
                 "blocked_exit_days": int(pos.get("blocked_exit_days", 0)),
             })
@@ -2481,7 +2496,7 @@ class BacktestEngine:
             if not valid_bar:
                 return True
             if has_volume and float(volumes[idx] or 0) <= 0:
-                same_price = max(o, h, l, c) - min(o, h, l, c) <= max(abs(c) * 1e-4, 0.01)
+                same_price = is_same_price_bar(o, h, l, c)
                 if same_price:
                     return True
             return False
@@ -2495,7 +2510,7 @@ class BacktestEngine:
             c = float(close_prices[idx])
             if not all(_valid_price(x) for x in (o, h, l, c)):
                 return False
-            same_price = max(o, h, l, c) - min(o, h, l, c) <= max(abs(c) * 1e-4, 0.01)
+            same_price = is_same_price_bar(o, h, l, c)
             if direction == "up":
                 return bool(limit_up_flags[idx]) and same_price
             return bool(limit_down_flags[idx]) and same_price

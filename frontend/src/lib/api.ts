@@ -1359,8 +1359,152 @@ export interface PaperTradingConfig {
   position_sizing: 'equal' | 'score_weight'
   holding_days: number
   minute_fill: boolean
+  exit_mode: 'eod' | 'intraday'
   regime_filter?: Record<string, any> | null
   enforce_t_plus_one?: boolean
+}
+
+export interface PaperTradingSystem {
+  beijing_time: string
+  market_phase: 'CLOSED' | 'PRE_MARKET' | 'PREFLIGHT' | 'TRADING' | 'LUNCH_BREAK' | 'CLOSE_PENDING' | 'SETTLEMENT' | 'SIGNAL_SEAL'
+  quote_age_ms: number | null
+  quote_stale: boolean
+  quote_source_mode: string
+  quote_enabled: boolean
+  executor_health: 'HEALTHY' | 'DEGRADED' | 'ERROR'
+  tracked_symbol_count: number
+  open_incident_count: number
+  critical_incident_count: number
+  ledger_path: string
+}
+
+export interface PaperTradingSummary {
+  cash: number
+  market_value: number
+  equity: number
+  unrealized_pnl: number
+  today_pnl: number | null
+  today_pnl_available: boolean
+  total_return: number
+  exposure: number
+  position_count: number
+  pending_order_count: number
+  open_incident_count: number
+  critical_incident_count: number
+}
+
+export interface PaperTradingPosition {
+  account_id: string
+  symbol: string
+  name: string
+  quantity: number
+  available_qty: number
+  locked_qty: number
+  average_price: number
+  cost_basis: number
+  acquired_on: string
+  hold_days: number
+  max_price: number
+  last_price: number | null
+  market_value: number
+  unrealized_pnl: number
+  previous_close: number | null
+  day_pnl: number
+  pnl_date: string | null
+  today_bought_qty: number
+  today_bought_cost: number
+  quote_at: string | null
+  quote_source: string | null
+  pending_exit_reason: string | null
+  pending_exit_date: string | null
+}
+
+export interface PaperTradingOrder {
+  id: string
+  symbol: string
+  name: string
+  side: 'BUY' | 'SELL'
+  requested_qty: number
+  filled_qty: number
+  target_amount: number
+  planned_session: 'NEXT_OPEN' | 'NEXT_QUOTE'
+  scheduled_date: string | null
+  status: string
+  reason: string
+  execution_quality: string | null
+  created_at: string
+  terminal_at: string | null
+  signal_date: string
+  score: number | null
+  signal_reason: string
+  signal_ref: string | null
+  preflight: Record<string, any>
+}
+
+export interface PaperTradingFill {
+  id: string
+  order_id: string
+  symbol: string
+  side: 'BUY' | 'SELL'
+  quantity: number
+  price: number
+  gross_amount: number
+  fee_amount: number
+  cash_delta: number
+  executed_at: string
+  quote_at: string
+  source: string
+  quality: 'ON_TIME' | 'RECOVERED_LATE' | string
+  reference_price: number | null
+  day_pnl: number
+}
+
+export interface PaperTradingCashEntry {
+  id: string
+  event_type: string
+  amount: number
+  balance_after: number
+  reference_id: string
+  occurred_at: string
+  detail: string
+}
+
+export interface PaperTradingEvent {
+  id: string
+  event_type: string
+  occurred_at: string
+  trading_date: string | null
+  entity_type: string | null
+  entity_id: string | null
+  severity: 'info' | 'warning' | 'critical'
+  title: string
+  detail: string
+  payload: Record<string, any>
+}
+
+export interface PaperTradingIncident {
+  id: string
+  incident_key: string
+  code: string
+  severity: 'info' | 'warning' | 'critical'
+  status: 'open' | 'resolved'
+  opened_at: string
+  resolved_at: string | null
+  title: string
+  detail: string
+  entity_type: string | null
+  entity_id: string | null
+}
+
+export interface PaperTradingReconciliation {
+  ok: boolean
+  cash_ok: boolean
+  position_ok: boolean
+  ledger_cash: number
+  account_cash: number
+  expected_positions: Record<string, number>
+  actual_positions: Record<string, number>
+  checked_at: string
 }
 
 export interface PaperTradingAccount {
@@ -1373,10 +1517,9 @@ export interface PaperTradingAccount {
   start_date: string
   baseline_date?: string
   signal_start_date?: string
-  execution_policy?: 'after_close_daily'
-  activation_policy?: 'completed_baseline_or_next_forward_day'
+  execution_policy?: 'event_driven'
   execution_state?: {
-    code: 'waiting_first_data' | 'waiting_rebuild' | 'waiting_open' | 'waiting_exit' | 'holding' | 'scanning' | 'error'
+    code: 'waiting_open' | 'holding' | 'scanning' | 'error'
     label: string
     detail: string
     next_action: string
@@ -1385,7 +1528,17 @@ export interface PaperTradingAccount {
   last_run_at: string | null
   last_error: string | null
   config: PaperTradingConfig
-  result: StrategyBacktestResult | null
+  summary: PaperTradingSummary
+  positions: PaperTradingPosition[]
+  orders: PaperTradingOrder[]
+  fills: PaperTradingFill[]
+  cash_entries: PaperTradingCashEntry[]
+  timeline: PaperTradingEvent[]
+  incidents: PaperTradingIncident[]
+  nav: { trading_date: string; equity: number; cash: number; market_value: number }[]
+  system: PaperTradingSystem
+  reconciliation: PaperTradingReconciliation
+  result: StrategyBacktestResult
 }
 
 // ===== Settings =====
@@ -2452,7 +2605,7 @@ export const api = {
     }),
 
   paperAccounts: () =>
-    request<{ items: PaperTradingAccount[] }>('/api/paper-trading/accounts'),
+    request<{ items: PaperTradingAccount[]; system: PaperTradingSystem }>('/api/paper-trading/accounts'),
 
   paperAccountCreate: (payload: PaperTradingConfig & { name: string }) =>
     request<PaperTradingAccount>('/api/paper-trading/accounts', {
@@ -2478,6 +2631,11 @@ export const api = {
   paperAccountDelete: (id: string) =>
     request<{ ok: boolean; id: string; name: string }>(`/api/paper-trading/accounts/${encodeURIComponent(id)}`, {
       method: 'DELETE',
+    }),
+
+  paperAccountReconcile: (id: string) =>
+    request<PaperTradingReconciliation>(`/api/paper-trading/accounts/${encodeURIComponent(id)}/reconcile`, {
+      method: 'POST',
     }),
 
   pipelineRun: () => request<{ job_id: string; reused: boolean }>(
