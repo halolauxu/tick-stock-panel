@@ -162,6 +162,7 @@ class PaperTradingService:
         self.ledger = PaperLedger(self.repo.store.data_dir)
         self._lock = threading.RLock()
         self._recovery_fetch_last: dict[tuple[date, str], datetime] = {}
+        self._recovery_quote_fetch_last: datetime | None = None
         self._migrate_legacy_json()
 
     def _migrate_legacy_json(self) -> None:
@@ -927,6 +928,84 @@ class PaperTradingService:
                 observed.append(candidate)
         return min(observed) if observed else None
 
+    def _completed_day_opening_evidence(
+        self,
+        order: dict[str, Any],
+        trading_date: date,
+        current: datetime,
+        quotes: dict[str, dict[str, Any]],
+    ) -> dict[str, Any] | None:
+        """Fall back to completed-day OHLCV, matching the backtest open_t+1 contract."""
+        if trading_date == current.date():
+            quote = quotes.get(str(order["symbol"]))
+            quote_at = quote.get("_quote_dt") if quote else None
+            if (
+                current.time() < dt_time(15, 0)
+                or quote_at is None
+                or quote_at.date() != trading_date
+                or quote_at.time() < dt_time(15, 0)
+            ):
+                return None
+            values = {
+                "open": quote.get("open"),
+                "high": quote.get("high"),
+                "low": quote.get("low"),
+                "close": quote.get("last_price"),
+                "volume": quote.get("volume"),
+            }
+            if not all(_valid_price(values[key]) for key in ("open", "high", "low", "close")):
+                return None
+            if values["volume"] in (None, 0):
+                return None
+            return {
+                "symbol": str(order["symbol"]),
+                "datetime": quote_at,
+                **values,
+                "prev_close": quote.get("prev_close"),
+                "_recovery_source": "realtime_close_snapshot_open_recovery",
+            }
+
+        account = self.ledger.get_account(order["account_id"])
+        frame = self.repo.get_daily_asset(
+            str(account["config"].get("asset_type", "stock")),
+            str(order["symbol"]),
+            trading_date,
+            trading_date,
+            [
+                "date", "raw_open", "raw_high", "raw_low", "raw_close", "raw_volume",
+                "open", "high", "low", "close", "volume", "prev_close",
+            ],
+        )
+        if frame.is_empty():
+            return None
+        row = frame.row(-1, named=True)
+        row_date = row.get("date")
+        if row_date is not None and str(row_date)[:10] != trading_date.isoformat():
+            return None
+
+        def daily_value(key: str) -> Any:
+            raw = row.get(f"raw_{key}")
+            return raw if raw is not None else row.get(key)
+
+        values = {
+            "open": daily_value("open"),
+            "high": daily_value("high"),
+            "low": daily_value("low"),
+            "close": daily_value("close"),
+            "volume": daily_value("volume"),
+        }
+        if not all(_valid_price(values[key]) for key in ("open", "high", "low", "close")):
+            return None
+        if values["volume"] in (None, 0):
+            return None
+        return {
+            "symbol": str(order["symbol"]),
+            "datetime": datetime.combine(trading_date, dt_time(15, 0), tzinfo=CN_TZ),
+            **values,
+            "prev_close": row.get("prev_close"),
+            "_recovery_source": "daily_close_snapshot_open_recovery",
+        }
+
     def _promote_historical_misses(self, current_date: date) -> int:
         """Freeze the original due session instead of shifting orders to deployment day."""
         promoted = 0
@@ -982,20 +1061,29 @@ class PaperTradingService:
         with self._lock:
             quotes = self._quotes_from_cache()
             symbols = sorted(self.subscription_symbols())
-            if not quotes and symbols:
+            missing_current_quotes = [
+                symbol for symbol in symbols
+                if symbol not in quotes
+                or quotes[symbol].get("_quote_dt") is None
+                or quotes[symbol]["_quote_dt"].date() != current.date()
+            ]
+            quote_retry_due = (
+                self._recovery_quote_fetch_last is None
+                or (current - self._recovery_quote_fetch_last).total_seconds() >= 300
+            )
+            if missing_current_quotes and quote_retry_due:
                 quote_service = getattr(self.app_state, "quote_service", None)
                 if quote_service is not None:
+                    self._recovery_quote_fetch_last = current
                     try:
-                        refresh = getattr(
-                            quote_service, "refresh_paper_symbols", quote_service.refresh
-                        )
+                        refresh = getattr(quote_service, "refresh_paper_symbols", None)
+                        if refresh is None:
+                            refresh = quote_service.refresh
                         fetched = refresh()
                         records = fetched.get("records", []) if isinstance(fetched, dict) else []
-                        quotes = _quote_map(records, source="realtime_recovery")
+                        quotes.update(_quote_map(records, source="realtime_recovery"))
                     except Exception:
                         logger.exception("paper recovery quote refresh failed")
-                    if not quotes:
-                        quotes = self._quotes_from_cache()
 
             current_minutes = (
                 self._opening_minutes(
@@ -1092,6 +1180,15 @@ class PaperTradingService:
                     minute = minute_by_symbol.get(str(order["symbol"]))
                     if minute is None:
                         minute = self._remote_opening_minute(order, trading_date, current)
+                        if minute is not None:
+                            minute_by_symbol[str(order["symbol"])] = minute
+                    if minute is None:
+                        minute = self._completed_day_opening_evidence(
+                            order,
+                            trading_date,
+                            current,
+                            quotes,
+                        )
                         if minute is not None:
                             minute_by_symbol[str(order["symbol"])] = minute
                     reliable = minute is not None and all(

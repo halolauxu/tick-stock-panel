@@ -47,9 +47,15 @@ def _config(**overrides) -> dict:
 
 
 class FakeRepo:
-    def __init__(self, data_dir, minute_rows: list[dict] | None = None) -> None:
+    def __init__(
+        self,
+        data_dir,
+        minute_rows: list[dict] | None = None,
+        daily_rows: list[dict] | None = None,
+    ) -> None:
         self.store = SimpleNamespace(data_dir=data_dir)
         self.minute_rows = minute_rows or []
+        self.daily_rows = daily_rows or []
 
     @staticmethod
     def latest_enriched_date(_asset_type: str) -> date:
@@ -68,20 +74,31 @@ class FakeRepo:
         ]
         return pl.DataFrame(rows)
 
-    @staticmethod
     def get_daily_asset(
+        self,
         _asset_type: str,
-        _symbol: str,
-        _start: date,
-        _end: date,
+        symbol: str,
+        start: date,
+        end: date,
         _columns: list[str],
     ) -> pl.DataFrame:
+        rows = [
+            row for row in self.daily_rows
+            if row.get("symbol") == symbol and start <= row.get("date") <= end
+        ]
+        if rows:
+            return pl.DataFrame(rows)
         return pl.DataFrame({"raw_close": [10.0], "close": [10.0]})
 
 
-def _service(tmp_path, *, minute_rows: list[dict] | None = None) -> PaperTradingService:
+def _service(
+    tmp_path,
+    *,
+    minute_rows: list[dict] | None = None,
+    daily_rows: list[dict] | None = None,
+) -> PaperTradingService:
     return PaperTradingService(
-        SimpleNamespace(repo=FakeRepo(tmp_path, minute_rows))
+        SimpleNamespace(repo=FakeRepo(tmp_path, minute_rows, daily_rows))
     )
 
 
@@ -477,6 +494,63 @@ def test_late_recovery_without_reliable_minute_data_stays_unknown(tmp_path):
     assert current["fills"] == []
 
 
+def test_completed_day_quote_recovers_open_fill_even_with_other_cached_quotes(tmp_path):
+    service = _service(tmp_path)
+    account, _ = _account_with_buy_order(service)
+    other = _quote(
+        symbol="000002.SZ",
+        at=datetime(2026, 8, 27, 15, 0, 5, tzinfo=CN_TZ),
+    )
+    service._quotes_from_cache = lambda: {"000002.SZ": other}  # type: ignore[method-assign]
+    refresh_calls: list[str] = []
+    service.app_state.quote_service = SimpleNamespace(
+        refresh_paper_symbols=lambda: refresh_calls.append("paper") or {
+            "records": [{
+                "symbol": "000001.SZ",
+                "timestamp": datetime(2026, 8, 27, 15, 0, 4, tzinfo=CN_TZ),
+                "open": 10.0,
+                "high": 10.4,
+                "low": 9.8,
+                "last_price": 10.2,
+                "prev_close": 9.9,
+                "volume": 88_000,
+            }],
+        },
+        refresh=lambda: {},
+        status=lambda: {"quote_age_ms": 0, "mode": "paper", "enabled": True},
+    )
+
+    result = service.recover_missed_open(
+        now=datetime(2026, 8, 27, 16, 5, tzinfo=CN_TZ)
+    )
+    current = service.account(account["id"])
+
+    assert refresh_calls == ["paper"]
+    assert result["recovered"] == 1
+    assert current["fills"][0]["price"] == 10.0
+    assert current["fills"][0]["source"] == (
+        "realtime_close_snapshot_open_recovery"
+    )
+    assert current["orders"][0]["execution_quality"] == "RECOVERED_LATE"
+
+
+def test_intraday_snapshot_does_not_masquerade_as_completed_open_evidence(tmp_path):
+    service = _service(tmp_path)
+    account, _ = _account_with_buy_order(service)
+    current_quote = _quote(at=datetime(2026, 8, 27, 11, 25, tzinfo=CN_TZ))
+    service._quotes_from_cache = lambda: {"000001.SZ": current_quote}  # type: ignore[method-assign]
+
+    result = service.recover_missed_open(
+        now=datetime(2026, 8, 27, 11, 25, tzinfo=CN_TZ)
+    )
+    current = service.account(account["id"])
+
+    assert result["waiting_evidence"] == 1
+    assert result["recovered"] == 0
+    assert current["orders"][0]["status"] == "UNKNOWN_MARKET_DATA"
+    assert current["fills"] == []
+
+
 def test_unknown_order_is_reconciled_when_opening_evidence_arrives_later(tmp_path):
     service = _service(tmp_path)
     account, _ = _account_with_buy_order(service)
@@ -594,6 +668,41 @@ def test_full_day_downtime_keeps_original_next_session_instead_of_deployment_day
         and event["trading_date"] == "2026-08-27"
         for event in current["timeline"]
     )
+
+
+def test_historical_daily_ohlcv_recovers_without_full_market_minute_partition(
+    tmp_path, monkeypatch
+):
+    service = _service(tmp_path)
+    account, _ = _account_with_buy_order(service)
+    daily_partition = tmp_path / "kline_daily" / "date=2026-08-27"
+    daily_partition.mkdir(parents=True)
+    (daily_partition / "part.parquet").touch()
+    next_day = datetime(2026, 8, 28, 8, 0, tzinfo=CN_TZ)
+    monkeypatch.setattr("app.services.paper_ledger.cn_now", lambda: next_day)
+    restarted = _service(
+        tmp_path,
+        daily_rows=[{
+            "symbol": "000001.SZ",
+            "date": TRADE_DAY,
+            "raw_open": 10.0,
+            "raw_high": 10.4,
+            "raw_low": 9.8,
+            "raw_close": 10.2,
+            "raw_volume": 88_000,
+            "prev_close": 9.9,
+        }],
+    )
+
+    result = restarted.recover_missed_open(now=next_day)
+    current = restarted.account(account["id"])
+
+    assert result["missed"] == 1
+    assert result["recovered"] == 1
+    assert current["fills"][0]["price"] == 10.0
+    assert current["fills"][0]["source"] == "daily_close_snapshot_open_recovery"
+    assert current["positions"][0]["available_qty"] == 1_000
+    assert current["positions"][0]["locked_qty"] == 0
 
 
 def test_unknown_order_only_allows_compensating_late_fill(tmp_path):
