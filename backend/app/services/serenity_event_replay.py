@@ -455,6 +455,8 @@ def collect_research_prices(store: EventReplayStore, data_dir: Path) -> dict[str
             else:
                 rejected_by_symbol[symbol] += 1
     inserted = failures = 0
+    all_values: list[list[Any]] = []
+    status_values: list[list[Any]] = []
     for symbol, asset_type in remaining:
         values = values_by_symbol.get(symbol, [])
         status = "ok" if values else "empty"
@@ -464,17 +466,28 @@ def collect_research_prices(store: EventReplayStore, data_dir: Path) -> dict[str
             else None
         )
         if values:
-            store.connection.executemany(
-                "INSERT OR REPLACE INTO research_daily_prices VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                values,
-            )
+            all_values.extend(values)
             inserted += len(values)
         else:
             failures += 1
-        store.connection.execute(
-            "INSERT OR REPLACE INTO price_collection_status VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-            [symbol, asset_type, start, end, len(values), status, error, datetime.now()],
+        status_values.append(
+            [symbol, asset_type, start, end, len(values), status, error, datetime.now()]
         )
+    store.connection.execute("BEGIN TRANSACTION")
+    try:
+        if all_values:
+            store.connection.executemany(
+                "INSERT OR REPLACE INTO research_daily_prices VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                all_values,
+            )
+        store.connection.executemany(
+            "INSERT OR REPLACE INTO price_collection_status VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            status_values,
+        )
+        store.connection.execute("COMMIT")
+    except Exception:
+        store.connection.execute("ROLLBACK")
+        raise
     return {"queried": len(remaining), "inserted_rows": inserted, "failures": failures}
 
 
@@ -506,13 +519,10 @@ def collect_event_metadata(store: EventReplayStore) -> dict[str, Any]:
                     [company["symbol"], start, end, str(exc)[:300], datetime.now()],
                 )
                 continue
+            announcement_values: list[list[Any]] = []
+            candidate_values: list[list[Any]] = []
             for item in rows:
-                discovered += 1
-                store.connection.execute(
-                    """
-                    INSERT OR IGNORE INTO announcements VALUES
-                    (?, ?, ?, ?, ?, ?, 'discovered', NULL, ?)
-                    """,
+                announcement_values.append(
                     [
                         item["announcement_id"],
                         company["symbol"],
@@ -521,12 +531,11 @@ def collect_event_metadata(store: EventReplayStore) -> dict[str, Any]:
                         item["pdf_url"],
                         item["announced_size_kb"],
                         datetime.now(),
-                    ],
+                    ]
                 )
                 classification = classify_event_title(item["title"])
                 if classification is None:
                     continue
-                candidates += 1
                 metadata_hash = _stable_hash(
                     item["announcement_id"],
                     company["symbol"],
@@ -534,11 +543,7 @@ def collect_event_metadata(store: EventReplayStore) -> dict[str, Any]:
                     item["title"],
                     item["pdf_url"],
                 )
-                store.connection.execute(
-                    """
-                    INSERT OR IGNORE INTO event_candidates VALUES
-                    (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?, ?)
-                    """,
+                candidate_values.append(
                     [
                         item["announcement_id"],
                         item["announcement_id"],
@@ -551,19 +556,47 @@ def collect_event_metadata(store: EventReplayStore) -> dict[str, Any]:
                         metadata_hash,
                         classification["status"],
                         datetime.now(),
+                    ]
+                )
+            try:
+                store.connection.execute("BEGIN TRANSACTION")
+                if announcement_values:
+                    store.connection.executemany(
+                        """
+                        INSERT OR IGNORE INTO announcements VALUES
+                        (?, ?, ?, ?, ?, ?, 'discovered', NULL, ?)
+                        """,
+                        announcement_values,
+                    )
+                if candidate_values:
+                    store.connection.executemany(
+                        """
+                        INSERT OR IGNORE INTO event_candidates VALUES
+                        (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?, ?)
+                        """,
+                        candidate_values,
+                    )
+                store.connection.execute(
+                    "INSERT OR REPLACE INTO announcement_collection_status VALUES (?, ?, ?, ?, ?, NULL, ?)",
+                    [
+                        company["symbol"],
+                        start,
+                        end,
+                        len(rows),
+                        "ok" if rows else "empty",
+                        datetime.now(),
                     ],
                 )
-            store.connection.execute(
-                "INSERT OR REPLACE INTO announcement_collection_status VALUES (?, ?, ?, ?, ?, NULL, ?)",
-                [
-                    company["symbol"],
-                    start,
-                    end,
-                    len(rows),
-                    "ok" if rows else "empty",
-                    datetime.now(),
-                ],
-            )
+                store.connection.execute("COMMIT")
+                discovered += len(announcement_values)
+                candidates += len(candidate_values)
+            except Exception as exc:
+                store.connection.execute("ROLLBACK")
+                failures += 1
+                store.connection.execute(
+                    "INSERT OR REPLACE INTO announcement_collection_status VALUES (?, ?, ?, 0, 'failed', ?, ?)",
+                    [company["symbol"], start, end, str(exc)[:300], datetime.now()],
+                )
         return {
             "queried_companies": len(companies),
             "query_failures": failures,
@@ -637,30 +670,43 @@ def collect_event_documents(
                     )
                     continue
                 metrics, facts = analyze_pdf(pdf_path, text_path, event_id)
-                store.connection.execute(
-                    "INSERT INTO document_metrics VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                    [
-                        metrics["announcement_id"], metrics["sha256"], metrics["pages"],
-                        metrics["pdf_bytes"], metrics["embedded_text_bytes"],
-                        metrics["extracted_text_bytes"], metrics["ocr_text_bytes"],
-                        metrics["ocr_pages"], metrics["low_text_pages"],
-                        metrics["rendered_png_bytes"], metrics["persistent_inflation_pct"],
-                        metrics["ocr_render_multiplier"], metrics["fact_count"],
-                        metrics["parse_status"], metrics["measured_at"],
-                    ],
-                )
-                if facts:
-                    store.connection.executemany(
-                        "INSERT OR IGNORE INTO evidence_facts VALUES (?, ?, ?, ?, ?, ?)",
-                        [[
-                            fact["fact_id"], fact["announcement_id"], fact["page_number"],
-                            fact["category"], fact["evidence_sentence"], fact["review_status"],
-                        ] for fact in facts],
+                store.connection.execute("BEGIN TRANSACTION")
+                try:
+                    store.connection.execute(
+                        "INSERT INTO document_metrics VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                        [
+                            metrics["announcement_id"], metrics["sha256"], metrics["pages"],
+                            metrics["pdf_bytes"], metrics["embedded_text_bytes"],
+                            metrics["extracted_text_bytes"], metrics["ocr_text_bytes"],
+                            metrics["ocr_pages"], metrics["low_text_pages"],
+                            metrics["rendered_png_bytes"], metrics["persistent_inflation_pct"],
+                            metrics["ocr_render_multiplier"], metrics["fact_count"],
+                            metrics["parse_status"], metrics["measured_at"],
+                        ],
                     )
-                store.connection.execute(
-                    "UPDATE announcements SET status='measured', error=NULL WHERE announcement_id=?",
-                    [event_id],
-                )
+                    if facts:
+                        store.connection.executemany(
+                            "INSERT OR IGNORE INTO evidence_facts VALUES (?, ?, ?, ?, ?, ?)",
+                            [
+                                [
+                                    fact["fact_id"],
+                                    fact["announcement_id"],
+                                    fact["page_number"],
+                                    fact["category"],
+                                    fact["evidence_sentence"],
+                                    fact["review_status"],
+                                ]
+                                for fact in facts
+                            ],
+                        )
+                    store.connection.execute(
+                        "UPDATE announcements SET status='measured', error=NULL WHERE announcement_id=?",
+                        [event_id],
+                    )
+                    store.connection.execute("COMMIT")
+                except Exception:
+                    store.connection.execute("ROLLBACK")
+                    raise
                 current_docs += 1
                 current_bytes += size
                 per_symbol[symbol] = int(per_symbol.get(symbol, 0)) + 1
