@@ -1017,6 +1017,28 @@ class PaperLedger:
         with self._connect() as conn:
             return conn.execute(sql, params).fetchall()
 
+    def accounts_needing_settlement_restatement(self, trading_date: date) -> set[str]:
+        """Accounts whose same-day settlement predates a recovered-late fill."""
+        day = trading_date.isoformat()
+        with self._connect() as conn:
+            rows = conn.execute(
+                """SELECT DISTINCT f.account_id
+                    FROM fills f
+                    JOIN accounts a ON a.id=f.account_id AND a.status!='deleted'
+                    WHERE f.quality='RECOVERED_LATE'
+                    AND substr(f.quote_at,1,10)=?
+                    AND EXISTS (
+                        SELECT 1 FROM nav_snapshots n
+                        WHERE n.account_id=f.account_id AND n.trading_date=?
+                    )
+                    AND f.executed_at > (
+                        SELECT max(n.captured_at) FROM nav_snapshots n
+                        WHERE n.account_id=f.account_id AND n.trading_date=?
+                    )""",
+                (day, day, day),
+            ).fetchall()
+        return {str(row[0]) for row in rows}
+
     def tracked_symbols(self) -> set[str]:
         with self._connect() as conn:
             rows = conn.execute(
@@ -1217,7 +1239,14 @@ class PaperLedger:
             )
         return result
 
-    def settle_account(self, account_id: str, trading_date: date, *, source: str) -> dict[str, Any]:
+    def settle_account(
+        self,
+        account_id: str,
+        trading_date: date,
+        *,
+        source: str,
+        restatement: bool = False,
+    ) -> dict[str, Any]:
         now = _now_text()
         with self.transaction() as conn:
             account = conn.execute("SELECT * FROM accounts WHERE id=?", (account_id,)).fetchone()
@@ -1255,14 +1284,18 @@ class PaperLedger:
             )
             self._event(
                 conn,
-                event_key=f"{account_id}:SETTLED:{trading_date.isoformat()}",
+                event_key=(
+                    f"{account_id}:SETTLEMENT_RESTATED:{trading_date.isoformat()}"
+                    if restatement
+                    else f"{account_id}:SETTLED:{trading_date.isoformat()}"
+                ),
                 account_id=account_id,
-                event_type="ACCOUNT_SETTLED",
+                event_type=("SETTLEMENT_RESTATED" if restatement else "ACCOUNT_SETTLED"),
                 occurred_at=now,
                 trading_date=trading_date.isoformat(),
                 entity_type="account",
                 entity_id=account_id,
-                title="收盘结算完成",
+                title=("延迟成交后重述收盘结算" if restatement else "收盘结算完成"),
                 detail=f"权益 {equity:.2f}, 现金 {float(account['cash_balance']):.2f}",
             )
         return self.get_account(account_id)

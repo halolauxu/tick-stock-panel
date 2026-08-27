@@ -497,6 +497,7 @@ def test_late_recovery_without_reliable_minute_data_stays_unknown(tmp_path):
 def test_completed_day_quote_recovers_open_fill_even_with_other_cached_quotes(tmp_path):
     service = _service(tmp_path)
     account, _ = _account_with_buy_order(service)
+    service.ledger.settle_account(account["id"], TRADE_DAY, source="15:05_close")
     other = _quote(
         symbol="000002.SZ",
         at=datetime(2026, 8, 27, 15, 0, 5, tzinfo=CN_TZ),
@@ -532,6 +533,14 @@ def test_completed_day_quote_recovers_open_fill_even_with_other_cached_quotes(tm
         "realtime_close_snapshot_open_recovery"
     )
     assert current["orders"][0]["execution_quality"] == "RECOVERED_LATE"
+    assert len(current["nav"]) == 1
+    assert current["nav"][0]["equity"] == pytest.approx(
+        current["summary"]["equity"]
+    )
+    assert any(
+        event["event_type"] == "SETTLEMENT_RESTATED"
+        for event in current["timeline"]
+    )
 
 
 def test_intraday_snapshot_does_not_masquerade_as_completed_open_evidence(tmp_path):

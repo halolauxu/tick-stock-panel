@@ -1064,6 +1064,7 @@ class PaperTradingService:
         if current.time() < OPEN_DEADLINE and not existing_recovery:
             return result
         with self._lock:
+            recovered_accounts: set[str] = set()
             quotes = self._quotes_from_cache()
             symbols = sorted(self.subscription_symbols())
             current_recovery_symbols = {
@@ -1305,6 +1306,7 @@ class PaperTradingService:
                                 source=str(current_quote.get("source") or "recovery_mark"),
                             )
                         result["recovered"] += 1
+                        recovered_accounts.add(str(order["account_id"]))
                     except Exception as exc:
                         self.ledger.terminal_order(
                             order["id"],
@@ -1313,6 +1315,17 @@ class PaperTradingService:
                             quality="RECOVERED_LATE",
                         )
                         result["resolved"] += 1
+            if current.time() >= SETTLEMENT_TIME:
+                recovered_accounts.update(
+                    self.ledger.accounts_needing_settlement_restatement(current.date())
+                )
+                for account_id in sorted(recovered_accounts):
+                    self.ledger.settle_account(
+                        account_id,
+                        current.date(),
+                        source="15:05_close",
+                        restatement=True,
+                    )
         return result
 
     def sync_account(self, account_id: str) -> dict[str, Any]:
