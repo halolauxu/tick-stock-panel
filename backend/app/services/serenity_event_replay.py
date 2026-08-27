@@ -37,6 +37,7 @@ from app.services.serenity_pilot import (
 
 EVENT_REPLAY_VERSION = "1.0.0"
 EVENT_HORIZONS = (2, 3, 5, 10)
+TRAINING_FRACTION = 2 / 3
 DEFAULT_EVENT_COST_BPS = 20.0
 DEFAULT_MAX_EVENT_DOCUMENTS = 600
 DEFAULT_MAX_EVENT_DOCUMENTS_PER_COMPANY = 10
@@ -262,6 +263,7 @@ def initialize_event_replay(
                 "benchmark": DEFAULT_BENCHMARK,
                 "title_classification_is_trade_signal": False,
                 "model_review_required_for_trade_signal": True,
+                "validation": "chronological_first_two_thirds_train_last_third_validate",
             },
             "qualification": {
                 "status": "RETROSPECTIVE_EVENT_DISCOVERY_NOT_ALPHA",
@@ -415,7 +417,12 @@ def collect_research_prices(store: EventReplayStore, data_dir: Path) -> dict[str
     }
     remaining = [(symbol, kind) for symbol, kind in targets if symbol not in already_complete]
     if not remaining:
-        return {"queried": 0, "inserted_rows": 0, "failures": 0}
+        return {
+            "queried": 0,
+            "inserted_rows": 0,
+            "failures": 0,
+            "validation_split": freeze_validation_split(store),
+        }
     stock_symbols = [symbol for symbol, kind in remaining if kind == "stock"]
     raw_rows: list[tuple[str, list[dict[str, Any]]]] = []
     if stock_symbols:
@@ -488,7 +495,42 @@ def collect_research_prices(store: EventReplayStore, data_dir: Path) -> dict[str
     except Exception:
         store.connection.execute("ROLLBACK")
         raise
-    return {"queried": len(remaining), "inserted_rows": inserted, "failures": failures}
+    return {
+        "queried": len(remaining),
+        "inserted_rows": inserted,
+        "failures": failures,
+        "validation_split": freeze_validation_split(store),
+    }
+
+
+def freeze_validation_split(store: EventReplayStore) -> dict[str, Any]:
+    calendar = [
+        row[0]
+        for row in store.connection.execute(
+            "SELECT date FROM research_daily_prices WHERE symbol=? ORDER BY date",
+            [DEFAULT_BENCHMARK],
+        ).fetchall()
+    ]
+    if len(calendar) < 3:
+        raise RuntimeError("at least three benchmark sessions are required for validation split")
+    training_sessions = max(1, min(len(calendar) - 1, int(len(calendar) * TRAINING_FRACTION)))
+    split = {
+        "method": "CHRONOLOGICAL_FIRST_TWO_THIRDS_TRAIN_LAST_THIRD_VALIDATE",
+        "calendar_hash": _stable_hash(*[value.isoformat() for value in calendar]),
+        "training_start": calendar[0].isoformat(),
+        "training_end": calendar[training_sessions - 1].isoformat(),
+        "training_sessions": training_sessions,
+        "validation_start": calendar[training_sessions].isoformat(),
+        "validation_end": calendar[-1].isoformat(),
+        "validation_sessions": len(calendar) - training_sessions,
+    }
+    existing = store.get_meta("validation_split")
+    if existing and existing != split:
+        raise RuntimeError("frozen validation split conflicts with current local calendar")
+    if not existing:
+        store.set_meta("validation_split", split)
+        _atomic_json(store.root / "validation-split.json", split)
+    return split
 
 
 def collect_event_metadata(store: EventReplayStore) -> dict[str, Any]:
@@ -1019,6 +1061,17 @@ def persist_model_review(
 
 def build_event_report(store: EventReplayStore) -> dict[str, Any]:
     manifest = store.get_meta("event_manifest")
+    validation_split = store.get_meta("validation_split")
+    if not validation_split:
+        benchmark_rows = store.connection.execute(
+            "SELECT count(*) FROM research_daily_prices WHERE symbol=?",
+            [DEFAULT_BENCHMARK],
+        ).fetchone()[0]
+        validation_split = (
+            freeze_validation_split(store)
+            if benchmark_rows >= 3
+            else {"status": "PENDING_PRICE_COLLECTION"}
+        )
     totals = store.connection.execute(
         """
         SELECT count(*),
@@ -1076,14 +1129,37 @@ def build_event_report(store: EventReplayStore) -> dict[str, Any]:
         SELECT primary_event_type, horizon, count(*), avg(net_return), median(net_return),
                stddev_samp(net_return), avg(CASE WHEN net_return > 0 THEN 1.0 ELSE 0.0 END),
                avg(net_return-benchmark_return), avg(net_return-chain_return),
-               min(mae), max(mfe)
+               min(mae), max(mfe),
+               CASE WHEN count(*) > 1 AND stddev_samp(net_return) > 0
+                    THEN avg(net_return) / stddev_samp(net_return) * sqrt(count(*))
+                    ELSE NULL END
         FROM event_discovery_outcomes WHERE status='SETTLED'
         GROUP BY primary_event_type, horizon ORDER BY primary_event_type, horizon
         """
     ).fetchall()
+    split_outcome_rows = []
+    if validation_split.get("validation_start"):
+        validation_start = date.fromisoformat(validation_split["validation_start"])
+        split_outcome_rows = store.connection.execute(
+            """
+            SELECT CASE WHEN decision_date < ? THEN 'TRAIN' ELSE 'VALIDATION' END AS sample,
+                   primary_event_type, horizon, count(*), avg(net_return), median(net_return),
+                   stddev_samp(net_return), avg(CASE WHEN net_return > 0 THEN 1.0 ELSE 0.0 END),
+                   avg(net_return-benchmark_return), avg(net_return-chain_return),
+                   min(mae), max(mfe),
+                   CASE WHEN count(*) > 1 AND stddev_samp(net_return) > 0
+                        THEN avg(net_return) / stddev_samp(net_return) * sqrt(count(*))
+                        ELSE NULL END
+            FROM event_discovery_outcomes WHERE status='SETTLED'
+            GROUP BY sample, primary_event_type, horizon
+            ORDER BY sample, primary_event_type, horizon
+            """,
+            [validation_start],
+        ).fetchall()
     report = {
         "replay_id": manifest.get("replay_id"),
         "period": {"start": manifest.get("start_date"), "end": manifest.get("end_date")},
+        "validation_split": validation_split,
         "universe_size": manifest.get("universe_size"),
         "events": {
             "total": int(totals[0]),
@@ -1118,8 +1194,20 @@ def build_event_report(store: EventReplayStore) -> dict[str, Any]:
                 "standard_deviation": row[5], "win_rate": row[6],
                 "mean_alpha_vs_csi300": row[7], "mean_alpha_vs_chain": row[8],
                 "worst_mae": row[9], "best_mfe": row[10],
+                "mean_return_t_stat": row[11],
             }
             for row in outcome_rows
+        ],
+        "discovery_event_study_by_split": [
+            {
+                "sample": row[0], "event_type": row[1], "horizon": int(row[2]),
+                "observations": int(row[3]), "mean_net_return": row[4],
+                "median_net_return": row[5], "standard_deviation": row[6],
+                "win_rate": row[7], "mean_alpha_vs_csi300": row[8],
+                "mean_alpha_vs_chain": row[9], "worst_mae": row[10],
+                "best_mfe": row[11], "mean_return_t_stat": row[12],
+            }
+            for row in split_outcome_rows
         ],
         "trade_signals": store.connection.execute("SELECT count(*) FROM event_signals").fetchone()[0],
         "model_reviews": store.connection.execute("SELECT count(*) FROM event_model_reviews").fetchone()[0],

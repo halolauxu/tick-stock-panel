@@ -225,7 +225,7 @@ def test_local_one_year_prices_are_reused_and_collection_is_idempotent(
     finally:
         source.close()
     data_dir = tmp_path / "data"
-    days = [date(2025, 8, 26), date(2026, 8, 26)]
+    days = [date(2025, 8, 26), date(2026, 2, 26), date(2026, 8, 26)]
     for day_index, day in enumerate(days):
         stock_partition = data_dir / "kline_daily_enriched" / f"date={day}"
         stock_partition.mkdir(parents=True)
@@ -271,9 +271,16 @@ def test_local_one_year_prices_are_reused_and_collection_is_idempotent(
             "SELECT count(*), count(*) FILTER (WHERE status='ok') FROM price_collection_status"
         ).fetchone()
 
-        assert (start, end) == (days[0], days[1])
-        assert first == {"queried": 101, "inserted_rows": 202, "failures": 0}
-        assert second == {"queried": 0, "inserted_rows": 0, "failures": 0}
+        assert (start, end) == (days[0], days[-1])
+        assert first["queried"] == 101
+        assert first["inserted_rows"] == 303
+        assert first["failures"] == 0
+        assert first["validation_split"]["training_sessions"] == 2
+        assert first["validation_split"]["validation_sessions"] == 1
+        assert second["queried"] == 0
+        assert second["inserted_rows"] == 0
+        assert second["failures"] == 0
+        assert second["validation_split"] == first["validation_split"]
         assert coverage == (101, 101)
     finally:
         store.close()
