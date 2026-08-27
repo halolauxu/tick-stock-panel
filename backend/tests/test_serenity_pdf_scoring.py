@@ -21,6 +21,7 @@ from app.services.serenity_pdf_scoring import (
     compute_full_score,
     execute_cached_call,
     initialize_semantic_tables,
+    sanitize_score_evidence,
     validate_score_output,
 )
 from app.services.serenity_pilot import PilotStore
@@ -348,6 +349,44 @@ def test_direct_pdf_gate_does_not_treat_legacy_fact_labels_as_score_input() -> N
     assert report["legacy_fact_labels_eligible_for_scoring"] is False
     assert _audit_allows_direct_pdf_scoring(report) is True
     assert _audit_allows_direct_pdf_scoring({}) is False
+
+
+def test_score_evidence_is_canonicalized_or_downgraded_without_mutating_raw() -> None:
+    raw = _score_output()
+    raw["dimensions"][1]["evidence"][0]["quote"] = "模型摘要而非原文引用"
+    raw["penalties"][0] = {
+        "penalty_id": "dilution_financing",
+        "status": "EVIDENCED",
+        "rating": 2,
+        "reason": "存在融资稀释",
+        "evidence": [
+            {
+                "document_id": "doc-1",
+                "page_number": 1,
+                "quote": "唯一供应商，扩产建设周期为24个月。",
+                "direction": "SUPPORT",
+            }
+        ],
+    }
+    documents = {"doc-1": {1: "唯一供应商，扩产建设周期为\n24个月。"}}
+
+    sanitized, adjustments = sanitize_score_evidence(raw, documents)
+
+    assert raw["dimensions"][0]["evidence"][0]["quote"] == "唯一供应商，扩产建设周期为24个月。"
+    assert sanitized["dimensions"][0]["evidence"][0]["quote"] == (
+        "唯一供应商，扩产建设周期为\n24个月。"
+    )
+    assert sanitized["dimensions"][1]["status"] == "UNKNOWN"
+    assert sanitized["dimensions"][1]["rating"] is None
+    assert sanitized["dimensions"][1]["evidence"] == []
+    assert sanitized["penalties"][0]["evidence"][0]["quote"] == (
+        "唯一供应商，扩产建设周期为\n24个月。"
+    )
+    assert {row["action"] for row in adjustments} == {
+        "CANONICALIZED_WHITESPACE",
+        "DOWNGRADED_TO_UNKNOWN",
+    }
+    assert validate_score_output(sanitized, entity_id="ENTITY-1", documents=documents) == []
 
 
 def test_compact_continuation_budget_uses_only_original_remaining_allowance(

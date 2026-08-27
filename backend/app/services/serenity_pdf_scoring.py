@@ -310,6 +310,22 @@ def initialize_semantic_tables(connection: duckdb.DuckDBPyConnection) -> None:
             scored_at TIMESTAMP NOT NULL,
             PRIMARY KEY (replay_id, symbol, cutoff_date)
         );
+        CREATE TABLE IF NOT EXISTS semantic_score_evidence_adjustments (
+            replay_id VARCHAR NOT NULL,
+            symbol VARCHAR NOT NULL,
+            cutoff_date DATE NOT NULL,
+            item_type VARCHAR NOT NULL,
+            item_id VARCHAR NOT NULL,
+            citation_index INTEGER NOT NULL,
+            action VARCHAR NOT NULL,
+            original_quote VARCHAR NOT NULL,
+            canonical_quote VARCHAR,
+            model_input_sha256 VARCHAR NOT NULL,
+            processed_at TIMESTAMP NOT NULL,
+            PRIMARY KEY (
+                replay_id, symbol, cutoff_date, item_type, item_id, citation_index
+            )
+        );
         CREATE TABLE IF NOT EXISTS serenity_full_decisions (
             replay_id VARCHAR NOT NULL,
             decision_date DATE NOT NULL,
@@ -443,14 +459,93 @@ def _normalize_text(value: str) -> str:
     return re.sub(r"\s+", "", value or "")
 
 
-def _citation_is_bound(citation: dict[str, Any], documents: dict[str, dict[int, str]]) -> bool:
+def _canonical_page_quote(
+    citation: dict[str, Any], documents: dict[str, dict[int, str]]
+) -> str | None:
+    """Return the exact page substring when a quote differs only by whitespace."""
     document_id = str(citation.get("document_id") or "")
     page_number = citation.get("page_number")
     quote = str(citation.get("quote") or "").strip()
     if document_id not in documents or not isinstance(page_number, int) or len(quote) < 6:
-        return False
+        return None
     page = documents[document_id].get(page_number, "")
-    return _normalize_text(quote) in _normalize_text(page)
+    normalized_quote = _normalize_text(quote)
+    if not normalized_quote:
+        return None
+    normalized_chars: list[str] = []
+    original_indexes: list[int] = []
+    for index, character in enumerate(page):
+        if character.isspace():
+            continue
+        normalized_chars.append(character)
+        original_indexes.append(index)
+    start = "".join(normalized_chars).find(normalized_quote)
+    if start < 0:
+        return None
+    end = start + len(normalized_quote) - 1
+    return page[original_indexes[start] : original_indexes[end] + 1]
+
+
+def _citation_is_bound(citation: dict[str, Any], documents: dict[str, dict[int, str]]) -> bool:
+    return _canonical_page_quote(citation, documents) is not None
+
+
+def sanitize_score_evidence(
+    output: dict[str, Any], documents: dict[str, dict[int, str]]
+) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    """Bind model citations to exact PDF text or conservatively mark the item UNKNOWN.
+
+    The immutable raw provider response remains in ``semantic_model_calls``.  This
+    derived copy is the only version used for deterministic scoring.
+    """
+    sanitized = json.loads(json.dumps(output, ensure_ascii=False))
+    adjustments: list[dict[str, Any]] = []
+    for collection, item_type, id_key in (
+        ("dimensions", "dimension", "dimension_id"),
+        ("penalties", "penalty", "penalty_id"),
+    ):
+        for item in sanitized.get(collection, []):
+            if item.get("status") == "UNKNOWN":
+                continue
+            invalid = False
+            for citation_index, citation in enumerate(item.get("evidence") or []):
+                original_quote = str(citation.get("quote") or "")
+                canonical_quote = _canonical_page_quote(citation, documents)
+                if canonical_quote is None:
+                    invalid = True
+                    action = "DOWNGRADED_TO_UNKNOWN"
+                else:
+                    citation["quote"] = canonical_quote
+                    action = (
+                        "CANONICALIZED_WHITESPACE"
+                        if canonical_quote != original_quote
+                        else "UNCHANGED"
+                    )
+                if action != "UNCHANGED":
+                    adjustments.append(
+                        {
+                            "item_type": item_type,
+                            "item_id": str(item.get(id_key) or ""),
+                            "citation_index": citation_index,
+                            "action": action,
+                            "original_quote": original_quote,
+                            "canonical_quote": canonical_quote,
+                        }
+                    )
+            if invalid:
+                original_reason = str(item.get("reason") or "")
+                item.update(
+                    {
+                        "status": "UNKNOWN",
+                        "rating": None,
+                        "reason": (
+                            "模型引用无法逐字绑定PDF原文，已按UNKNOWN处理；原理由："
+                            + original_reason[:180]
+                        ),
+                        "evidence": [],
+                    }
+                )
+    return sanitized, adjustments
 
 
 def validate_score_output(
@@ -1591,7 +1686,8 @@ def run_scores(store: PilotStore, paths: dict[str, Path]) -> dict[str, Any]:
     already_scored = len(states) - len(pending_states)
     for index, (state, spec) in enumerate(zip(pending_states, specs, strict=True), start=1):
         result = execute_cached_call(store.connection, spec, runner)
-        output = json.loads(result.raw_output)
+        raw_output = json.loads(result.raw_output)
+        output, evidence_adjustments = sanitize_score_evidence(raw_output, _document_lookup(state))
         errors = validate_score_output(
             output, entity_id=state.entity_id, documents=_document_lookup(state)
         )
@@ -1625,6 +1721,26 @@ def run_scores(store: PilotStore, paths: dict[str, Path]) -> dict[str, Any]:
                 datetime.now(),
             ],
         )
+        for adjustment in evidence_adjustments:
+            store.connection.execute(
+                """
+                INSERT OR REPLACE INTO semantic_score_evidence_adjustments VALUES
+                (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                [
+                    REPLAY_ID,
+                    state.symbol,
+                    state.cutoff_date,
+                    adjustment["item_type"],
+                    adjustment["item_id"],
+                    adjustment["citation_index"],
+                    adjustment["action"],
+                    adjustment["original_quote"],
+                    adjustment["canonical_quote"],
+                    spec.input_sha256,
+                    datetime.now(),
+                ],
+            )
         print(
             json.dumps(
                 {
@@ -1633,6 +1749,7 @@ def run_scores(store: PilotStore, paths: dict[str, Path]) -> dict[str, Any]:
                     "total": len(states),
                     "symbol": state.symbol,
                     "cutoff": state.cutoff_date.isoformat(),
+                    "evidence_adjustments": len(evidence_adjustments),
                 },
                 ensure_ascii=False,
             ),
