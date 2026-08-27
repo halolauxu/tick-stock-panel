@@ -1,11 +1,12 @@
 from __future__ import annotations
 
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 from pathlib import Path
 
 import polars as pl
 import pytest
 
+from app.market_time import CN_TZ
 from app.services import serenity_pilot
 from app.services.serenity_pilot import (
     CHAIN_SPECS,
@@ -273,6 +274,63 @@ def test_cninfo_null_announcements_is_a_valid_empty_window(monkeypatch: pytest.M
         client.close()
 
     assert rows == []
+
+
+def test_cninfo_paginates_deduplicates_and_uses_china_time(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class PageResponse:
+        def __init__(self, rows: list[dict]) -> None:
+            self._rows = rows
+
+        def raise_for_status(self) -> None:
+            return None
+
+        def json(self) -> dict:
+            return {"totalAnnouncement": 31, "announcements": self._rows}
+
+    timestamp = int(datetime(2026, 8, 1, 8, 0, tzinfo=CN_TZ).timestamp() * 1000)
+    first_page = [
+        {
+            "secCode": "300975",
+            "announcementId": f"id-{index}",
+            "announcementTime": timestamp,
+            "announcementTitle": f"<em>公告{index}</em>",
+            "adjunctUrl": f"finalpage/{index}.PDF",
+            "adjunctSize": "12.5",
+        }
+        for index in range(30)
+    ]
+    second_page = [dict(first_page[-1])]
+    second_page.append(
+        {
+            "secCode": "300975",
+            "announcementId": "id-30",
+            "announcementTime": timestamp,
+            "announcementTitle": "公告30",
+            "adjunctUrl": "finalpage/30.PDF",
+            "adjunctSize": "13.5",
+        }
+    )
+    responses = iter([PageResponse(first_page), PageResponse(second_page)])
+    calls: list[dict] = []
+    client = CninfoClient(min_interval_s=0)
+    monkeypatch.setattr(client, "org_map", lambda: {"300975": "gssz000300975"})
+
+    def fake_post(_url: str, *, data: dict) -> PageResponse:
+        calls.append(data)
+        return next(responses)
+
+    monkeypatch.setattr(client._http, "post", fake_post)
+    try:
+        rows = client.announcements("300975", date(2026, 7, 1), date(2026, 8, 26))
+    finally:
+        client.close()
+
+    assert len(rows) == 31
+    assert [call["pageNum"] for call in calls] == ["1", "2"]
+    assert rows[0]["announce_time"] == datetime(2026, 8, 1, 8, 0)
+    assert rows[0]["title"] == "公告0"
 
 
 def test_daily_decisions_are_immutable_and_next_day_not_used(tmp_path: Path) -> None:

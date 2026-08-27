@@ -35,6 +35,7 @@ import httpx
 import polars as pl
 
 from app.config import settings
+from app.market_time import CN_TZ
 from app.plugins.tushare.client import TushareClient
 from app.plugins.tushare.provider import get_api_key
 
@@ -494,57 +495,88 @@ class CninfoClient:
             }
         return self._org_map
 
-    def announcements(self, code: str, start: date, end: date) -> list[dict[str, Any]]:
+    def announcements(
+        self,
+        code: str,
+        start: date,
+        end: date,
+        *,
+        max_pages: int = 100,
+    ) -> list[dict[str, Any]]:
         org_id = self.org_map().get(code)
         if not org_id:
             raise RuntimeError(f"CNINFO has no orgId for {code}")
-        self._wait()
-        response = self._http.post(
-            CNINFO_QUERY_URL,
-            data={
-                "pageNum": "1",
-                "pageSize": "30",
-                "column": "szse",
-                "tabName": "fulltext",
-                "plate": "",
-                "stock": f"{code},{org_id}",
-                "searchkey": "",
-                "secid": "",
-                "category": "",
-                "trade": "",
-                "seDate": f"{start.isoformat()}~{end.isoformat()}",
-                "sortName": "time",
-                "sortType": "desc",
-                "isHLtitle": "true",
-            },
-        )
-        response.raise_for_status()
-        payload = response.json()
-        rows = payload.get("announcements") if isinstance(payload, dict) else None
-        if rows is None and isinstance(payload, dict) and int(payload.get("totalAnnouncement") or 0) == 0:
-            rows = []
-        if not isinstance(rows, list):
-            raise RuntimeError("CNINFO announcement query contract changed")
+        if max_pages < 1:
+            raise ValueError("max_pages must be positive")
         result: list[dict[str, Any]] = []
-        for row in rows:
-            if not isinstance(row, dict) or str(row.get("secCode")) != code:
-                continue
-            adjunct_url = str(row.get("adjunctUrl") or "").lstrip("/")
-            if not adjunct_url.lower().endswith(".pdf"):
-                continue
-            raw_time = row.get("announcementTime")
-            announce_time = None
-            if isinstance(raw_time, (int, float)):
-                announce_time = datetime.fromtimestamp(float(raw_time) / 1000)
-            result.append(
-                {
-                    "announcement_id": str(row.get("announcementId") or row.get("id")),
-                    "announce_time": announce_time,
-                    "title": re.sub(r"<[^>]+>", "", str(row.get("announcementTitle") or "")).strip(),
-                    "pdf_url": CNINFO_STATIC_ROOT + adjunct_url,
-                    "announced_size_kb": float(row["adjunctSize"]) if row.get("adjunctSize") else None,
-                }
+        seen: set[str] = set()
+        page_size = 30
+        for page_num in range(1, max_pages + 1):
+            self._wait()
+            response = self._http.post(
+                CNINFO_QUERY_URL,
+                data={
+                    "pageNum": str(page_num),
+                    "pageSize": str(page_size),
+                    "column": "szse",
+                    "tabName": "fulltext",
+                    "plate": "",
+                    "stock": f"{code},{org_id}",
+                    "searchkey": "",
+                    "secid": "",
+                    "category": "",
+                    "trade": "",
+                    "seDate": f"{start.isoformat()}~{end.isoformat()}",
+                    "sortName": "time",
+                    "sortType": "desc",
+                    "isHLtitle": "true",
+                },
             )
+            response.raise_for_status()
+            payload = response.json()
+            rows = payload.get("announcements") if isinstance(payload, dict) else None
+            total = int(payload.get("totalAnnouncement") or 0) if isinstance(payload, dict) else 0
+            if rows is None and total == 0:
+                rows = []
+            if not isinstance(rows, list):
+                raise RuntimeError("CNINFO announcement query contract changed")
+            for row in rows:
+                if not isinstance(row, dict) or str(row.get("secCode")) != code:
+                    continue
+                adjunct_url = str(row.get("adjunctUrl") or "").lstrip("/")
+                if not adjunct_url.lower().endswith(".pdf"):
+                    continue
+                raw_announcement_id = row.get("announcementId") or row.get("id")
+                if raw_announcement_id is None:
+                    continue
+                announcement_id = str(raw_announcement_id).strip()
+                if not announcement_id or announcement_id in seen:
+                    continue
+                seen.add(announcement_id)
+                raw_time = row.get("announcementTime")
+                announce_time = None
+                if isinstance(raw_time, (int, float)):
+                    announce_time = datetime.fromtimestamp(
+                        float(raw_time) / 1000,
+                        tz=CN_TZ,
+                    ).replace(tzinfo=None)
+                result.append(
+                    {
+                        "announcement_id": announcement_id,
+                        "announce_time": announce_time,
+                        "title": re.sub(
+                            r"<[^>]+>", "", str(row.get("announcementTitle") or "")
+                        ).strip(),
+                        "pdf_url": CNINFO_STATIC_ROOT + adjunct_url,
+                        "announced_size_kb": (
+                            float(row["adjunctSize"]) if row.get("adjunctSize") else None
+                        ),
+                    }
+                )
+            if not rows or len(rows) < page_size or (total and len(seen) >= total):
+                break
+        else:
+            raise RuntimeError(f"CNINFO announcement query exceeded {max_pages} pages")
         return result
 
     def download_pdf(self, url: str, destination: Path, max_bytes: int) -> int:
