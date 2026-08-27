@@ -995,7 +995,7 @@ def evaluate(store: EventReplayStore) -> dict[str, Any]:
         row["consensus_event_gate"] = "PASS" if gates_agree else "FAIL_CROSS_CALL"
         store.connection.execute(
             """
-            INSERT INTO serenity_thesis_consensus_scores VALUES
+            INSERT OR REPLACE INTO serenity_thesis_consensus_scores VALUES
             (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             [
