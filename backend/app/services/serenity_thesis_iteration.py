@@ -680,7 +680,7 @@ def run_scores(store: EventReplayStore, *, execute: bool) -> dict[str, Any]:
     current_stage_cost = int(
         store.connection.execute(
             """
-            SELECT coalesce(sum(charged_cost_micros_cny), 0)
+            SELECT coalesce(sum(cost_micros_cny), 0)
             FROM semantic_model_calls WHERE replay_id=? AND stage=?
             """,
             [OPTIMIZATION_ID, EVENT_ENRICHED_SCORE_STAGE],
@@ -989,7 +989,7 @@ def status(store: EventReplayStore) -> dict[str, Any]:
         ).fetchall(),
         "parent_stage_cost_micros_cny": store.connection.execute(
             """
-            SELECT coalesce(sum(charged_cost_micros_cny), 0)
+            SELECT coalesce(sum(cost_micros_cny), 0)
             FROM semantic_model_calls WHERE replay_id=? AND stage=?
             """,
             [OPTIMIZATION_ID, EVENT_ENRICHED_SCORE_STAGE],
