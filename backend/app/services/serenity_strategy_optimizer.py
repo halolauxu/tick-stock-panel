@@ -54,7 +54,15 @@ from app.services.serenity_pdf_scoring import (
     sanitize_score_evidence,
     validate_score_output,
 )
-from app.services.serenity_pilot import _atomic_json, _json_default, _pilot_lock, _stable_hash
+from app.services.serenity_pilot import (
+    DEFAULT_MAX_DOCUMENT_BYTES,
+    CninfoClient,
+    _atomic_json,
+    _json_default,
+    _pilot_lock,
+    _stable_hash,
+    analyze_pdf,
+)
 
 OPTIMIZATION_ID = "serenity-event-1y-opt-v1"
 OPTIMIZATION_VERSION = "1.0.0"
@@ -71,6 +79,10 @@ MAX_COMPLETION_TOKENS = 700_000
 MAX_TOTAL_TOKENS = 8_700_000
 MAX_REQUEST_BYTES = 820_000
 MAX_EVENT_ONLY_CONTEXTS = 50
+MAX_ENRICHED_CONTEXTS = 22
+MAX_SUPPORT_DOCUMENTS = 44
+MAX_SUPPORT_RAW_BYTES = 300_000_000
+MAX_SUPPORT_PAGES_PER_DOCUMENT = 8
 FROZEN_START = date(2025, 8, 26)
 FROZEN_END = date(2026, 8, 27)
 FROZEN_UNIVERSE_SIZE = 100
@@ -81,6 +93,47 @@ FOLDS = (
     ("F2", date(2026, 2, 1), date(2026, 4, 30)),
     ("F3", date(2026, 5, 1), date(2026, 6, 30)),
     ("F4", date(2026, 7, 1), date(2026, 8, 27)),
+)
+
+_SUPPORT_PERIODIC_RE = re.compile(
+    r"(?:年度报告|半年度报告|第一季度报告|第三季度报告)(?:（更正后）)?$"
+)
+_SUPPORT_IR_RE = re.compile(r"投资者关系活动记录|调研活动记录|机构调研记录")
+_SUPPORT_OPERATING_RE = re.compile(
+    r"中标|订单|合同|客户认证|产品认证|供应商资格|批量供货|正式量产|"
+    r"扩产|投产|产能|建设项目|项目进展|停产|限产|价格调整"
+)
+_SUPPORT_ROUTINE_RE = re.compile(
+    r"摘要|披露提示|管理制度|董事会|股东会|法律意见|回购|担保|理财|"
+    r"股份变动|股权激励|权益分派|募集资金监管|核查意见"
+)
+_SUPPORT_PAGE_KEYWORDS = (
+    "供应商",
+    "独家",
+    "唯一",
+    "进口依赖",
+    "国产替代",
+    "市占率",
+    "竞争格局",
+    "客户认证",
+    "产品认证",
+    "验证",
+    "良率",
+    "产能",
+    "产量",
+    "利用率",
+    "扩产",
+    "投产",
+    "建设周期",
+    "专用设备",
+    "技术壁垒",
+    "订单",
+    "合同",
+    "中标",
+    "客户",
+    "交付",
+    "收入",
+    "毛利率",
 )
 
 
@@ -181,6 +234,21 @@ def initialize_optimization_tables(store: EventReplayStore) -> None:
             status VARCHAR NOT NULL,
             evaluated_at TIMESTAMP NOT NULL,
             PRIMARY KEY (optimization_id, trial_id, fold_id, horizon)
+        );
+        CREATE TABLE IF NOT EXISTS serenity_event_support_documents (
+            optimization_id VARCHAR NOT NULL,
+            event_id VARCHAR NOT NULL,
+            symbol VARCHAR NOT NULL,
+            decision_date DATE NOT NULL,
+            announcement_id VARCHAR NOT NULL,
+            selection_kind VARCHAR NOT NULL,
+            selection_rank INTEGER NOT NULL,
+            announce_time TIMESTAMP NOT NULL,
+            title VARCHAR NOT NULL,
+            status VARCHAR NOT NULL,
+            error VARCHAR,
+            planned_at TIMESTAMP NOT NULL,
+            PRIMARY KEY (optimization_id, event_id, announcement_id)
         );
         """
     )
@@ -338,6 +406,322 @@ def materialize_event_features(store: EventReplayStore) -> dict[str, Any]:
         store.connection.execute("ROLLBACK")
         raise
     return {"materialized": len(values), "blocked": blocked}
+
+
+def _support_kind(title: str) -> str | None:
+    compact = re.sub(r"\s+", "", str(title or ""))
+    if _SUPPORT_PERIODIC_RE.search(compact) and not _SUPPORT_ROUTINE_RE.search(compact):
+        return "LATEST_PERIODIC_REPORT"
+    if _SUPPORT_IR_RE.search(compact) and not _SUPPORT_ROUTINE_RE.search(compact):
+        return "LATEST_INVESTOR_ACTIVITY"
+    if _SUPPORT_OPERATING_RE.search(compact) and not _SUPPORT_ROUTINE_RE.search(compact):
+        return "LATEST_PRIOR_OPERATING_DISCLOSURE"
+    return None
+
+
+def _round1_qualified_events(store: EventReplayStore) -> list[tuple[Any, ...]]:
+    rows = store.connection.execute(
+        """
+        SELECT s.event_id, s.symbol, s.decision_date, e.announcement_id
+        FROM serenity_event_semantic_scores s
+        JOIN event_candidates e USING (event_id)
+        WHERE s.optimization_id=? AND s.stage=?
+          AND s.event_gate='PASS' AND s.newness='NEW_INFORMATION'
+          AND s.economic_bridge='PASS' AND s.event_stage!='ROUTINE_ADMIN'
+        ORDER BY s.decision_date, s.symbol, s.event_id
+        """,
+        [OPTIMIZATION_ID, EVENT_SCORE_STAGE],
+    ).fetchall()
+    if len(rows) > MAX_ENRICHED_CONTEXTS:
+        raise RuntimeError("round-one qualified population exceeds the frozen enriched cap")
+    return rows
+
+
+def plan_support_documents(store: EventReplayStore) -> dict[str, Any]:
+    """Freeze PIT support PDFs without looking at any event outcome."""
+    initialize_optimization_tables(store)
+    selected: list[dict[str, Any]] = []
+    for event_id, symbol, decision_day, event_announcement_id in _round1_qualified_events(store):
+        candidates = store.connection.execute(
+            """
+            SELECT announcement_id, announce_time, title, announced_size_kb
+            FROM announcements
+            WHERE symbol=? AND announce_time IS NOT NULL
+              AND CAST(announce_time AS DATE)<=?
+              AND CAST(announce_time AS DATE)>=? - INTERVAL 365 DAY
+            ORDER BY announce_time DESC, announcement_id DESC
+            """,
+            [symbol, decision_day, decision_day],
+        ).fetchall()
+        by_kind: dict[str, tuple[Any, ...]] = {}
+        for announcement_id, announce_time, title, announced_size_kb in candidates:
+            kind = _support_kind(str(title))
+            if kind is None or kind in by_kind:
+                continue
+            if (
+                kind == "LATEST_PRIOR_OPERATING_DISCLOSURE"
+                and str(announcement_id) == str(event_announcement_id)
+            ):
+                continue
+            by_kind[kind] = (
+                str(announcement_id),
+                announce_time,
+                str(title),
+                float(announced_size_kb) if announced_size_kb is not None else None,
+            )
+        for rank, kind in enumerate(
+            (
+                "LATEST_PERIODIC_REPORT",
+                "LATEST_INVESTOR_ACTIVITY",
+                "LATEST_PRIOR_OPERATING_DISCLOSURE",
+            ),
+            start=1,
+        ):
+            item = by_kind.get(kind)
+            if item is None:
+                continue
+            announcement_id, announce_time, title, announced_size_kb = item
+            selected.append(
+                {
+                    "event_id": str(event_id),
+                    "symbol": str(symbol),
+                    "decision_date": decision_day.isoformat(),
+                    "announcement_id": announcement_id,
+                    "selection_kind": kind,
+                    "selection_rank": rank,
+                    "announce_time": announce_time.isoformat(),
+                    "title": title,
+                    "announced_size_kb": announced_size_kb,
+                }
+            )
+    unique_ids = sorted({item["announcement_id"] for item in selected})
+    if len(unique_ids) > MAX_SUPPORT_DOCUMENTS:
+        raise RuntimeError("support document plan exceeds the frozen document cap")
+    estimated_bytes = round(
+        sum(
+            max(0.0, float(item["announced_size_kb"] or 0.0)) * 1024
+            for item in {row["announcement_id"]: row for row in selected}.values()
+        )
+    )
+    if estimated_bytes > MAX_SUPPORT_RAW_BYTES:
+        raise RuntimeError("support document estimate exceeds the frozen raw-byte cap")
+    manifest = _with_content_hash(
+        {
+            "optimization_id": OPTIMIZATION_ID,
+            "selection_uses_outcomes": False,
+            "qualification_rule": (
+                "round1 event gate PASS + NEW_INFORMATION + economic bridge PASS + non-admin"
+            ),
+            "lookback_days": 365,
+            "selection_kinds": [
+                "LATEST_PERIODIC_REPORT",
+                "LATEST_INVESTOR_ACTIVITY",
+                "LATEST_PRIOR_OPERATING_DISCLOSURE",
+            ],
+            "max_documents": MAX_SUPPORT_DOCUMENTS,
+            "max_raw_bytes": MAX_SUPPORT_RAW_BYTES,
+            "estimated_raw_bytes": estimated_bytes,
+            "qualified_event_count": len(_round1_qualified_events(store)),
+            "unique_document_count": len(unique_ids),
+            "records": selected,
+        }
+    )
+    path = _optimization_root(store) / "support-document-manifest.json"
+    if path.is_file():
+        existing = json.loads(path.read_text(encoding="utf-8"))
+        if existing != manifest:
+            paid_calls = store.connection.execute(
+                "SELECT count(*) FROM semantic_model_calls WHERE replay_id=? AND stage=?",
+                [OPTIMIZATION_ID, EVENT_ENRICHED_SCORE_STAGE],
+            ).fetchone()[0]
+            if paid_calls:
+                raise RuntimeError("support population cannot change after enriched model calls")
+            raise RuntimeError("support manifest drifted before paid execution; review required")
+    else:
+        _freeze_json(path, manifest, "support document manifest")
+    store.connection.execute(
+        "DELETE FROM serenity_event_support_documents WHERE optimization_id=?",
+        [OPTIMIZATION_ID],
+    )
+    if selected:
+        store.connection.executemany(
+            """
+            INSERT INTO serenity_event_support_documents VALUES
+            (?, ?, ?, ?, ?, ?, ?, ?, ?, 'PLANNED', NULL, ?)
+            """,
+            [
+                [
+                    OPTIMIZATION_ID,
+                    item["event_id"],
+                    item["symbol"],
+                    date.fromisoformat(item["decision_date"]),
+                    item["announcement_id"],
+                    item["selection_kind"],
+                    item["selection_rank"],
+                    datetime.fromisoformat(item["announce_time"]),
+                    item["title"],
+                    datetime.now(),
+                ]
+                for item in selected
+            ],
+        )
+    return {
+        "qualified_events": manifest["qualified_event_count"],
+        "support_links": len(selected),
+        "unique_documents": len(unique_ids),
+        "estimated_raw_bytes": estimated_bytes,
+        "manifest_path": str(path),
+    }
+
+
+def collect_support_documents(store: EventReplayStore) -> dict[str, Any]:
+    """Download only the frozen support manifest and persist extraction before scoring."""
+    initialize_optimization_tables(store)
+    manifest_path = _optimization_root(store) / "support-document-manifest.json"
+    if not manifest_path.is_file():
+        raise RuntimeError("support document manifest is missing")
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    records = manifest.get("records") or []
+    by_document: dict[str, dict[str, Any]] = {}
+    for row in records:
+        by_document.setdefault(str(row["announcement_id"]), row)
+    if len(by_document) > MAX_SUPPORT_DOCUMENTS:
+        raise RuntimeError("frozen support document cap exceeded")
+    client = CninfoClient()
+    downloaded = downloaded_bytes = reused = failed = 0
+    try:
+        for announcement_id, _record in sorted(by_document.items()):
+            existing = store.connection.execute(
+                "SELECT pdf_bytes FROM document_metrics WHERE announcement_id=?",
+                [announcement_id],
+            ).fetchone()
+            if existing:
+                reused += 1
+                store.connection.execute(
+                    """
+                    UPDATE serenity_event_support_documents SET status='READY', error=NULL
+                    WHERE optimization_id=? AND announcement_id=?
+                    """,
+                    [OPTIMIZATION_ID, announcement_id],
+                )
+                continue
+            if downloaded_bytes >= MAX_SUPPORT_RAW_BYTES:
+                raise RuntimeError("support download raw-byte cap reached")
+            announcement = store.connection.execute(
+                "SELECT pdf_url FROM announcements WHERE announcement_id=?",
+                [announcement_id],
+            ).fetchone()
+            if not announcement:
+                raise RuntimeError(f"support announcement disappeared: {announcement_id}")
+            pdf_path = store.documents_dir / f"{announcement_id}.pdf"
+            text_path = store.text_dir / f"{announcement_id}.txt"
+            try:
+                size = client.download_pdf(
+                    str(announcement[0]), pdf_path, DEFAULT_MAX_DOCUMENT_BYTES
+                )
+                if downloaded_bytes + size > MAX_SUPPORT_RAW_BYTES:
+                    pdf_path.unlink(missing_ok=True)
+                    raise RuntimeError("support download would exceed the frozen raw-byte cap")
+                metrics, facts = analyze_pdf(pdf_path, text_path, announcement_id)
+                store.connection.execute("BEGIN TRANSACTION")
+                try:
+                    store.connection.execute(
+                        "INSERT INTO document_metrics VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                        [
+                            metrics["announcement_id"],
+                            metrics["sha256"],
+                            metrics["pages"],
+                            metrics["pdf_bytes"],
+                            metrics["embedded_text_bytes"],
+                            metrics["extracted_text_bytes"],
+                            metrics["ocr_text_bytes"],
+                            metrics["ocr_pages"],
+                            metrics["low_text_pages"],
+                            metrics["rendered_png_bytes"],
+                            metrics["persistent_inflation_pct"],
+                            metrics["ocr_render_multiplier"],
+                            metrics["fact_count"],
+                            metrics["parse_status"],
+                            metrics["measured_at"],
+                        ],
+                    )
+                    if facts:
+                        store.connection.executemany(
+                            "INSERT OR IGNORE INTO evidence_facts VALUES (?, ?, ?, ?, ?, ?)",
+                            [
+                                [
+                                    fact["fact_id"],
+                                    fact["announcement_id"],
+                                    fact["page_number"],
+                                    fact["category"],
+                                    fact["evidence_sentence"],
+                                    fact["review_status"],
+                                ]
+                                for fact in facts
+                            ],
+                        )
+                    store.connection.execute(
+                        "UPDATE announcements SET status='measured', error=NULL WHERE announcement_id=?",
+                        [announcement_id],
+                    )
+                    store.connection.execute(
+                        """
+                        UPDATE serenity_event_support_documents SET status='READY', error=NULL
+                        WHERE optimization_id=? AND announcement_id=?
+                        """,
+                        [OPTIMIZATION_ID, announcement_id],
+                    )
+                    store.connection.execute("COMMIT")
+                except Exception:
+                    store.connection.execute("ROLLBACK")
+                    raise
+                downloaded += 1
+                downloaded_bytes += size
+            except Exception as exc:
+                failed += 1
+                pdf_path.unlink(missing_ok=True)
+                text_path.unlink(missing_ok=True)
+                store.connection.execute(
+                    """
+                    UPDATE serenity_event_support_documents SET status='FAILED', error=?
+                    WHERE optimization_id=? AND announcement_id=?
+                    """,
+                    [str(exc)[:300], OPTIMIZATION_ID, announcement_id],
+                )
+        return {
+            "planned_unique_documents": len(by_document),
+            "downloaded_documents": downloaded,
+            "downloaded_bytes": downloaded_bytes,
+            "reused_documents": reused,
+            "failed_documents": failed,
+            "ready_links": store.connection.execute(
+                """
+                SELECT count(*) FROM serenity_event_support_documents
+                WHERE optimization_id=? AND status='READY'
+                """,
+                [OPTIMIZATION_ID],
+            ).fetchone()[0],
+        }
+    finally:
+        client.close()
+
+
+def _select_support_pages(pages: dict[int, str]) -> dict[int, str]:
+    ranked = []
+    for page_number, text in pages.items():
+        score = sum(text.count(keyword) for keyword in _SUPPORT_PAGE_KEYWORDS)
+        if re.search(r"\d+(?:\.\d+)?\s*(?:%|亿元|万元|吨|台|套|个月|年)", text):
+            score += 2
+        ranked.append((score, page_number, text))
+    positive = [item for item in ranked if item[0] > 0]
+    candidates = positive or ranked[:2]
+    chosen = sorted(
+        sorted(candidates, key=lambda item: (-item[0], item[1]))[
+            :MAX_SUPPORT_PAGES_PER_DOCUMENT
+        ],
+        key=lambda item: item[1],
+    )
+    return {page_number: text for _score, page_number, text in chosen}
 
 
 def _event_score_schema() -> dict[str, Any]:
@@ -535,6 +919,125 @@ def load_event_score_states(
                 {
                     "event_id": str(event_id),
                     "status": "DATA_INSUFFICIENT_OVERSIZE_CONTEXT",
+                    "prompt_bytes": len(prompt.encode("utf-8")),
+                }
+            )
+        else:
+            states.append(
+                EventScoreState(
+                    event_id=str(event_id),
+                    symbol=str(symbol),
+                    decision_date=decision_day,
+                    event_type=str(event_type),
+                    entity_id=entity_id,
+                    score_state=score_state,
+                    document_map=document_map,
+                )
+            )
+    return states, blocked
+
+
+def load_enriched_score_states(
+    store: EventReplayStore,
+) -> tuple[list[EventScoreState], list[dict[str, Any]]]:
+    """Build PIT packets for the frozen Round-1 pass population plus support PDFs."""
+    universe = {row["symbol"]: row for row in store.universe()}
+    states: list[EventScoreState] = []
+    blocked: list[dict[str, Any]] = []
+    for event_id, symbol, decision_day, _event_announcement_id in _round1_qualified_events(
+        store
+    ):
+        company = universe[str(symbol)]
+        event_type = store.connection.execute(
+            "SELECT primary_event_type FROM event_candidates WHERE event_id=?",
+            [event_id],
+        ).fetchone()[0]
+        documents = store.connection.execute(
+            """
+            SELECT e.announcement_id, e.published_at, e.title, d.sha256, 'EVENT' AS kind
+            FROM event_candidates e
+            JOIN document_metrics d ON d.announcement_id=e.announcement_id
+            WHERE e.symbol=? AND e.decision_date=?
+              AND e.polarity IN ('LONG_CANDIDATE', 'MIXED_REVIEW')
+            UNION ALL
+            SELECT m.announcement_id, a.announce_time, a.title, d.sha256, m.selection_kind
+            FROM serenity_event_support_documents m
+            JOIN announcements a USING (announcement_id)
+            JOIN document_metrics d USING (announcement_id)
+            WHERE m.optimization_id=? AND m.event_id=? AND m.status='READY'
+              AND CAST(a.announce_time AS DATE)<=m.decision_date
+            ORDER BY 2, 1
+            """,
+            [symbol, decision_day, OPTIMIZATION_ID, event_id],
+        ).fetchall()
+        packets: list[DocumentPacket] = []
+        document_map: dict[str, str] = {}
+        seen_documents: set[str] = set()
+        for index, (document_id, published_at, title, sha256, kind) in enumerate(
+            documents, start=1
+        ):
+            document_id = str(document_id)
+            if document_id in seen_documents or published_at is None:
+                continue
+            seen_documents.add(document_id)
+            text_path = store.text_dir / f"{document_id}.txt"
+            if not text_path.is_file():
+                continue
+            opaque_id = "DOC-" + _stable_hash(
+                OPTIMIZATION_ID, EVENT_ENRICHED_SCORE_STAGE, str(event_id), str(index)
+            )[:16]
+            original_pages = _parse_pages(text_path)
+            if str(kind) != "EVENT":
+                original_pages = _select_support_pages(original_pages)
+            pages = {
+                page: _mask_identity(
+                    value,
+                    symbol=str(symbol),
+                    code=str(company["code"]),
+                    name=str(company["name"]),
+                )
+                for page, value in original_pages.items()
+            }
+            if not pages:
+                continue
+            packets.append(
+                DocumentPacket(
+                    document_id=opaque_id,
+                    announcement_time=published_at,
+                    title=_mask_identity(
+                        f"[{kind}] {title}",
+                        symbol=str(symbol),
+                        code=str(company["code"]),
+                        name=str(company["name"]),
+                    ),
+                    pages=pages,
+                    sha256=str(sha256),
+                )
+            )
+            document_map[opaque_id] = document_id
+        entity_id = "EVENT-" + _stable_hash(OPTIMIZATION_ID, str(event_id))[:20]
+        score_state = ScoreState(
+            symbol=str(symbol),
+            name="[发行人]",
+            chain_id=str(company["chain_id"]),
+            cutoff_date=decision_day,
+            entity_id=entity_id,
+            documents=tuple(packets),
+        )
+        prompt = build_event_score_prompt(score_state, str(event_type))
+        support_count = sum(1 for packet in packets if "[EVENT]" not in packet.title)
+        if support_count == 0:
+            blocked.append(
+                {
+                    "event_id": str(event_id),
+                    "status": "DATA_INSUFFICIENT_NO_READY_SUPPORT_PDF",
+                }
+            )
+        elif len(prompt.encode("utf-8")) > MAX_REQUEST_BYTES - 30_000:
+            blocked.append(
+                {
+                    "event_id": str(event_id),
+                    "status": "DATA_INSUFFICIENT_OVERSIZE_ENRICHED_CONTEXT",
                     "prompt_bytes": len(prompt.encode("utf-8")),
                 }
             )
@@ -881,7 +1384,10 @@ def run_event_scores(
     runner: Callable[[ModelCallSpec], CachedModelResult] | None = None,
 ) -> dict[str, Any]:
     initialize_optimization_tables(store)
-    states, blocked = load_event_score_states(store, stage=stage)
+    if stage == EVENT_ENRICHED_SCORE_STAGE:
+        states, blocked = load_enriched_score_states(store)
+    else:
+        states, blocked = load_event_score_states(store, stage=stage)
     completed = {
         row[0]
         for row in store.connection.execute(
@@ -941,9 +1447,16 @@ def run_event_scores(
             "optimization_id": OPTIMIZATION_ID,
             "stage": stage,
             "selection_rule": (
-                "50 highest-information PIT contexts from non-admin capacity or fact_count>0; "
-                "priority=non-admin capacity, order, earnings, price/supply, financing-admin; "
-                "outcomes excluded"
+                (
+                    "round1 PASS + NEW_INFORMATION + economic bridge PASS + non-admin; "
+                    "frozen PIT support manifest; outcomes excluded"
+                )
+                if stage == EVENT_ENRICHED_SCORE_STAGE
+                else (
+                    "50 highest-information PIT contexts from non-admin capacity or fact_count>0; "
+                    "priority=non-admin capacity, order, earnings, price/supply, financing-admin; "
+                    "outcomes excluded"
+                )
             ),
             "selection_uses_outcomes": False,
             "pending_slots": [
@@ -1100,16 +1613,27 @@ def evaluate_trials(store: EventReplayStore) -> dict[str, Any]:
                f.deterministic_subtype, f.relative_momentum_20, f.next_open_gap,
                s.event_gate, s.event_stage, s.newness, s.economic_bridge,
                s.known_dimension_weight, s.known_dimension_points,
-               s.complete_dimension_score, s.dimension_json
+               s.complete_dimension_score, s.dimension_json,
+               se.event_gate, se.event_stage, se.newness, se.economic_bridge,
+               se.known_dimension_weight, se.known_dimension_points,
+               se.complete_dimension_score, se.dimension_json
         FROM event_discovery_outcomes o
         JOIN serenity_event_features f
           ON f.optimization_id=? AND f.event_id=o.event_id
         LEFT JOIN serenity_event_semantic_scores s
           ON s.optimization_id=? AND s.stage=? AND s.event_id=o.event_id
+        LEFT JOIN serenity_event_semantic_scores se
+          ON se.optimization_id=? AND se.stage=? AND se.event_id=o.event_id
         WHERE o.status='SETTLED'
         ORDER BY o.decision_date, o.event_id, o.horizon
         """,
-        [OPTIMIZATION_ID, OPTIMIZATION_ID, EVENT_SCORE_STAGE],
+        [
+            OPTIMIZATION_ID,
+            OPTIMIZATION_ID,
+            EVENT_SCORE_STAGE,
+            OPTIMIZATION_ID,
+            EVENT_ENRICHED_SCORE_STAGE,
+        ],
     ).fetchall()
     records = [
         {
@@ -1132,12 +1656,26 @@ def evaluate_trials(store: EventReplayStore) -> dict[str, Any]:
             "known_dimension_points": float(row[16]) if row[16] is not None else 0.0,
             "complete_dimension_score": row[17],
             "dimensions": json.loads(row[18]) if row[18] else [],
+            "enriched_event_gate": row[19],
+            "enriched_event_stage": row[20],
+            "enriched_newness": row[21],
+            "enriched_economic_bridge": row[22],
+            "enriched_known_dimension_weight": (
+                float(row[23]) if row[23] is not None else 0.0
+            ),
+            "enriched_known_dimension_points": (
+                float(row[24]) if row[24] is not None else 0.0
+            ),
+            "enriched_complete_dimension_score": row[25],
+            "enriched_dimensions": json.loads(row[26]) if row[26] else [],
         }
         for row in rows
     ]
 
-    def dimension_gates(row: dict[str, Any]) -> bool:
-        dimensions = {item["dimension_id"]: item for item in row["dimensions"]}
+    def enriched_dimension_gates(row: dict[str, Any]) -> bool:
+        dimensions = {
+            item["dimension_id"]: item for item in row["enriched_dimensions"]
+        }
         minimums = {
             "architecture_coupling": 3,
             "chokepoint_severity": 3,
@@ -1161,17 +1699,19 @@ def evaluate_trials(store: EventReplayStore) -> dict[str, Any]:
             and row["event_stage"] != "ROUTINE_ADMIN"
         ),
         "T3_STRICT_FULL64_GATES": lambda row: (
-            row["event_gate"] == "PASS"
-            and row["newness"] == "NEW_INFORMATION"
-            and row["economic_bridge"] == "PASS"
-            and dimension_gates(row)
+            row["enriched_event_gate"] == "PASS"
+            and row["enriched_newness"] == "NEW_INFORMATION"
+            and row["enriched_economic_bridge"] == "PASS"
+            and enriched_dimension_gates(row)
         ),
         "T4_RESEARCH_COVERAGE_GATE": lambda row: (
-            row["event_gate"] == "PASS"
-            and row["newness"] == "NEW_INFORMATION"
-            and row["economic_bridge"] == "PASS"
-            and row["known_dimension_weight"] >= 32
-            and row["known_dimension_points"] / row["known_dimension_weight"] >= 0.6
+            row["enriched_event_gate"] == "PASS"
+            and row["enriched_newness"] == "NEW_INFORMATION"
+            and row["enriched_economic_bridge"] == "PASS"
+            and row["enriched_known_dimension_weight"] >= 32
+            and row["enriched_known_dimension_points"]
+            / row["enriched_known_dimension_weight"]
+            >= 0.6
         ),
     }
     store.connection.execute(
@@ -1238,6 +1778,16 @@ def evaluate_trials(store: EventReplayStore) -> dict[str, Any]:
             """,
             [OPTIMIZATION_ID, EVENT_SCORE_STAGE],
         ).fetchone(),
+        "enriched_semantic_coverage": store.connection.execute(
+            """
+            SELECT count(*), count(*) FILTER (WHERE event_gate='PASS'),
+                   avg(known_dimension_weight),
+                   count(*) FILTER (WHERE complete_dimension_score IS NOT NULL)
+            FROM serenity_event_semantic_scores
+            WHERE optimization_id=? AND stage=?
+            """,
+            [OPTIMIZATION_ID, EVENT_ENRICHED_SCORE_STAGE],
+        ).fetchone(),
         "alpha_status": "UNVERIFIED_ALPHA",
         "selection_status": "NO_AUTOMATIC_WINNER; FUTURE_SHADOW_CONFIRMATION_REQUIRED",
         "generated_at": datetime.now().isoformat(timespec="seconds"),
@@ -1269,6 +1819,23 @@ def status_report(store: EventReplayStore) -> dict[str, Any]:
             """,
             [OPTIMIZATION_ID],
         ).fetchone(),
+        "semantic_scores_by_stage": store.connection.execute(
+            """
+            SELECT stage, count(*), count(*) FILTER (WHERE event_gate='PASS'),
+                   count(*) FILTER (WHERE complete_dimension_score IS NOT NULL),
+                   avg(known_dimension_weight)
+            FROM serenity_event_semantic_scores WHERE optimization_id=?
+            GROUP BY stage ORDER BY stage
+            """,
+            [OPTIMIZATION_ID],
+        ).fetchall(),
+        "support_documents": store.connection.execute(
+            """
+            SELECT status, count(*) FROM serenity_event_support_documents
+            WHERE optimization_id=? GROUP BY status ORDER BY status
+            """,
+            [OPTIMIZATION_ID],
+        ).fetchall(),
         "semantic_calls": store.connection.execute(
             """
             SELECT count(*), coalesce(sum(cost_micros_cny),0)
@@ -1289,7 +1856,17 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "command",
-        choices=("prepare", "plan-score", "score", "evaluate", "status"),
+        choices=(
+            "prepare",
+            "plan-score",
+            "score",
+            "plan-support",
+            "collect-support",
+            "plan-enriched-score",
+            "enriched-score",
+            "evaluate",
+            "status",
+        ),
     )
     parser.add_argument("--root", type=Path, required=True)
     args = parser.parse_args(argv)
@@ -1306,6 +1883,18 @@ def main(argv: list[str] | None = None) -> int:
             elif args.command in {"plan-score", "score"}:
                 paths = write_optimization_contract(store)
                 payload = run_event_scores(store, paths, execute=args.command == "score")
+            elif args.command == "plan-support":
+                payload = plan_support_documents(store)
+            elif args.command == "collect-support":
+                payload = collect_support_documents(store)
+            elif args.command in {"plan-enriched-score", "enriched-score"}:
+                paths = write_optimization_contract(store)
+                payload = run_event_scores(
+                    store,
+                    paths,
+                    execute=args.command == "enriched-score",
+                    stage=EVENT_ENRICHED_SCORE_STAGE,
+                )
             elif args.command == "evaluate":
                 payload = evaluate_trials(store)
             else:

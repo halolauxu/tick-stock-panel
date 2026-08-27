@@ -9,9 +9,26 @@ from app.services.serenity_strategy_optimizer import (
     _dimension_score,
     _event_score_schema,
     _mask_identity,
+    _select_support_pages,
+    _support_kind,
     classify_capacity_subtype,
     materialize_event_features,
 )
+
+
+def test_support_selection_rejects_routine_documents_and_ranks_evidence_pages() -> None:
+    assert _support_kind("某公司2025年年度报告") == "LATEST_PERIODIC_REPORT"
+    assert _support_kind("投资者关系活动记录表") == "LATEST_INVESTOR_ACTIVITY"
+    assert _support_kind("关于客户认证并取得订单的公告") == "LATEST_PRIOR_OPERATING_DISCLOSURE"
+    assert _support_kind("投资者关系管理制度") is None
+    assert _support_kind("2025年年度报告摘要") is None
+
+    pages = {
+        1: "目录和普通介绍",
+        2: "客户认证周期为18个月,现有产能为300吨。",
+        3: "供应商数量为2家,关键设备依赖进口。",
+    }
+    assert list(_select_support_pages(pages)) == [2, 3]
 
 
 def test_capacity_subtype_rejects_financing_admin_false_positive() -> None:
