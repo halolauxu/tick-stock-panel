@@ -27,7 +27,7 @@ from app import secrets_store
 from app.data_providers.base import AssetType
 from app.market_time import CN_TZ
 from app.plugins.tushare.client import TushareClient, TushareError
-from app.services.minute_quality import filter_regular_session
+from app.services.minute_quality import minute_quality_payload, sanitize_minute_rows
 
 logger = logging.getLogger(__name__)
 
@@ -567,7 +567,15 @@ class TushareProvider:
             .select(_MINUTE_CANONICAL)
             .drop_nulls(_MINUTE_CANONICAL)
         )
-        return filter_regular_session(frame)
+        frame = sanitize_minute_rows(frame)
+        quality = minute_quality_payload(frame)
+        if quality["null_ohlc"] or quality["invalid_ohlc"]:
+            raise TushareError(
+                "stk_mins 返回非法价格数据: "
+                f"空OHLC {quality['null_ohlc']} 行,"
+                f"非法OHLC {quality['invalid_ohlc']} 行"
+            )
+        return frame
 
     def test_dataset(self, dataset: str, symbols: list[str] | None = None) -> dict:
         if dataset not in _DATASETS:

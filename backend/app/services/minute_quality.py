@@ -35,6 +35,21 @@ def filter_regular_session(frame: pl.DataFrame) -> pl.DataFrame:
     )
 
 
+def zero_ohlc_expr() -> pl.Expr:
+    """识别数据源为未交易/未上市标的生成的全零价格占位行。"""
+    return pl.all_horizontal(
+        *[pl.col(column) == 0 for column in ("open", "high", "low", "close")]
+    )
+
+
+def sanitize_minute_rows(frame: pl.DataFrame) -> pl.DataFrame:
+    """执行可安全自动修复的两项过滤：盘后记录与全零价格占位行。"""
+    frame = filter_regular_session(frame)
+    if frame.is_empty() or not {"open", "high", "low", "close"}.issubset(frame.columns):
+        return frame
+    return frame.filter(~zero_ohlc_expr())
+
+
 def minute_quality_payload(frame: pl.DataFrame) -> dict[str, int]:
     """深度检查一个或多个分钟 K 分区，返回可序列化的质量计数。"""
     if frame.is_empty():
@@ -46,6 +61,7 @@ def minute_quality_payload(frame: pl.DataFrame) -> dict[str, int]:
             "extra_symbols": 0,
             "null_datetime": 0,
             "null_ohlc": 0,
+            "zero_ohlc": 0,
             "invalid_ohlc": 0,
             "duplicate_symbol_datetime": 0,
             "out_of_regular_session": 0,
@@ -67,10 +83,17 @@ def minute_quality_payload(frame: pl.DataFrame) -> dict[str, int]:
         ).item()
         or 0
     )
+    zero_ohlc = int(frame.select(zero_ohlc_expr().fill_null(False).sum()).item() or 0)
     invalid_ohlc = int(
         frame.select(
             (
-                (pl.col("open") <= 0)
+                pl.any_horizontal(
+                    *[
+                        ~pl.col(column).is_finite()
+                        for column in ("open", "high", "low", "close")
+                    ]
+                )
+                | (pl.col("open") <= 0)
                 | (pl.col("high") <= 0)
                 | (pl.col("low") <= 0)
                 | (pl.col("close") <= 0)
@@ -111,6 +134,7 @@ def minute_quality_payload(frame: pl.DataFrame) -> dict[str, int]:
         "extra_symbols": extra_symbols,
         "null_datetime": null_datetime,
         "null_ohlc": null_ohlc,
+        "zero_ohlc": zero_ohlc,
         "invalid_ohlc": invalid_ohlc,
         "duplicate_symbol_datetime": duplicate_keys,
         "out_of_regular_session": out_of_session,

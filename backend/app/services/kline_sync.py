@@ -23,8 +23,8 @@ from app.market_time import CN_TZ, cn_now, cn_today
 from app.services import preferences
 from app.services.minute_quality import (
     REGULAR_MINUTE_BARS,
-    filter_regular_session,
     minute_quality_payload,
+    sanitize_minute_rows,
 )
 from app.tickflow.capabilities import Cap, CapabilitySet
 from app.tickflow.client import get_client
@@ -531,7 +531,7 @@ def _normalize_minute(df_in, default_symbol: str | None = None) -> pl.DataFrame:
             df = df.with_columns(pl.col(col).cast(pl.Float64, strict=False))
 
     keep = [c for c in CANONICAL_MINUTE_COLS if c in df.columns]
-    return filter_regular_session(df.select(keep))
+    return sanitize_minute_rows(df.select(keep))
 
 
 def _datetime_to_ms(dt: datetime) -> int:
@@ -544,9 +544,16 @@ def _write_minute_partition(df: pl.DataFrame, minute_dir) -> int:
 
     抽自原 sync_and_persist_minute 末尾的循环, 供流式落盘 (每段一次) 与一次性迁移共用。
     """
-    df = filter_regular_session(df)
+    df = sanitize_minute_rows(df)
     if df.is_empty():
         return 0
+    incoming_quality = minute_quality_payload(df)
+    if int(incoming_quality["null_ohlc"]) or int(incoming_quality["invalid_ohlc"]):
+        raise ValueError(
+            "分钟K写入被拒绝: "
+            f"空OHLC {incoming_quality['null_ohlc']} 行,"
+            f"非法OHLC {incoming_quality['invalid_ohlc']} 行"
+        )
     df = df.with_columns(pl.col("datetime").dt.date().alias("_trade_date"))
     written = 0
     for day_df in df.partition_by("_trade_date"):
@@ -555,7 +562,7 @@ def _write_minute_partition(df: pl.DataFrame, minute_dir) -> int:
         out.parent.mkdir(parents=True, exist_ok=True)
         if out.exists():
             existing = pl.read_parquet(out)
-            existing = filter_regular_session(existing)
+            existing = sanitize_minute_rows(existing)
             day_df = pl.concat([existing, day_df.drop("_trade_date")]).unique(
                 subset=["symbol", "datetime"], keep="last",
             )
@@ -673,12 +680,12 @@ def validate_minute_partitions(
     }
 
 
-def repair_minute_regular_sessions(
+def repair_minute_quality_partitions(
     data_dir: Path,
     start_date: date,
     end_date: date,
 ) -> dict[str, object]:
-    """只清理指定日期范围内的盘后分钟线，并原子重写分区及完整度统计。"""
+    """清理指定范围的盘后/全零占位行，并原子重写分区及完整度统计。"""
     data_dir = Path(data_dir)
     minute_dir = data_dir / "kline_minute"
     scanned_days = repaired_days = removed_rows = 0
@@ -704,17 +711,19 @@ def repair_minute_regular_sessions(
             for key in (
                 "null_datetime",
                 "null_ohlc",
-                "invalid_ohlc",
                 "duplicate_symbol_datetime",
             )
             if int(before[key])
         }
+        nonzero_invalid_ohlc = int(before["invalid_ohlc"]) - int(before["zero_ohlc"])
+        if nonzero_invalid_ohlc:
+            hard_errors["invalid_ohlc_nonzero"] = nonzero_invalid_ohlc
         if hard_errors:
             raise ValueError(
                 f"{trade_date} 分区除盘后数据外仍有异常，已停止修复: {hard_errors}"
             )
 
-        repaired = filter_regular_session(frame).sort("symbol", "datetime")
+        repaired = sanitize_minute_rows(frame).sort("symbol", "datetime")
         after = minute_quality_payload(repaired)
         if any(
             int(after[key])
