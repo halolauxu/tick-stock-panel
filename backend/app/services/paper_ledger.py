@@ -575,6 +575,67 @@ class PaperLedger:
                 payload=preflight,
             )
 
+    def mark_historically_missed(
+        self,
+        order_id: str,
+        trading_date: date,
+        evidence: dict[str, Any],
+    ) -> bool:
+        """Freeze a past intended session without inventing a successful preflight."""
+        now = _now_text()
+        reason = "服务恢复后确认订单原定交易日已过去; 进入历史开盘证据恢复"
+        with self.transaction() as conn:
+            order = conn.execute("SELECT * FROM orders WHERE id=?", (order_id,)).fetchone()
+            if order is None:
+                raise KeyError(order_id)
+            if order["status"] in TERMINAL_ORDER_STATUSES:
+                return False
+            scheduled = order["scheduled_date"]
+            if scheduled is not None and scheduled != trading_date.isoformat():
+                raise PaperLedgerError(
+                    f"订单已冻结到其他交易日: {scheduled} != {trading_date.isoformat()}"
+                )
+            conn.execute(
+                """UPDATE orders SET scheduled_date=?,status='MISSED_EXECUTION',reason=?,
+                    execution_quality='MISSED_EXECUTION',preflight_json=?,terminal_at=?,
+                    updated_at=? WHERE id=?""",
+                (
+                    trading_date.isoformat(),
+                    reason,
+                    _json(evidence),
+                    now,
+                    now,
+                    order_id,
+                ),
+            )
+            self._event(
+                conn,
+                event_key=f"{order_id}:HISTORICAL_MISSED:{trading_date.isoformat()}",
+                account_id=order["account_id"],
+                event_type="MISSED_EXECUTION",
+                occurred_at=now,
+                trading_date=trading_date.isoformat(),
+                entity_type="order",
+                entity_id=order_id,
+                severity="critical",
+                title=f"{order['name'] or order['symbol']} 错过原定开盘",
+                detail=reason,
+                payload=evidence,
+            )
+            self._upsert_incident_tx(
+                conn,
+                account_id=order["account_id"],
+                incident_key=f"order:{order_id}:MISSED_EXECUTION",
+                code="MISSED_EXECUTION",
+                severity="critical",
+                title=f"{order['name'] or order['symbol']} 执行异常",
+                detail=reason,
+                entity_type="order",
+                entity_id=order_id,
+                now=now,
+            )
+        return True
+
     def terminal_order(
         self,
         order_id: str,
@@ -592,19 +653,29 @@ class PaperLedger:
             order = conn.execute("SELECT * FROM orders WHERE id=?", (order_id,)).fetchone()
             if order is None:
                 raise KeyError(order_id)
-            if order["status"] in TERMINAL_ORDER_STATUSES and order["status"] != "MISSED_EXECUTION":
+            recovering_unknown = (
+                order["status"] == "UNKNOWN_MARKET_DATA"
+                and quality == "RECOVERED_LATE"
+                and status != "UNKNOWN_MARKET_DATA"
+            )
+            if (
+                order["status"] in TERMINAL_ORDER_STATUSES
+                and order["status"] != "MISSED_EXECUTION"
+                and not recovering_unknown
+            ):
                 return
             conn.execute(
                 """UPDATE orders SET status=?,reason=?,execution_quality=?,terminal_at=?,updated_at=?
                     WHERE id=?""",
                 (status, reason, quality, now, now, order_id),
             )
-            if order["status"] == "MISSED_EXECUTION" and status != "MISSED_EXECUTION":
-                conn.execute(
-                    """UPDATE incidents SET status='resolved',resolved_at=?
-                        WHERE incident_key=? AND status='open'""",
-                    (now, f"order:{order_id}:MISSED_EXECUTION"),
-                )
+            for prior_status in ("MISSED_EXECUTION", "UNKNOWN_MARKET_DATA"):
+                if order["status"] == prior_status and status != prior_status:
+                    conn.execute(
+                        """UPDATE incidents SET status='resolved',resolved_at=?
+                            WHERE incident_key=? AND status='open'""",
+                        (now, f"order:{order_id}:{prior_status}"),
+                    )
             self._event(
                 conn,
                 event_key=f"{order_id}:TERMINAL:{status}",
@@ -656,7 +727,11 @@ class PaperLedger:
             existing = conn.execute("SELECT id FROM fills WHERE order_id=?", (order_id,)).fetchone()
             if existing is not None:
                 return str(existing["id"])
-            if order["status"] in TERMINAL_ORDER_STATUSES and order["status"] != "MISSED_EXECUTION":
+            recoverable_terminal = (
+                quality == "RECOVERED_LATE"
+                and order["status"] in {"MISSED_EXECUTION", "UNKNOWN_MARKET_DATA"}
+            )
+            if order["status"] in TERMINAL_ORDER_STATUSES and not recoverable_terminal:
                 raise PaperLedgerError(f"订单已终结: {order['status']}")
             account = conn.execute("SELECT * FROM accounts WHERE id=?", (order["account_id"],)).fetchone()
             config = _loads(account["config_json"], {})
@@ -668,6 +743,7 @@ class PaperLedger:
             side = str(order["side"])
             gross = float(price) * int(quantity)
             quote_date = quote_text[:10]
+            execution_date = now[:10]
             day_pnl = 0.0
             if side == "BUY":
                 cash_total = model.buy_cash_required(price, quantity)
@@ -728,6 +804,8 @@ class PaperLedger:
                 ).fetchone()
                 cost = -cash_delta
                 if current is None:
+                    unlocked_quantity = quantity if quote_date < execution_date else 0
+                    locked_quantity = quantity - unlocked_quantity
                     conn.execute(
                         """INSERT INTO positions(
                             account_id,symbol,name,quantity,available_qty,locked_qty,
@@ -737,7 +815,8 @@ class PaperLedger:
                         ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                         (
                             order["account_id"], order["symbol"], order["name"], quantity,
-                            0, quantity, cost / quantity, cost, quote_text[:10], price, price,
+                            unlocked_quantity, locked_quantity, cost / quantity, cost,
+                            quote_text[:10], price, price,
                             gross, gross - cost, previous_close, gross - cost, quote_date,
                             quantity, cost, quote_text, source,
                         ),
@@ -758,15 +837,19 @@ class PaperLedger:
                         old_qty * (price - reference)
                         + bought_qty * price - bought_cost
                     )
+                    unlocked_quantity = quantity if quote_date < execution_date else 0
+                    locked_quantity = quantity - unlocked_quantity
                     conn.execute(
-                        """UPDATE positions SET quantity=?,locked_qty=locked_qty+?,
+                        """UPDATE positions SET quantity=?,available_qty=available_qty+?,
+                            locked_qty=locked_qty+?,
                             average_price=?,cost_basis=?,last_price=?,market_value=?,
                             unrealized_pnl=?,previous_close=?,day_pnl=?,pnl_date=?,
                             today_bought_qty=?,today_bought_cost=?,quote_at=?,quote_source=?,
                             max_price=max(max_price,?)
                             WHERE account_id=? AND symbol=?""",
                         (
-                            new_qty, quantity, new_cost / new_qty, new_cost, price,
+                            new_qty, unlocked_quantity, locked_quantity,
+                            new_cost / new_qty, new_cost, price,
                             new_qty * price, new_qty * price - new_cost, reference,
                             current_day_pnl + gross - cost, quote_date,
                             bought_qty + quantity, bought_cost + cost, quote_text, source, price,
@@ -826,12 +909,13 @@ class PaperLedger:
                     now, now, order_id,
                 ),
             )
-            if order["status"] == "MISSED_EXECUTION":
-                conn.execute(
-                    """UPDATE incidents SET status='resolved',resolved_at=?
-                        WHERE incident_key=? AND status='open'""",
-                    (now, f"order:{order_id}:MISSED_EXECUTION"),
-                )
+            for prior_status in ("MISSED_EXECUTION", "UNKNOWN_MARKET_DATA"):
+                if order["status"] == prior_status:
+                    conn.execute(
+                        """UPDATE incidents SET status='resolved',resolved_at=?
+                            WHERE incident_key=? AND status='open'""",
+                        (now, f"order:{order_id}:{prior_status}"),
+                    )
             self._event(
                 conn,
                 event_key=f"{order_id}:FILL:{fill_id}",
@@ -916,6 +1000,23 @@ class PaperLedger:
         with self._connect() as conn:
             return conn.execute(sql, params).fetchall()
 
+    def recovery_orders(self, *, account_id: str | None = None) -> list[sqlite3.Row]:
+        """Orders whose execution-window result awaits later reliable evidence."""
+        sql = """SELECT o.*,s.signal_date,s.reason AS signal_reason,s.score
+            FROM orders o
+            JOIN signal_intents s ON s.id=o.signal_id
+            JOIN accounts a ON a.id=o.account_id
+            WHERE o.status IN ('MISSED_EXECUTION','UNKNOWN_MARKET_DATA')
+            AND o.scheduled_date IS NOT NULL
+            AND a.status!='deleted'"""
+        params: tuple[Any, ...] = ()
+        if account_id:
+            sql += " AND o.account_id=?"
+            params = (account_id,)
+        sql += " ORDER BY o.scheduled_date,o.created_at,o.id"
+        with self._connect() as conn:
+            return conn.execute(sql, params).fetchall()
+
     def tracked_symbols(self) -> set[str]:
         with self._connect() as conn:
             rows = conn.execute(
@@ -923,7 +1024,9 @@ class PaperLedger:
                     WHERE p.quantity>0 AND a.status!='deleted'
                     UNION SELECT o.symbol FROM orders o JOIN accounts a ON a.id=o.account_id
                     WHERE a.status!='deleted'
-                    AND o.status IN ('PLANNED','PREFLIGHT_OK','MISSED_EXECUTION')"""
+                    AND o.status IN (
+                        'PLANNED','PREFLIGHT_OK','MISSED_EXECUTION','UNKNOWN_MARKET_DATA'
+                    )"""
             ).fetchall()
         return {str(row[0]) for row in rows if row[0]}
 

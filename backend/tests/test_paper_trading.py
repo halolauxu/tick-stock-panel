@@ -56,7 +56,17 @@ class FakeRepo:
         return SIGNAL_DAY
 
     def get_minute_batch(self, _symbols: list[str], _trading_date: date) -> pl.DataFrame:
-        return pl.DataFrame(self.minute_rows)
+        rows = [
+            row for row in self.minute_rows
+            if row.get("symbol") in _symbols
+            and row.get("datetime") is not None
+            and (
+                row["datetime"].date()
+                if row["datetime"].tzinfo is not None
+                else row["datetime"].replace(tzinfo=CN_TZ).date()
+            ) == _trading_date
+        ]
+        return pl.DataFrame(rows)
 
     @staticmethod
     def get_daily_asset(
@@ -162,6 +172,7 @@ def test_scheduler_registers_and_dispatches_all_exchange_clock_boundaries():
         execute_open_orders=lambda: calls.append("open"),
         finalize_open_window=lambda: calls.append("deadline"),
         settle_all=lambda: calls.append("settlement"),
+        recover_missed_open=lambda: calls.append("recovery"),
     )
     daily_pipeline.set_app_state(SimpleNamespace(paper_trading_service=service))
 
@@ -171,15 +182,17 @@ def test_scheduler_registers_and_dispatches_all_exchange_clock_boundaries():
         "paper_open_execution",
         "paper_open_deadline",
         "paper_settlement",
+        "paper_evidence_recovery",
     ):
         jobs[job_id]["func"]()
 
-    assert calls == ["preflight", "open", "deadline", "settlement"]
+    assert calls == ["preflight", "open", "deadline", "settlement", "recovery"]
     assert str(jobs["paper_preflight"]["trigger"]).startswith("cron[day_of_week='mon-fri'")
     assert "hour='9', minute='30', second='5,25,45'" in str(
         jobs["paper_open_execution"]["trigger"]
     )
     assert "interval[0:00:10]" in str(jobs["paper_quote_tick"]["trigger"])
+    assert "interval[0:01:00]" in str(jobs["paper_evidence_recovery"]["trigger"])
 
 
 def test_quote_tick_refreshes_tracked_paper_symbols_during_market(monkeypatch):
@@ -424,7 +437,13 @@ def test_late_recovery_preserves_missed_event_and_marks_fill_recovered_late(tmp_
     current = service.account(account["id"])
     event_types = {event["event_type"] for event in current["timeline"]}
 
-    assert result == {"missed": 1, "recovered": 1, "unknown": 0}
+    assert result == {
+        "missed": 1,
+        "recovered": 1,
+        "resolved": 0,
+        "unknown": 0,
+        "waiting_evidence": 0,
+    }
     assert current["orders"][0]["status"] == "FILLED"
     assert current["orders"][0]["execution_quality"] == "RECOVERED_LATE"
     assert current["fills"][0]["quality"] == "RECOVERED_LATE"
@@ -446,10 +465,202 @@ def test_late_recovery_without_reliable_minute_data_stays_unknown(tmp_path):
     )
     current = service.account(account["id"])
 
-    assert result == {"missed": 1, "recovered": 0, "unknown": 1}
+    assert result == {
+        "missed": 1,
+        "recovered": 0,
+        "resolved": 0,
+        "unknown": 1,
+        "waiting_evidence": 1,
+    }
     assert current["orders"][0]["status"] == "UNKNOWN_MARKET_DATA"
     assert current["orders"][0]["execution_quality"] == "NO_RELIABLE_OPEN_DATA"
     assert current["fills"] == []
+
+
+def test_unknown_order_is_reconciled_when_opening_evidence_arrives_later(tmp_path):
+    service = _service(tmp_path)
+    account, _ = _account_with_buy_order(service)
+    market_quote = _quote(
+        symbol="000002.SZ", at=datetime(2026, 8, 27, 11, 25, tzinfo=CN_TZ)
+    )
+    service._quotes_from_cache = lambda: {"000002.SZ": market_quote}  # type: ignore[method-assign]
+
+    first = service.recover_missed_open(
+        now=datetime(2026, 8, 27, 11, 25, tzinfo=CN_TZ)
+    )
+    assert first["waiting_evidence"] == 1
+    assert service.account(account["id"])["orders"][0]["status"] == (
+        "UNKNOWN_MARKET_DATA"
+    )
+    assert service.subscription_symbols() == {"000001.SZ"}
+
+    service.repo.minute_rows = [{
+        "symbol": "000001.SZ",
+        "datetime": datetime(2026, 8, 27, 9, 30, tzinfo=CN_TZ),
+        "open": 10.0,
+        "high": 10.05,
+        "low": 9.98,
+        "close": 10.02,
+        "volume": 12_000,
+    }]
+    second = service.recover_missed_open(
+        now=datetime(2026, 8, 27, 11, 26, tzinfo=CN_TZ)
+    )
+    current = service.account(account["id"])
+
+    assert second["recovered"] == 1
+    assert current["orders"][0]["status"] == "FILLED"
+    assert current["orders"][0]["execution_quality"] == "RECOVERED_LATE"
+    assert len(current["fills"]) == 1
+    assert current["summary"]["critical_incident_count"] == 0
+    assert service.recover_missed_open(
+        now=datetime(2026, 8, 27, 11, 27, tzinfo=CN_TZ)
+    )["recovered"] == 0
+    assert len(service.account(account["id"])["fills"]) == 1
+
+
+def test_unknown_recovery_survives_restart_and_unlocks_historical_buy(
+    tmp_path, monkeypatch
+):
+    service = _service(tmp_path)
+    account, _ = _account_with_buy_order(service)
+    market_quote = _quote(
+        symbol="000002.SZ", at=datetime(2026, 8, 27, 11, 25, tzinfo=CN_TZ)
+    )
+    service._quotes_from_cache = lambda: {"000002.SZ": market_quote}  # type: ignore[method-assign]
+    service.recover_missed_open(
+        now=datetime(2026, 8, 27, 11, 25, tzinfo=CN_TZ)
+    )
+
+    next_day = datetime(2026, 8, 28, 8, 0, tzinfo=CN_TZ)
+    monkeypatch.setattr("app.services.paper_ledger.cn_now", lambda: next_day)
+    minute_rows = [{
+        "symbol": "000001.SZ",
+        "datetime": datetime(2026, 8, 27, 9, 30, tzinfo=CN_TZ),
+        "open": 10.0,
+        "high": 10.05,
+        "low": 9.98,
+        "close": 10.02,
+        "volume": 12_000,
+    }]
+    restarted = _service(tmp_path, minute_rows=minute_rows)
+
+    result = restarted.recover_missed_open(now=next_day)
+    current = restarted.account(account["id"])
+
+    assert result["recovered"] == 1
+    assert len(current["fills"]) == 1
+    assert current["positions"][0]["available_qty"] == 1_000
+    assert current["positions"][0]["locked_qty"] == 0
+    assert _service(tmp_path, minute_rows=minute_rows).recover_missed_open(
+        now=next_day
+    )["recovered"] == 0
+    assert len(restarted.account(account["id"])["fills"]) == 1
+
+
+def test_full_day_downtime_keeps_original_next_session_instead_of_deployment_day(
+    tmp_path, monkeypatch
+):
+    service = _service(tmp_path)
+    account, _ = _account_with_buy_order(service)
+    daily_partition = tmp_path / "kline_daily" / "date=2026-08-27"
+    daily_partition.mkdir(parents=True)
+    (daily_partition / "part.parquet").touch()
+    minute_rows = [{
+        "symbol": "000001.SZ",
+        "datetime": datetime(2026, 8, 27, 9, 30, tzinfo=CN_TZ),
+        "open": 10.0,
+        "high": 10.05,
+        "low": 9.98,
+        "close": 10.02,
+        "volume": 12_000,
+    }]
+    restarted_at = datetime(2026, 8, 28, 8, 0, tzinfo=CN_TZ)
+    monkeypatch.setattr("app.services.paper_ledger.cn_now", lambda: restarted_at)
+    restarted = _service(tmp_path, minute_rows=minute_rows)
+
+    result = restarted.recover_missed_open(now=restarted_at)
+    current = restarted.account(account["id"])
+
+    assert result["missed"] == 1
+    assert result["recovered"] == 1
+    assert current["orders"][0]["scheduled_date"] == "2026-08-27"
+    assert current["orders"][0]["status"] == "FILLED"
+    assert current["orders"][0]["execution_quality"] == "RECOVERED_LATE"
+    assert current["positions"][0]["available_qty"] == 1_000
+    assert current["positions"][0]["locked_qty"] == 0
+    assert any(
+        event["event_type"] == "MISSED_EXECUTION"
+        and event["trading_date"] == "2026-08-27"
+        for event in current["timeline"]
+    )
+
+
+def test_unknown_order_only_allows_compensating_late_fill(tmp_path):
+    service = _service(tmp_path)
+    account, order_id = _account_with_buy_order(service)
+    service.ledger.assign_due_date(order_id, TRADE_DAY, {})
+    service.ledger.terminal_order(
+        order_id,
+        status="UNKNOWN_MARKET_DATA",
+        reason="09:31 时没有可靠开盘行情",
+        quality="NO_RELIABLE_OPEN_DATA",
+    )
+
+    with pytest.raises(PaperLedgerError, match="订单已终结"):
+        service.ledger.execute_fill(
+            order_id,
+            price=10,
+            quantity=1_000,
+            quote_at=OPEN_TIME,
+            source="minute_k",
+        )
+
+    service.ledger.execute_fill(
+        order_id,
+        price=10,
+        quantity=1_000,
+        quote_at=OPEN_TIME,
+        source="minute_k_recovery",
+        quality="RECOVERED_LATE",
+    )
+    assert service.account(account["id"])["orders"][0]["status"] == "FILLED"
+
+
+def test_recovery_fetches_only_missing_symbol_opening_minutes(
+    tmp_path, monkeypatch
+):
+    calls: list[tuple[str, date, str]] = []
+
+    def fetch(symbol: str, trading_date: date, asset_type: str) -> pl.DataFrame:
+        calls.append((symbol, trading_date, asset_type))
+        return pl.DataFrame([{
+            "symbol": symbol,
+            "datetime": datetime(2026, 8, 27, 9, 30, tzinfo=CN_TZ),
+            "open": 10.0,
+            "high": 10.05,
+            "low": 9.98,
+            "close": 10.02,
+            "volume": 12_000,
+        }])
+
+    monkeypatch.setattr("app.services.kline_sync.fetch_minute_single", fetch)
+    state = SimpleNamespace(
+        repo=FakeRepo(tmp_path),
+        capabilities=SimpleNamespace(has=lambda _capability: True),
+    )
+    service = PaperTradingService(state)
+    account, _ = _account_with_buy_order(service)
+    service._quotes_from_cache = lambda: {}  # type: ignore[method-assign]
+
+    result = service.recover_missed_open(
+        now=datetime(2026, 8, 27, 11, 25, tzinfo=CN_TZ)
+    )
+    current = service.account(account["id"])
+
+    assert calls == [("000001.SZ", TRADE_DAY, "stock")]
+    assert result["recovered"] == 1
+    assert current["fills"][0]["source"] == "minute_k_targeted_recovery"
 
 
 def test_intraday_stop_on_same_day_buy_is_t1_locked_and_not_sold(tmp_path):

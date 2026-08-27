@@ -420,6 +420,10 @@ def test_successful_pipeline_runs_paper_accounts_before_mining(monkeypatch):
     calls = []
     state = SimpleNamespace(
         paper_trading_service=SimpleNamespace(
+            recover_missed_open=lambda: calls.append(("paper", "recovered")) or {
+                "recovered": 0,
+                "waiting_evidence": 0,
+            },
             seal_daily_signals=lambda: calls.append(("paper", "sealed")) or {
                 "processed": 1,
                 "failed": 0,
@@ -436,7 +440,11 @@ def test_successful_pipeline_runs_paper_accounts_before_mining(monkeypatch):
 
     daily_pipeline._scheduled_pipeline_task(lambda: None)
 
-    assert calls == [("paper", "sealed"), ("mining", state)]
+    assert calls == [
+        ("paper", "recovered"),
+        ("paper", "sealed"),
+        ("mining", state),
+    ]
 
 
 def test_enqueue_failure_does_not_escape_successful_pipeline(monkeypatch):

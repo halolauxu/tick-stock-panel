@@ -899,14 +899,20 @@ def _scheduled_pipeline_task(pipeline_fn) -> None:
     """Freeze the newly sealed day of paper signals after the pipeline succeeds."""
     if not _run_tracked(pipeline_fn, "daily_pipeline"):
         return
-    try:
-        service = getattr(_get_app_state(), "paper_trading_service", None)
-        result = service.seal_daily_signals() if service else {
-            "processed": 0, "failed": 0, "orders": 0,
-        }
-        logger.info("scheduled paper signal seal result: %s", result)
-    except Exception:
-        logger.exception("scheduled paper trading failed; daily pipeline remains succeeded")
+    service = getattr(_get_app_state(), "paper_trading_service", None)
+    if service is not None:
+        try:
+            recovery = service.recover_missed_open()
+            logger.info("scheduled paper evidence recovery result: %s", recovery)
+        except Exception:
+            logger.exception(
+                "scheduled paper evidence recovery failed; signal sealing will continue"
+            )
+        try:
+            result = service.seal_daily_signals()
+            logger.info("scheduled paper signal seal result: %s", result)
+        except Exception:
+            logger.exception("scheduled paper signal seal failed; daily pipeline remains succeeded")
     try:
         from app.services.mining_schedule import run_weekly_mining
 
@@ -1137,7 +1143,7 @@ def _paper_clock_call(method: str) -> None:
 
 
 def _register_paper_clock_jobs(scheduler) -> None:
-    """Register the four explicit exchange-clock boundaries for paper trading."""
+    """Register exchange-clock boundaries plus persistent evidence recovery."""
     scheduler.add_job(
         lambda: _paper_clock_call("preflight_all"),
         trigger=CronTrigger(day_of_week="mon-fri", hour=9, minute=25,
@@ -1169,6 +1175,15 @@ def _register_paper_clock_jobs(scheduler) -> None:
                             timezone="Asia/Shanghai"),
         id="paper_settlement",
         misfire_grace_time=1800,
+        replace_existing=True,
+    )
+    scheduler.add_job(
+        lambda: _paper_clock_call("recover_missed_open"),
+        trigger=IntervalTrigger(minutes=1),
+        id="paper_evidence_recovery",
+        misfire_grace_time=60,
+        coalesce=True,
+        max_instances=1,
         replace_existing=True,
     )
     scheduler.add_job(

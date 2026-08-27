@@ -75,7 +75,7 @@ const STATUS_LABELS: Record<string, string> = {
   REJECTED_LIMIT_DOWN: '跌停无法卖出',
   REJECTED_SUSPENDED: '停牌 / 无成交',
   REJECTED_INSUFFICIENT_CASH: '资金不足',
-  UNKNOWN_MARKET_DATA: '行情不足 · 未知',
+  UNKNOWN_MARKET_DATA: '行情不足 · 等待自动复核',
   EXECUTION_FAILED: '执行失败',
   MISSED_EXECUTION: '错过执行窗口',
   CANCELLED: '已取消',
@@ -84,7 +84,7 @@ const STATUS_LABELS: Record<string, string> = {
 const QUALITY_LABELS: Record<string, string> = {
   ON_TIME: '按时执行',
   RECOVERED_LATE: '延迟恢复',
-  NO_RELIABLE_OPEN_DATA: '无可靠开盘证据',
+  NO_RELIABLE_OPEN_DATA: '无可靠开盘证据 · 持续自动复核',
   MISSED_EXECUTION: '错过开盘时钟',
 }
 

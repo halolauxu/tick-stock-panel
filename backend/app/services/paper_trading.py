@@ -161,6 +161,7 @@ class PaperTradingService:
         self.repo = app_state.repo
         self.ledger = PaperLedger(self.repo.store.data_dir)
         self._lock = threading.RLock()
+        self._recovery_fetch_last: dict[tuple[date, str], datetime] = {}
         self._migrate_legacy_json()
 
     def _migrate_legacy_json(self) -> None:
@@ -838,10 +839,145 @@ class PaperTradingService:
                     logger.exception("paper settlement failed: %s", row["id"])
         return summary
 
+    @staticmethod
+    def _opening_minutes(
+        frame: pl.DataFrame,
+        trading_date: date,
+    ) -> dict[str, dict[str, Any]]:
+        if frame.is_empty() or "datetime" not in frame.columns or "symbol" not in frame.columns:
+            return {}
+        minute_time = pl.col("datetime")
+        minute_dtype = frame.schema.get("datetime")
+        if isinstance(minute_dtype, pl.Datetime) and minute_dtype.time_zone:
+            minute_time = minute_time.dt.convert_time_zone("Asia/Shanghai")
+        valid = frame.filter(
+            (minute_time.dt.time() >= OPEN_START)
+            & (minute_time.dt.time() <= OPEN_DEADLINE)
+        ).sort(["symbol", "datetime"])
+        result: dict[str, dict[str, Any]] = {}
+        for symbol, symbol_frame in valid.group_by("symbol", maintain_order=True):
+            key = symbol[0] if isinstance(symbol, tuple) else symbol
+            for row in symbol_frame.iter_rows(named=True):
+                if _as_cn(row["datetime"]).date() == trading_date:
+                    result[str(key)] = row
+                    break
+        return result
+
+    def _remote_opening_minute(
+        self,
+        order: dict[str, Any],
+        trading_date: date,
+        current: datetime,
+    ) -> dict[str, Any] | None:
+        """Fetch only one missing execution symbol, with a five-minute retry backoff."""
+        capset = getattr(self.app_state, "capabilities", None)
+        if capset is None:
+            return None
+        try:
+            from app.tickflow.capabilities import Cap
+
+            if not capset.has(Cap.KLINE_MINUTE_BATCH):
+                return None
+        except Exception:
+            return None
+        key = (trading_date, str(order["symbol"]))
+        last_attempt = self._recovery_fetch_last.get(key)
+        if last_attempt is not None and (current - last_attempt).total_seconds() < 300:
+            return None
+        self._recovery_fetch_last[key] = current
+        try:
+            from app.services.kline_sync import fetch_minute_single
+
+            account = self.ledger.get_account(order["account_id"])
+            frame = fetch_minute_single(
+                str(order["symbol"]),
+                trading_date,
+                asset_type=str(account["config"].get("asset_type", "stock")),
+            )
+            minute = self._opening_minutes(frame, trading_date).get(str(order["symbol"]))
+            if minute is not None:
+                minute["_recovery_source"] = "minute_k_targeted_recovery"
+            return minute
+        except Exception:
+            logger.exception(
+                "targeted paper recovery minute fetch failed: %s %s",
+                order["symbol"],
+                trading_date,
+            )
+            return None
+
+    def _first_observed_session_after(
+        self,
+        signal_date: date,
+        before_date: date,
+    ) -> date | None:
+        """Use persisted market partitions to recover the intended session after downtime."""
+        root = Path(self.repo.store.data_dir) / "kline_daily"
+        observed: list[date] = []
+        if not root.exists():
+            return None
+        for partition in root.glob("date=*"):
+            if not any(partition.glob("*.parquet")):
+                continue
+            try:
+                candidate = date.fromisoformat(partition.name.removeprefix("date="))
+            except ValueError:
+                continue
+            if signal_date < candidate < before_date:
+                observed.append(candidate)
+        return min(observed) if observed else None
+
+    def _promote_historical_misses(self, current_date: date) -> int:
+        """Freeze the original due session instead of shifting orders to deployment day."""
+        promoted = 0
+        active_accounts = {
+            row["id"] for row in self.ledger.list_account_rows(active_only=True)
+        }
+        for row in self.ledger.planned_orders():
+            order = dict(row)
+            if (
+                order["account_id"] not in active_accounts
+                or order["status"] not in {"PLANNED", "PREFLIGHT_OK"}
+            ):
+                continue
+            scheduled_text = order.get("scheduled_date")
+            if scheduled_text:
+                intended = date.fromisoformat(str(scheduled_text))
+                evidence_source = "frozen_schedule"
+            else:
+                intended = self._first_observed_session_after(
+                    date.fromisoformat(str(order["signal_date"])),
+                    current_date,
+                )
+                evidence_source = "local_daily_partition"
+            if intended is None or intended >= current_date:
+                continue
+            if self.ledger.mark_historically_missed(
+                order["id"],
+                intended,
+                {
+                    "source": evidence_source,
+                    "observed_after_restart": True,
+                    "checked_on": current_date.isoformat(),
+                },
+            ):
+                promoted += 1
+        return promoted
+
     def recover_missed_open(self, *, now: datetime | None = None) -> dict[str, int]:
+        """Reconcile missed windows whenever reliable opening evidence becomes available."""
         current = _as_cn(now)
-        result = {"missed": 0, "recovered": 0, "unknown": 0}
-        if current.time() < OPEN_DEADLINE:
+        result = {
+            "missed": 0,
+            "recovered": 0,
+            "resolved": 0,
+            "unknown": 0,
+            "waiting_evidence": 0,
+        }
+        with self._lock:
+            result["missed"] += self._promote_historical_misses(current.date())
+        existing_recovery = self.ledger.recovery_orders()
+        if current.time() < OPEN_DEADLINE and not existing_recovery:
             return result
         with self._lock:
             quotes = self._quotes_from_cache()
@@ -860,95 +996,205 @@ class PaperTradingService:
                         logger.exception("paper recovery quote refresh failed")
                     if not quotes:
                         quotes = self._quotes_from_cache()
-            minutes = self.repo.get_minute_batch(symbols, current.date()) if symbols else pl.DataFrame()
-            minute_by_symbol: dict[str, dict[str, Any]] = {}
-            if not minutes.is_empty() and "datetime" in minutes.columns:
-                minute_time = pl.col("datetime")
-                minute_dtype = minutes.schema.get("datetime")
-                if isinstance(minute_dtype, pl.Datetime) and minute_dtype.time_zone:
-                    minute_time = minute_time.dt.convert_time_zone("Asia/Shanghai")
-                valid = minutes.filter(
-                    (minute_time.dt.time() >= OPEN_START)
-                    & (minute_time.dt.time() <= OPEN_DEADLINE)
-                ).sort(["symbol", "datetime"])
-                for symbol, frame in valid.group_by("symbol", maintain_order=True):
-                    key = symbol[0] if isinstance(symbol, tuple) else symbol
-                    if not frame.is_empty():
-                        minute_by_symbol[str(key)] = frame.row(0, named=True)
-            market_observed = self._market_is_observed(current.date(), quotes) or bool(minute_by_symbol)
-            if not market_observed:
-                return result
-            recovery_quotes = quotes or {
+
+            current_minutes = (
+                self._opening_minutes(
+                    self.repo.get_minute_batch(symbols, current.date()),
+                    current.date(),
+                )
+                if symbols else {}
+            )
+            minute_quotes = {
                 symbol: {
                     "symbol": symbol,
                     "last_price": row.get("close"),
-                    "open": row.get("open"), "high": row.get("high"), "low": row.get("low"),
+                    "open": row.get("open"),
+                    "high": row.get("high"),
+                    "low": row.get("low"),
                     "volume": row.get("volume"),
                     "quote_at": _as_cn(row["datetime"]).isoformat(timespec="seconds"),
-                    "_quote_dt": _as_cn(row["datetime"]), "source": "minute_k",
+                    "_quote_dt": _as_cn(row["datetime"]),
+                    "source": "minute_k",
                 }
-                for symbol, row in minute_by_symbol.items()
+                for symbol, row in current_minutes.items()
             }
-            self.preflight_all(now=current, quotes=recovery_quotes)
-            for row in self.ledger.planned_orders():
-                order = dict(row)
-                if order["status"] != "PREFLIGHT_OK" or order["scheduled_date"] != current.date().isoformat():
-                    continue
-                self.ledger.terminal_order(
-                    order["id"],
-                    status="MISSED_EXECUTION",
-                    reason="服务未在 09:30 执行该订单, 已按真实发生时间记录错过开盘",
-                    quality="MISSED_EXECUTION",
-                    severity="critical",
+            if current.time() >= OPEN_DEADLINE:
+                for row in self.ledger.planned_orders():
+                    order = dict(row)
+                    if (
+                        order["status"] not in {"PLANNED", "PREFLIGHT_OK"}
+                        or date.fromisoformat(str(order["signal_date"])) >= current.date()
+                        or (
+                            order.get("scheduled_date") is not None
+                            and order["scheduled_date"] != current.date().isoformat()
+                        )
+                        or str(order["symbol"]) in current_minutes
+                    ):
+                        continue
+                    minute = self._remote_opening_minute(order, current.date(), current)
+                    if minute is not None:
+                        current_minutes[str(order["symbol"])] = minute
+                        minute_quotes[str(order["symbol"])] = {
+                            "symbol": str(order["symbol"]),
+                            "last_price": minute.get("close"),
+                            "open": minute.get("open"),
+                            "high": minute.get("high"),
+                            "low": minute.get("low"),
+                            "volume": minute.get("volume"),
+                            "quote_at": _as_cn(minute["datetime"]).isoformat(
+                                timespec="seconds"
+                            ),
+                            "_quote_dt": _as_cn(minute["datetime"]),
+                            "source": str(
+                                minute.get("_recovery_source")
+                                or "minute_k_targeted_recovery"
+                            ),
+                        }
+            confirmation_quotes = {**minute_quotes, **quotes}
+            if current.time() >= OPEN_DEADLINE and (
+                self._market_is_observed(current.date(), confirmation_quotes)
+                or bool(current_minutes)
+            ):
+                self.preflight_all(now=current, quotes=confirmation_quotes)
+                for row in self.ledger.planned_orders():
+                    order = dict(row)
+                    if (
+                        order["status"] != "PREFLIGHT_OK"
+                        or order["scheduled_date"] != current.date().isoformat()
+                    ):
+                        continue
+                    self.ledger.terminal_order(
+                        order["id"],
+                        status="MISSED_EXECUTION",
+                        reason="服务未在 09:30 执行该订单, 已按真实发生时间记录错过开盘",
+                        quality="MISSED_EXECUTION",
+                        severity="critical",
+                    )
+                    result["missed"] += 1
+
+            recovery_orders = [dict(row) for row in self.ledger.recovery_orders()]
+            by_date: dict[date, list[dict[str, Any]]] = {}
+            for order in recovery_orders:
+                trading_date = date.fromisoformat(str(order["scheduled_date"]))
+                by_date.setdefault(trading_date, []).append(order)
+
+            for trading_date, orders in by_date.items():
+                date_symbols = sorted({str(order["symbol"]) for order in orders})
+                minute_by_symbol = (
+                    dict(current_minutes)
+                    if trading_date == current.date()
+                    else self._opening_minutes(
+                        self.repo.get_minute_batch(date_symbols, trading_date),
+                        trading_date,
+                    )
                 )
-                result["missed"] += 1
-                minute = minute_by_symbol.get(order["symbol"])
-                if minute is None or not all(_valid_price(minute.get(key)) for key in ("open", "high", "low", "close")):
-                    self.ledger.terminal_order(
-                        order["id"], status="UNKNOWN_MARKET_DATA",
-                        reason="缺少 09:30-09:31 的完整可靠行情, 不制造成交",
-                        quality="NO_RELIABLE_OPEN_DATA",
-                    )
-                    result["unknown"] += 1
-                    continue
-                quote = {
-                    **minute,
-                    "last_price": minute["close"],
-                    "quote_at": _as_cn(minute["datetime"]).isoformat(timespec="seconds"),
-                    "_quote_dt": _as_cn(minute["datetime"]),
-                    "source": "minute_k_recovery",
-                }
-                blocked, reason = self._blocked_status(order, quote, current.date())
-                if blocked:
-                    self.ledger.terminal_order(order["id"], status=blocked, reason=reason, quality="RECOVERED_LATE")
-                    continue
-                account = self.ledger.get_account(order["account_id"])
-                price = float(minute["open"])
-                quantity = int(order["requested_qty"])
-                if order["side"] == "BUY":
-                    affordable = round_lot_quantity(
-                        account["summary"]["cash"], price, _account_cost_model(account["config"])
-                    )
-                    quantity = min(quantity or affordable, affordable)
-                if quantity <= 0:
-                    self.ledger.terminal_order(
-                        order["id"], status="REJECTED_INSUFFICIENT_CASH",
-                        reason="恢复撮合时可用资金不足", quality="RECOVERED_LATE",
-                    )
-                    continue
-                try:
-                    self.ledger.execute_fill(
-                        order["id"], price=price, quantity=quantity,
-                        quote_at=quote["_quote_dt"], source="minute_k_recovery",
-                        quality="RECOVERED_LATE",
-                        previous_close=self._reference_close(order, quote),
-                    )
-                    result["recovered"] += 1
-                except Exception as exc:
-                    self.ledger.terminal_order(
-                        order["id"], status="EXECUTION_FAILED", reason=str(exc),
-                        quality="RECOVERED_LATE",
-                    )
+                for order in orders:
+                    minute = minute_by_symbol.get(str(order["symbol"]))
+                    if minute is None:
+                        minute = self._remote_opening_minute(order, trading_date, current)
+                        if minute is not None:
+                            minute_by_symbol[str(order["symbol"])] = minute
+                    reliable = minute is not None and all(
+                        _valid_price(minute.get(key))
+                        for key in ("open", "high", "low", "close")
+                    ) and minute.get("volume") not in (None, 0)
+                    if not reliable:
+                        if order["status"] != "UNKNOWN_MARKET_DATA":
+                            self.ledger.terminal_order(
+                                order["id"],
+                                status="UNKNOWN_MARKET_DATA",
+                                reason=(
+                                    "09:31 当时缺少可靠开盘行情; 已进入自动证据恢复队列, "
+                                    "不会制造成交"
+                                ),
+                                quality="NO_RELIABLE_OPEN_DATA",
+                            )
+                            result["unknown"] += 1
+                        result["waiting_evidence"] += 1
+                        continue
+                    quote = {
+                        **minute,
+                        "last_price": minute["close"],
+                        "quote_at": _as_cn(minute["datetime"]).isoformat(timespec="seconds"),
+                        "_quote_dt": _as_cn(minute["datetime"]),
+                        "source": str(
+                            minute.get("_recovery_source") or "minute_k_recovery"
+                        ),
+                    }
+                    blocked, reason = self._blocked_status(order, quote, trading_date)
+                    if blocked:
+                        if blocked == "UNKNOWN_MARKET_DATA":
+                            result["waiting_evidence"] += 1
+                            continue
+                        self.ledger.terminal_order(
+                            order["id"],
+                            status=blocked,
+                            reason=reason,
+                            quality="RECOVERED_LATE",
+                        )
+                        result["resolved"] += 1
+                        continue
+                    account = self.ledger.get_account(order["account_id"])
+                    price = float(minute["open"])
+                    quantity = int(order["requested_qty"])
+                    if order["side"] == "BUY":
+                        affordable = round_lot_quantity(
+                            account["summary"]["cash"],
+                            price,
+                            _account_cost_model(account["config"]),
+                        )
+                        quantity = min(quantity or affordable, affordable)
+                    else:
+                        positions = {p["symbol"]: p for p in account["positions"]}
+                        position = positions.get(order["symbol"])
+                        quantity = min(
+                            quantity,
+                            int(position["available_qty"]) if position else 0,
+                        )
+                    if quantity <= 0:
+                        status = (
+                            "REJECTED_INSUFFICIENT_CASH"
+                            if order["side"] == "BUY"
+                            else "EXECUTION_FAILED"
+                        )
+                        reason = (
+                            "恢复撮合时可用资金不足"
+                            if order["side"] == "BUY"
+                            else "恢复撮合时可卖数量为零或受 T+1 锁定"
+                        )
+                        self.ledger.terminal_order(
+                            order["id"],
+                            status=status,
+                            reason=reason,
+                            quality="RECOVERED_LATE",
+                        )
+                        result["resolved"] += 1
+                        continue
+                    try:
+                        self.ledger.execute_fill(
+                            order["id"],
+                            price=price,
+                            quantity=quantity,
+                            quote_at=quote["_quote_dt"],
+                            source=quote["source"],
+                            quality="RECOVERED_LATE",
+                            previous_close=self._reference_close(order, quote),
+                        )
+                        current_quote = quotes.get(str(order["symbol"]))
+                        if current_quote is not None:
+                            self.ledger.update_marks(
+                                {str(order["symbol"]): current_quote},
+                                source=str(current_quote.get("source") or "recovery_mark"),
+                            )
+                        result["recovered"] += 1
+                    except Exception as exc:
+                        self.ledger.terminal_order(
+                            order["id"],
+                            status="EXECUTION_FAILED",
+                            reason=str(exc),
+                            quality="RECOVERED_LATE",
+                        )
+                        result["resolved"] += 1
         return result
 
     def sync_account(self, account_id: str) -> dict[str, Any]:
