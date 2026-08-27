@@ -606,7 +606,7 @@ def validate_minute_partitions(
     """深度校验指定范围内已有日 K 对应的分钟 K 分区。
 
     完整交易日要求：无空时间/OHLC、无非法 OHLC、无重复键、无盘后记录，且
-    至少覆盖当天日 K 标的数的 98%，每个计入完整的标的恰好 241 根。
+    必须覆盖当天全部日 K 标的，每个计入完整的标的恰好 241 根。
     """
     data_dir = Path(data_dir)
     daily_dir = data_dir / "kline_daily"
@@ -644,7 +644,7 @@ def validate_minute_partitions(
             or 0
         )
         baseline = expected or int(quality["symbols"])
-        required = (baseline * 98 + 99) // 100 if baseline else 0
+        required = baseline
         structural_ok = all(
             int(quality[key]) == 0
             for key in (
@@ -818,7 +818,7 @@ def minute_coverage_summary(data_dir: Path) -> dict[str, object] | None:
         full_symbols = int(stats.get("full_symbols") or 0)
         max_bars = int(stats.get("max_bars") or 0)
         baseline = expected or symbols
-        required = (baseline * 98 + 99) // 100 if baseline else 0
+        required = baseline
         complete = bool(
             max_bars == REGULAR_MINUTE_BARS
             and required

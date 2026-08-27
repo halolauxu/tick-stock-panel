@@ -90,6 +90,23 @@ def test_minute_coverage_distinguishes_landed_and_complete_days(tmp_path):
     assert "dates" not in status
 
 
+def test_minute_coverage_requires_every_daily_symbol(tmp_path):
+    trade_date = date(2026, 8, 13)
+    _daily_day(tmp_path, trade_date, symbols=2)
+    _write_minute_partition(
+        _minute_day(trade_date, 241, symbols=1),
+        tmp_path / "kline_minute",
+    )
+
+    summary = minute_coverage_summary(tmp_path)
+    validation = validate_minute_partitions(tmp_path, trade_date, trade_date)
+
+    assert summary["complete_days"] == 0
+    assert summary["incomplete_days"] == 1
+    assert validation["valid"] is False
+    assert validation["dates"][0]["required_full_symbols"] == 2
+
+
 def test_repairs_post_market_rows_and_rebuilds_complete_stats(tmp_path):
     trade_date = date(2026, 8, 13)
     _daily_day(tmp_path, trade_date)
