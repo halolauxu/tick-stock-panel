@@ -973,7 +973,7 @@ class PaperTradingService:
             trading_date,
             [
                 "date", "raw_open", "raw_high", "raw_low", "raw_close", "raw_volume",
-                "open", "high", "low", "close", "volume", "prev_close",
+                "open", "high", "low", "close", "volume", "prev_close", "quote_ts",
             ],
         )
         if frame.is_empty():
@@ -981,6 +981,11 @@ class PaperTradingService:
         row = frame.row(-1, named=True)
         row_date = row.get("date")
         if row_date is not None and str(row_date)[:10] != trading_date.isoformat():
+            return None
+        live_marker = _quote_datetime(row.get("quote_ts"))
+        if live_marker is not None and (
+            live_marker.date() != trading_date or live_marker.time() < dt_time(15, 0)
+        ):
             return None
 
         def daily_value(key: str) -> Any:

@@ -705,6 +705,40 @@ def test_historical_daily_ohlcv_recovers_without_full_market_minute_partition(
     assert current["positions"][0]["locked_qty"] == 0
 
 
+def test_partial_live_daily_partition_is_not_historical_recovery_evidence(
+    tmp_path, monkeypatch
+):
+    service = _service(tmp_path)
+    account, _ = _account_with_buy_order(service)
+    daily_partition = tmp_path / "kline_daily" / "date=2026-08-27"
+    daily_partition.mkdir(parents=True)
+    (daily_partition / "part.parquet").touch()
+    next_day = datetime(2026, 8, 28, 8, 0, tzinfo=CN_TZ)
+    monkeypatch.setattr("app.services.paper_ledger.cn_now", lambda: next_day)
+    restarted = _service(
+        tmp_path,
+        daily_rows=[{
+            "symbol": "000001.SZ",
+            "date": TRADE_DAY,
+            "open": 10.0,
+            "high": 10.4,
+            "low": 9.8,
+            "close": 10.2,
+            "volume": 88_000,
+            "prev_close": 9.9,
+            "quote_ts": datetime(2026, 8, 27, 14, 13, tzinfo=CN_TZ),
+        }],
+    )
+
+    result = restarted.recover_missed_open(now=next_day)
+    current = restarted.account(account["id"])
+
+    assert result["recovered"] == 0
+    assert result["waiting_evidence"] == 1
+    assert current["orders"][0]["status"] == "UNKNOWN_MARKET_DATA"
+    assert current["fills"] == []
+
+
 def test_unknown_order_only_allows_compensating_late_fill(tmp_path):
     service = _service(tmp_path)
     account, order_id = _account_with_buy_order(service)
