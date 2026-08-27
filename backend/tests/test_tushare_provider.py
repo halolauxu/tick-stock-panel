@@ -180,6 +180,23 @@ def test_provider_normalizes_schema_orders_rows_and_converts_cn_window():
     assert progress == [(1, 1)]
 
 
+def test_provider_filters_bse_post_market_minutes():
+    fields = list(tc.MINUTE_FIELDS)
+    rows = [
+        dict(zip(fields, item, strict=True))
+        for item in (
+            ["920001.BJ", "2026-08-25 15:00:00", 10, 10, 10, 10, 100, 1000],
+            ["920001.BJ", "2026-08-25 15:01:00", 10, 10, 10, 10, 100, 1000],
+            ["920001.BJ", "2026-08-25 15:30:00", 10, 10, 10, 10, 100, 1000],
+        )
+    ]
+
+    frame = TushareProvider._minute_df(rows)
+
+    assert frame.height == 1
+    assert frame["datetime"].item() == datetime(2026, 8, 25, 15, 0)
+
+
 def test_provider_rejects_unpurchased_asset_types():
     with pytest.raises(TushareError, match="仅覆盖 A股历史分钟"):
         TushareProvider().get_minute(["510300.SH"], None, None, asset_type="etf")

@@ -27,6 +27,7 @@ from app import secrets_store
 from app.data_providers.base import AssetType
 from app.market_time import CN_TZ
 from app.plugins.tushare.client import TushareClient, TushareError
+from app.services.minute_quality import filter_regular_session
 
 logger = logging.getLogger(__name__)
 
@@ -566,7 +567,7 @@ class TushareProvider:
             .select(_MINUTE_CANONICAL)
             .drop_nulls(_MINUTE_CANONICAL)
         )
-        return frame
+        return filter_regular_session(frame)
 
     def test_dataset(self, dataset: str, symbols: list[str] | None = None) -> dict:
         if dataset not in _DATASETS:

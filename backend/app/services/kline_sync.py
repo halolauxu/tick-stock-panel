@@ -21,6 +21,11 @@ from app.data_providers.base import AssetType
 from app.indicators.pipeline import filter_halt_days
 from app.market_time import CN_TZ, cn_now, cn_today
 from app.services import preferences
+from app.services.minute_quality import (
+    REGULAR_MINUTE_BARS,
+    filter_regular_session,
+    minute_quality_payload,
+)
 from app.tickflow.capabilities import Cap, CapabilitySet
 from app.tickflow.client import get_client
 from app.tickflow.rate_limits import chunked, resolve_limit, sleep_between_batches
@@ -526,7 +531,7 @@ def _normalize_minute(df_in, default_symbol: str | None = None) -> pl.DataFrame:
             df = df.with_columns(pl.col(col).cast(pl.Float64, strict=False))
 
     keep = [c for c in CANONICAL_MINUTE_COLS if c in df.columns]
-    return df.select(keep)
+    return filter_regular_session(df.select(keep))
 
 
 def _datetime_to_ms(dt: datetime) -> int:
@@ -539,6 +544,7 @@ def _write_minute_partition(df: pl.DataFrame, minute_dir) -> int:
 
     抽自原 sync_and_persist_minute 末尾的循环, 供流式落盘 (每段一次) 与一次性迁移共用。
     """
+    df = filter_regular_session(df)
     if df.is_empty():
         return 0
     df = df.with_columns(pl.col("datetime").dt.date().alias("_trade_date"))
@@ -549,8 +555,7 @@ def _write_minute_partition(df: pl.DataFrame, minute_dir) -> int:
         out.parent.mkdir(parents=True, exist_ok=True)
         if out.exists():
             existing = pl.read_parquet(out)
-            if "datetime" in existing.columns:
-                existing = existing.filter(pl.col("datetime").is_not_null())
+            existing = filter_regular_session(existing)
             day_df = pl.concat([existing, day_df.drop("_trade_date")]).unique(
                 subset=["symbol", "datetime"], keep="last",
             )
@@ -565,19 +570,9 @@ def _write_minute_partition(df: pl.DataFrame, minute_dir) -> int:
 
 def _minute_coverage_payload(df: pl.DataFrame) -> dict[str, object]:
     """Return cheap per-day completeness metadata for the status page."""
-    if df.is_empty():
-        return {"rows": 0, "symbols": 0, "full_symbols": 0, "min_bars": 0, "max_bars": 0}
-    bars = df.group_by("symbol").len().get_column("len")
-    max_bars = int(bars.max() or 0)
-    # A full A-share 1-minute session normally has 241 bars in this provider.
-    # Values below 200 are boundary/intraday fragments and must never be called complete.
-    full_symbols = int((bars >= max_bars).sum()) if max_bars >= 200 else 0
+    payload = minute_quality_payload(df)
     return {
-        "rows": int(df.height),
-        "symbols": int(bars.len()),
-        "full_symbols": full_symbols,
-        "min_bars": int(bars.min() or 0),
-        "max_bars": max_bars,
+        **payload,
         "updated_at": datetime.now().isoformat(timespec="seconds"),
     }
 
@@ -588,6 +583,169 @@ def _write_minute_coverage(df: pl.DataFrame, day_dir: Path) -> None:
     tmp = out.with_name(f".{out.name}.{uuid.uuid4().hex}.tmp")
     tmp.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
     tmp.replace(out)
+
+
+def _minute_partition_frame(data_dir: Path, trade_date: date) -> pl.DataFrame:
+    day_dir = Path(data_dir) / "kline_minute" / f"date={trade_date.isoformat()}"
+    files = sorted(day_dir.glob("*.parquet")) if day_dir.exists() else []
+    return pl.read_parquet(files) if files else pl.DataFrame()
+
+
+def validate_minute_partitions(
+    data_dir: Path,
+    start_date: date,
+    end_date: date,
+) -> dict[str, object]:
+    """深度校验指定范围内已有日 K 对应的分钟 K 分区。
+
+    完整交易日要求：无空时间/OHLC、无非法 OHLC、无重复键、无盘后记录，且
+    至少覆盖当天日 K 标的数的 98%，每个计入完整的标的恰好 241 根。
+    """
+    data_dir = Path(data_dir)
+    daily_dir = data_dir / "kline_daily"
+    expected_dates: list[date] = []
+    if daily_dir.exists():
+        for day_dir in sorted(daily_dir.glob("date=*")):
+            try:
+                trade_date = date.fromisoformat(day_dir.name[5:])
+            except ValueError:
+                continue
+            if start_date <= trade_date <= end_date:
+                expected_dates.append(trade_date)
+
+    records: list[dict[str, object]] = []
+    for trade_date in expected_dates:
+        expected = _daily_expected_symbols(data_dir, trade_date.isoformat())
+        frame = _minute_partition_frame(data_dir, trade_date)
+        if frame.is_empty():
+            records.append({
+                "date": trade_date.isoformat(),
+                "expected_symbols": expected,
+                "complete": False,
+                "error": "分钟K分区缺失",
+            })
+            continue
+
+        quality = minute_quality_payload(frame)
+        wrong_date = int(
+            frame.select(
+                (
+                    pl.col("datetime").is_not_null()
+                    & (pl.col("datetime").dt.date() != pl.lit(trade_date))
+                ).sum()
+            ).item()
+            or 0
+        )
+        baseline = expected or int(quality["symbols"])
+        required = (baseline * 98 + 99) // 100 if baseline else 0
+        structural_ok = all(
+            int(quality[key]) == 0
+            for key in (
+                "null_datetime",
+                "null_ohlc",
+                "invalid_ohlc",
+                "duplicate_symbol_datetime",
+                "out_of_regular_session",
+                "extra_symbols",
+            )
+        ) and wrong_date == 0
+        complete = bool(
+            structural_ok
+            and required
+            and int(quality["full_symbols"]) >= required
+        )
+        records.append({
+            **quality,
+            "date": trade_date.isoformat(),
+            "expected_symbols": expected,
+            "required_full_symbols": required,
+            "wrong_partition_date": wrong_date,
+            "complete": complete,
+        })
+
+    invalid = [record for record in records if not record.get("complete")]
+    return {
+        "valid": bool(records) and not invalid,
+        "checked_days": len(records),
+        "complete_days": len(records) - len(invalid),
+        "invalid_days": len(invalid),
+        "dates": records,
+    }
+
+
+def repair_minute_regular_sessions(
+    data_dir: Path,
+    start_date: date,
+    end_date: date,
+) -> dict[str, object]:
+    """只清理指定日期范围内的盘后分钟线，并原子重写分区及完整度统计。"""
+    data_dir = Path(data_dir)
+    minute_dir = data_dir / "kline_minute"
+    scanned_days = repaired_days = removed_rows = 0
+    repaired_dates: list[str] = []
+
+    day_dirs = sorted(minute_dir.glob("date=*")) if minute_dir.exists() else []
+    for day_dir in day_dirs:
+        try:
+            trade_date = date.fromisoformat(day_dir.name[5:])
+        except ValueError:
+            continue
+        if not (start_date <= trade_date <= end_date):
+            continue
+        files = sorted(day_dir.glob("*.parquet"))
+        if not files:
+            continue
+        scanned_days += 1
+        frame = pl.read_parquet(files)
+        before = minute_quality_payload(frame)
+        non_session = int(before["out_of_regular_session"])
+        hard_errors = {
+            key: int(before[key])
+            for key in (
+                "null_datetime",
+                "null_ohlc",
+                "invalid_ohlc",
+                "duplicate_symbol_datetime",
+            )
+            if int(before[key])
+        }
+        if hard_errors:
+            raise ValueError(
+                f"{trade_date} 分区除盘后数据外仍有异常，已停止修复: {hard_errors}"
+            )
+
+        repaired = filter_regular_session(frame).sort("symbol", "datetime")
+        after = minute_quality_payload(repaired)
+        if any(
+            int(after[key])
+            for key in (
+                "null_datetime",
+                "null_ohlc",
+                "invalid_ohlc",
+                "duplicate_symbol_datetime",
+                "out_of_regular_session",
+                "extra_symbols",
+            )
+        ):
+            raise ValueError(f"{trade_date} 过滤后仍未通过分钟K质量校验")
+
+        if non_session:
+            out = day_dir / "part.parquet"
+            _atomic_write_parquet(repaired, out)
+            for old in files:
+                if old != out:
+                    old.unlink()
+            repaired_days += 1
+            removed_rows += frame.height - repaired.height
+            repaired_dates.append(trade_date.isoformat())
+        _write_minute_coverage(repaired, day_dir)
+
+    return {
+        "scanned_days": scanned_days,
+        "repaired_days": repaired_days,
+        "removed_rows": removed_rows,
+        "repaired_dates": repaired_dates,
+    }
 
 
 def rebuild_minute_coverage_metadata(data_dir: Path) -> int:
@@ -652,7 +810,11 @@ def minute_coverage_summary(data_dir: Path) -> dict[str, object] | None:
         max_bars = int(stats.get("max_bars") or 0)
         baseline = expected or symbols
         required = (baseline * 98 + 99) // 100 if baseline else 0
-        complete = bool(max_bars >= 200 and required and full_symbols >= required)
+        complete = bool(
+            max_bars == REGULAR_MINUTE_BARS
+            and required
+            and full_symbols >= required
+        )
         records.append({
             **stats,
             "date": trade_date,

@@ -11,17 +11,35 @@ from app.services.kline_sync import (
     _write_minute_partition,
     find_minute_repair_start,
     minute_coverage_summary,
+    repair_minute_regular_sessions,
+    validate_minute_partitions,
 )
 
 
 def _minute_day(trade_date: date, bars: int, symbols: int = 2) -> pl.DataFrame:
+    morning = [
+        datetime.combine(trade_date, datetime.min.time()).replace(hour=9, minute=30)
+        + timedelta(minutes=offset)
+        for offset in range(121)
+    ]
+    afternoon = [
+        datetime.combine(trade_date, datetime.min.time()).replace(hour=13, minute=1)
+        + timedelta(minutes=offset)
+        for offset in range(120)
+    ]
+    post_market = [
+        datetime.combine(trade_date, datetime.min.time()).replace(hour=15, minute=1)
+        + timedelta(minutes=offset)
+        for offset in range(max(0, bars - 241))
+    ]
+    timestamps = (morning + afternoon)[:bars] + post_market
     rows = []
     for symbol_index in range(symbols):
         symbol = f"00000{symbol_index + 1}.SZ"
-        for offset in range(bars):
+        for timestamp in timestamps:
             rows.append({
                 "symbol": symbol,
-                "datetime": datetime.combine(trade_date, datetime.min.time()) + timedelta(minutes=offset),
+                "datetime": timestamp,
                 "open": 1.0,
                 "high": 1.0,
                 "low": 1.0,
@@ -69,6 +87,36 @@ def test_minute_coverage_distinguishes_landed_and_complete_days(tmp_path):
     assert status is not None
     assert status["complete_days"] == 1
     assert "dates" not in status
+
+
+def test_repairs_post_market_rows_and_rebuilds_complete_stats(tmp_path):
+    trade_date = date(2026, 8, 13)
+    _daily_day(tmp_path, trade_date)
+    day_dir = tmp_path / "kline_minute" / f"date={trade_date}"
+    day_dir.mkdir(parents=True)
+    polluted = _minute_day(trade_date, 271)
+    polluted.write_parquet(day_dir / "part.parquet")
+
+    before = validate_minute_partitions(tmp_path, trade_date, trade_date)
+    assert before["valid"] is False
+    assert before["dates"][0]["out_of_regular_session"] == 60
+    assert before["dates"][0]["extra_symbols"] == 2
+
+    repaired = repair_minute_regular_sessions(tmp_path, trade_date, trade_date)
+
+    assert repaired == {
+        "scanned_days": 1,
+        "repaired_days": 1,
+        "removed_rows": 60,
+        "repaired_dates": ["2026-08-13"],
+    }
+    after = validate_minute_partitions(tmp_path, trade_date, trade_date)
+    assert after["valid"] is True
+    assert after["complete_days"] == 1
+    stored = pl.read_parquet(day_dir / "part.parquet")
+    assert stored.height == 482
+    assert stored["datetime"].max() == datetime(2026, 8, 13, 15, 0)
+    assert minute_coverage_summary(tmp_path)["complete_days"] == 1
 
 
 def test_streaming_custom_provider_honors_time_segments(monkeypatch):

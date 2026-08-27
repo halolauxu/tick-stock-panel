@@ -319,8 +319,9 @@ def launch_integrity_repair(app_state, start_date: date, reason: str) -> tuple[s
 def boot_integrity_check(app_state) -> None:
     """启动自检 (后台线程调用): 发现窗口内的坏数据自动创建修复任务。
 
-    分钟K缺口无需单独处理 — 修复管道 Step 2.5 在 minute_sync_enabled 时
-    以 start=max(datetime) 增量补洞, 天然覆盖停机缺口。
+    本函数只负责日 K 族的启动修复。分钟 K 在数据源、落盘边界过滤盘后
+    记录，并由每日盘后管道对最近交易日做深度校验；校验失败时任务失败，
+    不会把异常分区标记为同步成功。
     """
     repo = getattr(app_state, "repo", None)
     if repo is None:

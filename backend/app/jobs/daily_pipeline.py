@@ -609,6 +609,13 @@ def run_now(
     minute_on = preferences.get_minute_sync_enabled()
     minute_days = preferences.get_minute_sync_days()
     written_minute = 0
+    minute_validation: dict[str, object] = {
+        "valid": True,
+        "checked_days": 0,
+        "complete_days": 0,
+        "invalid_days": 0,
+        "dates": [],
+    }
     if minute_on and capset.has(Cap.KLINE_MINUTE_BATCH):
         minute_start = today - _td(days=minute_days)
         emit("sync_minute", 92, f"获取分钟K [{minute_start} ~ {today}]…")
@@ -624,9 +631,42 @@ def run_now(
             minute_symbols, repo, capset, days=minute_days,
             on_chunk_done=_minute_chunk_progress,
         )
+        # 每日自动更新不能以“目录存在/写入成功”代替数据正确。盘后任务校验本次
+        # 覆盖范围内所有已有日K交易日；盘中手动运行时不把尚未收盘的今天判坏。
+        validation_end = today
+        current_cn = kline_sync.cn_now()
+        if (current_cn.hour, current_cn.minute) < (15, 5):
+            validation_end = today - _td(days=1)
+        validation_start = today - _td(days=max(minute_days, 7))
+        minute_validation = kline_sync.validate_minute_partitions(
+            repo.store.data_dir,
+            validation_start,
+            validation_end,
+        )
+        if minute_validation["checked_days"] and not minute_validation["valid"]:
+            bad_dates = [
+                str(record["date"])
+                for record in minute_validation["dates"]
+                if not record.get("complete")
+            ]
+            sample = "、".join(bad_dates[:5])
+            raise ValueError(
+                "分钟K数据校验失败: "
+                f"{minute_validation['invalid_days']} 个交易日不完整({sample})"
+            )
+        unresolved_day = kline_sync.find_minute_repair_start(repo.store.data_dir)
+        if unresolved_day is not None:
+            raise ValueError(f"分钟K数据校验失败: {unresolved_day} 起仍有历史缺口")
         minute_dir = repo.store.data_dir / "kline_minute"
         minute_cover_days = len(list(minute_dir.glob("date=*"))) if minute_dir.exists() else 0
-        emit("sync_minute", 95, f"分钟K完成,覆盖 {minute_cover_days} 天")
+        emit(
+            "sync_minute",
+            95,
+            "分钟K完成,"
+            f"本次校验 {minute_validation['complete_days']}/"
+            f"{minute_validation['checked_days']} 个交易日,"
+            f"全库落盘 {minute_cover_days} 天",
+        )
         logger.info("sync_minute: [%s ~ %s] done, %d days", minute_start, today, minute_cover_days)
         _invalidate("minute")
     else:
@@ -709,6 +749,7 @@ def run_now(
         "etf_daily_rows": written_etf_daily,
         "etf_adj_factor_symbols": etf_adj_symbols,
         "minute_rows": written_minute,
+        "minute_validated_days": minute_validation["checked_days"],
         "auction_rows": written_auction,
         "irm_qa_rows": written_irm_qa,
         "regime_days": regime_days,
