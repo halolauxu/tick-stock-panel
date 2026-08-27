@@ -965,6 +965,15 @@ class PaperLedger:
                 older_qty = int(row["quantity"]) - bought_qty
                 market_value = int(row["quantity"]) * price
                 day_pnl = older_qty * (price - reference) + bought_qty * price - bought_cost
+                materially_changed = (
+                    abs(float(row["last_price"] or 0) - price) > 1e-9
+                    or abs(float(row["market_value"] or 0) - market_value) > 1e-6
+                    or abs(
+                        float(row["unrealized_pnl"] or 0)
+                        - (market_value - float(row["cost_basis"]))
+                    ) > 1e-6
+                    or abs(float(row["day_pnl"] or 0) - day_pnl) > 1e-6
+                )
                 conn.execute(
                     """UPDATE positions SET last_price=?,market_value=?,unrealized_pnl=?,
                         previous_close=?,day_pnl=?,pnl_date=?,today_bought_qty=?,
@@ -976,7 +985,7 @@ class PaperLedger:
                         quote_at, source, price, row["account_id"], row["symbol"],
                     ),
                 )
-                updated += 1
+                updated += int(materially_changed)
         return updated
 
     def unlock_positions(self, trading_date: date) -> int:
@@ -1036,6 +1045,28 @@ class PaperLedger:
                         WHERE n.account_id=f.account_id AND n.trading_date=?
                     )""",
                 (day, day, day),
+            ).fetchall()
+        return {str(row[0]) for row in rows}
+
+    def settled_accounts_holding_symbols(
+        self,
+        trading_date: date,
+        symbols: set[str],
+    ) -> set[str]:
+        """Return settled accounts whose close valuation uses any selected symbol."""
+        if not symbols:
+            return set()
+        placeholders = ",".join("?" for _ in symbols)
+        day = trading_date.isoformat()
+        with self._connect() as conn:
+            rows = conn.execute(
+                f"""SELECT DISTINCT p.account_id
+                    FROM positions p
+                    JOIN accounts a ON a.id=p.account_id AND a.status!='deleted'
+                    JOIN nav_snapshots n ON n.account_id=p.account_id
+                        AND n.trading_date=?
+                    WHERE p.quantity>0 AND p.symbol IN ({placeholders})""",
+                (day, *sorted(symbols)),
             ).fetchall()
         return {str(row[0]) for row in rows}
 
@@ -1285,7 +1316,8 @@ class PaperLedger:
             self._event(
                 conn,
                 event_key=(
-                    f"{account_id}:SETTLEMENT_RESTATED:{trading_date.isoformat()}"
+                    f"{account_id}:SETTLEMENT_RESTATED:{trading_date.isoformat()}:{now}:"
+                    f"{equity:.6f}"
                     if restatement
                     else f"{account_id}:SETTLED:{trading_date.isoformat()}"
                 ),
@@ -1295,7 +1327,7 @@ class PaperLedger:
                 trading_date=trading_date.isoformat(),
                 entity_type="account",
                 entity_id=account_id,
-                title=("延迟成交后重述收盘结算" if restatement else "收盘结算完成"),
+                title=("收盘证据更新后重述结算" if restatement else "收盘结算完成"),
                 detail=f"权益 {equity:.2f}, 现金 {float(account['cash_balance']):.2f}",
             )
         return self.get_account(account_id)

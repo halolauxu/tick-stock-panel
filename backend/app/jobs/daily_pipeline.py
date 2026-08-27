@@ -1244,18 +1244,24 @@ def _register_paper_clock_jobs(scheduler) -> None:
 
 def _paper_quote_tick() -> None:
     """Keep paper orders and positions priced even when the global UI switch is off."""
-    current = cn_now().time()
+    observed = cn_now()
+    current = observed.time()
     in_market_window = (
         dt_time(9, 25) <= current <= dt_time(11, 30)
         or dt_time(13, 0) <= current <= dt_time(15, 0)
     )
-    if not in_market_window:
+    in_close_finalization = dt_time(15, 0) < current <= dt_time(17, 0)
+    if not in_market_window and not in_close_finalization:
         return
     state = _get_app_state()
     service = getattr(state, "paper_trading_service", None) if state else None
     quote_service = getattr(state, "quote_service", None) if state else None
     if service is None or quote_service is None or not service.subscription_symbols():
         return
+    if in_close_finalization:
+        claim = getattr(service, "claim_close_quote_refresh", None)
+        if claim is not None and not claim(now=observed):
+            return
     try:
         refresh = getattr(quote_service, "refresh_paper_symbols", quote_service.refresh)
         refresh()

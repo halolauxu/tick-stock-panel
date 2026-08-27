@@ -243,6 +243,19 @@ async def _application_lifespan(app: FastAPI):
 
     paper_trading_service = get_paper_trading_service(app.state)
 
+    def _refresh_paper_quotes_on_boot() -> None:
+        try:
+            if paper_trading_service.subscription_symbols():
+                result = qs.refresh_paper_symbols()
+                logger.info("paper boot quote refresh result: %s", result.get("fetched", 0))
+        except Exception:  # noqa: BLE001
+            logger.exception("paper boot quote refresh failed")
+
+    paper_quote_boot_timer = threading.Timer(2.0, _refresh_paper_quotes_on_boot)
+    paper_quote_boot_timer.daemon = True
+    paper_quote_boot_timer.start()
+    app.state.paper_quote_boot_timer = paper_quote_boot_timer
+
     def _recover_paper_open() -> None:
         try:
             result = paper_trading_service.recover_missed_open()
@@ -355,6 +368,9 @@ async def _application_lifespan(app: FastAPI):
         recovery_timer = getattr(app.state, "paper_recovery_timer", None)
         if recovery_timer:
             recovery_timer.cancel()
+        quote_boot_timer = getattr(app.state, "paper_quote_boot_timer", None)
+        if quote_boot_timer:
+            quote_boot_timer.cancel()
         if not matrix_prewarm_owner.shutdown(timeout=5.0):
             logger.warning("matrix cache prewarm did not stop within 5 seconds")
         mmanager = getattr(app.state, "mining_manager", None)

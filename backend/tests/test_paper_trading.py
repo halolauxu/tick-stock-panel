@@ -232,6 +232,35 @@ def test_quote_tick_refreshes_tracked_paper_symbols_during_market(monkeypatch):
     assert calls == ["refresh"]
 
 
+def test_quote_tick_finalizes_close_marks_without_hammering_provider(monkeypatch):
+    calls: list[str] = []
+    claims: list[datetime] = []
+
+    def claim(*, now):
+        claims.append(now)
+        return len(claims) == 1
+
+    state = SimpleNamespace(
+        paper_trading_service=SimpleNamespace(
+            subscription_symbols=lambda: {"000001.SZ"},
+            claim_close_quote_refresh=claim,
+        ),
+        quote_service=SimpleNamespace(refresh=lambda: calls.append("refresh")),
+    )
+    daily_pipeline.set_app_state(state)
+    monkeypatch.setattr(
+        daily_pipeline,
+        "cn_now",
+        lambda: datetime(2026, 8, 27, 16, 0, tzinfo=CN_TZ),
+    )
+
+    daily_pipeline._paper_quote_tick()
+    daily_pipeline._paper_quote_tick()
+
+    assert len(claims) == 2
+    assert calls == ["refresh"]
+
+
 def test_system_does_not_report_stale_quotes_when_nothing_requires_quotes(
     tmp_path, monkeypatch
 ):
@@ -320,6 +349,42 @@ def test_today_pnl_uses_previous_close_and_buy_cost_without_backfill(tmp_path, m
     assert current["summary"]["today_pnl"] == pytest.approx(493.0)
     assert current["positions"][0]["pnl_date"] == "2026-08-27"
     assert current["positions"][0]["today_bought_qty"] == 1_000
+
+
+def test_revised_close_mark_restates_settlement_once(tmp_path, monkeypatch):
+    observed = datetime(2026, 8, 27, 16, 10, tzinfo=CN_TZ)
+    monkeypatch.setattr("app.services.paper_trading.cn_now", lambda: observed)
+    monkeypatch.setattr("app.services.paper_ledger.cn_now", lambda: observed)
+    service = _service(tmp_path)
+    account, order_id = _account_with_buy_order(service)
+    service.ledger.assign_due_date(order_id, TRADE_DAY, {"market_observed": True})
+    service.ledger.execute_fill(
+        order_id,
+        price=10,
+        quantity=1_000,
+        quote_at=OPEN_TIME,
+        source="open_quote",
+        previous_close=9.9,
+    )
+    service.ledger.settle_account(account["id"], TRADE_DAY, source="15:05_close")
+    final_quote = _quote(
+        price=10.2,
+        at=datetime(2026, 8, 27, 15, 0, 4, tzinfo=CN_TZ),
+    )
+
+    first = service.on_quote_records([final_quote], source="close_final")
+    second = service.on_quote_records([final_quote], source="close_final")
+    current = service.account(account["id"])
+
+    assert first["marked"] == 1
+    assert second["marked"] == 0
+    assert current["positions"][0]["last_price"] == 10.2
+    assert current["nav"][0]["market_value"] == 10_200
+    assert current["nav"][0]["equity"] == pytest.approx(current["summary"]["equity"])
+    assert len([
+        event for event in current["timeline"]
+        if event["event_type"] == "SETTLEMENT_RESTATED"
+    ]) == 1
 
 
 def test_today_pnl_keeps_realized_sell_after_position_closes(tmp_path, monkeypatch):

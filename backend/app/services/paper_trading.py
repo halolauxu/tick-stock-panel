@@ -163,7 +163,27 @@ class PaperTradingService:
         self._lock = threading.RLock()
         self._recovery_fetch_last: dict[tuple[date, str], datetime] = {}
         self._recovery_quote_fetch_last: datetime | None = None
+        self._close_quote_refresh_last: datetime | None = None
         self._migrate_legacy_json()
+
+    def claim_close_quote_refresh(
+        self,
+        *,
+        now: datetime | None = None,
+        min_interval_seconds: int = 300,
+    ) -> bool:
+        """Throttle the independent post-close paper quote finalizer."""
+        current = _as_cn(now)
+        with self._lock:
+            previous = self._close_quote_refresh_last
+            if (
+                previous is not None
+                and previous.date() == current.date()
+                and (current - previous).total_seconds() < min_interval_seconds
+            ):
+                return False
+            self._close_quote_refresh_last = current
+            return True
 
     def _migrate_legacy_json(self) -> None:
         legacy_root = self.ledger.root / "accounts"
@@ -537,6 +557,24 @@ class PaperTradingService:
         tracked = self.subscription_symbols()
         selected = {symbol: quote for symbol, quote in quotes.items() if symbol in tracked}
         marked = self.ledger.update_marks(selected, source=source) if selected else 0
+        observed = _as_cn()
+        if marked and observed.time() >= SETTLEMENT_TIME:
+            close_symbols = {
+                symbol for symbol, quote in selected.items()
+                if quote["_quote_dt"].date() == observed.date()
+            }
+            for account_id in sorted(
+                self.ledger.settled_accounts_holding_symbols(
+                    observed.date(),
+                    close_symbols,
+                )
+            ):
+                self.ledger.settle_account(
+                    account_id,
+                    observed.date(),
+                    source="15:05_close",
+                    restatement=True,
+                )
         executed = 0
         if OPEN_START <= current.time() <= OPEN_DEADLINE:
             result = self.execute_open_orders(now=current, quotes=quotes, finalize_missing=False)
