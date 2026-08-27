@@ -65,6 +65,7 @@ ANNUAL_LOOKBACK_DAYS = 550
 MAX_THESIS_DOCUMENTS = 16
 MAX_THESIS_RAW_BYTES = 200_000_000
 MAX_THESIS_PAGES_PER_DOCUMENT = 12
+MAX_THESIS_CONTEXTS = 10
 THESIS_WORST_CASE_CAP_MICROS_CNY = 10_000_000
 MIN_COMPLETE_SCORE = 38.4
 MIN_DIMENSION_RATING = 3
@@ -608,7 +609,27 @@ def load_states(store: EventReplayStore) -> tuple[list[EventScoreState], list[di
                     document_map=document_map,
                 )
             )
-    return states, blocked
+    ranked = sorted(
+        states,
+        key=lambda state: (
+            -len(build_event_score_prompt(state.score_state, state.event_type).encode("utf-8")),
+            state.decision_date,
+            state.event_id,
+        ),
+    )
+    selected = ranked[:MAX_THESIS_CONTEXTS]
+    for state in ranked[MAX_THESIS_CONTEXTS:]:
+        blocked.append(
+            {
+                "event_id": state.event_id,
+                "status": "DEFERRED_THESIS_CNY10_CAP",
+                "selection_rule": (
+                    "10 largest return-blind T0 PDF contexts; ties by decision date and event id"
+                ),
+            }
+        )
+    selected.sort(key=lambda state: (state.decision_date, state.event_id))
+    return selected, blocked
 
 
 def run_scores(store: EventReplayStore, *, execute: bool) -> dict[str, Any]:
@@ -672,6 +693,9 @@ def run_scores(store: EventReplayStore, *, execute: bool) -> dict[str, Any]:
         "substage": THESIS_SUBSTAGE,
         "parent_stage": EVENT_ENRICHED_SCORE_STAGE,
         "selection_uses_outcomes": False,
+        "selection_rule": (
+            "10 largest return-blind T0 PDF contexts; ties by decision date and event id"
+        ),
         "reason": (
             "red team rejected P4 because the PDF-backed 64-point thesis was not a hard gate; "
             "repair evidence coverage before any further price-rule selection"
