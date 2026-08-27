@@ -60,6 +60,10 @@ OPTIMIZATION_ID = "serenity-event-1y-opt-v1"
 OPTIMIZATION_VERSION = "1.0.0"
 EVENT_SCORE_STAGE = "SERENITY_EVENT_SCORE"
 EVENT_ENRICHED_SCORE_STAGE = "SERENITY_EVENT_ENRICHED_SCORE"
+STAGE_COST_CAP_MICROS_CNY = {
+    EVENT_SCORE_STAGE: 15_000_000,
+    EVENT_ENRICHED_SCORE_STAGE: 25_000_000,
+}
 MAX_COST_MICROS_CNY = 60_000_000
 MAX_REQUESTS = 170
 MAX_PROMPT_TOKENS = 8_000_000
@@ -422,7 +426,7 @@ def load_event_score_states(
     for event_id, symbol, decision_day, event_type, subtype, fact_count in anchors:
         event_only_eligible = bool(
             event_type == "ORDER_CONTRACT"
-            or subtype != "FINANCING_ADMIN"
+            or (event_type == "CAPACITY_MILESTONE" and subtype != "FINANCING_ADMIN")
             or int(fact_count) > 0
         )
         if stage == EVENT_SCORE_STAGE and not event_only_eligible:
@@ -879,6 +883,16 @@ def run_event_scores(
         if specs
         else {"status": "NO_PENDING_CALLS"}
     )
+    worst_case_cost = int(
+        (preflight.get("preflight") or {})
+        .get("worst_case_increment", {})
+        .get("charged_cost_micros_cny", 0)
+    )
+    stage_cost_cap = STAGE_COST_CAP_MICROS_CNY[stage]
+    if worst_case_cost > stage_cost_cap:
+        raise RuntimeError(
+            f"{stage} worst-case cost {worst_case_cost} exceeds frozen stage cap {stage_cost_cap}"
+        )
     plan = {
         "stage": stage,
         "total_states": len(states),
@@ -893,7 +907,8 @@ def run_event_scores(
             "optimization_id": OPTIMIZATION_ID,
             "stage": stage,
             "selection_rule": (
-                "ORDER_CONTRACT OR deterministic_subtype!=FINANCING_ADMIN OR fact_count>0"
+                "ORDER_CONTRACT OR (CAPACITY_MILESTONE AND subtype!=FINANCING_ADMIN) "
+                "OR fact_count>0"
             ),
             "selection_uses_outcomes": False,
             "pending_slots": [
@@ -906,11 +921,38 @@ def run_event_scores(
             ],
         }
     )
-    _freeze_json(
-        paths["run_root"] / f"{stage.lower()}-paid-population.json",
-        paid_population,
-        f"{stage} paid population",
-    )
+    population_path = paths["run_root"] / f"{stage.lower()}-paid-population.json"
+    if population_path.is_file():
+        existing = json.loads(population_path.read_text(encoding="utf-8"))
+        if existing != paid_population:
+            paid_calls = store.connection.execute(
+                """
+                SELECT count(*) FROM semantic_model_calls
+                WHERE replay_id=? AND stage=?
+                """,
+                [OPTIMIZATION_ID, stage],
+            ).fetchone()[0]
+            if paid_calls:
+                raise RuntimeError("paid population cannot change after the first model call")
+            correction = _with_content_hash(
+                {
+                    **{key: value for key, value in paid_population.items() if key != "content_sha256"},
+                    "supersedes_sha256": _file_hash(population_path),
+                    "correction_reason": (
+                        "preflight-only population exceeded the frozen stage cap; no paid call occurred"
+                    ),
+                }
+            )
+            correction_path = (
+                paths["run_root"] / f"{stage.lower()}-paid-population-correction-01.json"
+            )
+            _freeze_json(correction_path, correction, f"{stage} corrected paid population")
+            plan["paid_population_path"] = str(correction_path)
+        else:
+            plan["paid_population_path"] = str(population_path)
+    else:
+        _freeze_json(population_path, paid_population, f"{stage} paid population")
+        plan["paid_population_path"] = str(population_path)
     _atomic_json(paths["run_root"] / f"{stage.lower()}-plan.json", plan)
     if not execute or not specs:
         return plan
