@@ -468,9 +468,9 @@ def set_pipeline_index_symbols(symbols: str) -> str:
 
 
 def get_pipeline_schedule() -> dict:
-    """返回盘后管道调度时间 {"hour": 15, "minute": 30}。"""
-    d = load().get("pipeline_schedule", {"hour": 15, "minute": 30})
-    return {"hour": d.get("hour", 15), "minute": d.get("minute", 30)}
+    """返回盘后管道调度时间 {"hour": 17, "minute": 0}。"""
+    d = load().get("pipeline_schedule", {"hour": 17, "minute": 0})
+    return {"hour": d.get("hour", 17), "minute": d.get("minute", 0)}
 
 
 def set_pipeline_schedule(hour: int, minute: int) -> dict:

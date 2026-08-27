@@ -5,7 +5,7 @@
   09:25 模拟交易盘前校验
   09:30 模拟交易开盘撮合, 09:31 终态截止
   15:05 模拟交易收盘结算
-  15:30 盘后 — 日K同步 + 增量除权因子 + enriched 计算 + 刷新视图
+  17:00 盘后 — 日K同步 + 增量除权因子 + enriched 计算 + 刷新视图
   数据管道成功后 — 生成并冻结下一交易日信号和订单计划
 
 盘后同步策略:
@@ -128,6 +128,7 @@ def run_now(
     """
     emit = on_progress or _noop
     skipped: list[str] = []
+    deferred: list[str] = []
     # 阶段软失败累积: 下列阶段 try/except 吞异常以不中断管道, 但失败即代表数据可能陈旧。
     # 管道末尾若非空则抛 PipelineStageError, 让任务终态如实标记为 failed(而非误报成功)。
     stage_errors: list[str] = []
@@ -474,6 +475,16 @@ def run_now(
                 _invalidate("index_daily")
                 _invalidate("index_enriched")
 
+                index_today = repo.store.data_dir / "kline_index_daily" / f"date={today}"
+                latest_stock_day = repo.latest_daily_date()
+                if latest_stock_day and latest_stock_day >= today and not index_today.exists():
+                    deferred.append("sync_index")
+                    emit(
+                        "sync_index",
+                        89,
+                        f"指数日K延期:{today} 数据源尚未发布;本次保留上一完整交易日",
+                    )
+
             if pull_etf:
                 emit("sync_index", 88, "同步 ETF 维表…")
                 etf_count = index_sync.sync_etf_instruments(repo)
@@ -577,7 +588,22 @@ def run_now(
                 lookback_days=3,
                 on_progress=_auction_progress,
             )
-            emit("sync_auction", 91, f"集合竞价完成,本次获取 {written_auction} 行")
+            auction_today = (
+                repo.store.data_dir
+                / "tushare_supplemental"
+                / "auction"
+                / f"date={today}"
+            )
+            latest_stock_day = repo.latest_daily_date()
+            if latest_stock_day and latest_stock_day >= today and not auction_today.exists():
+                deferred.append("sync_auction")
+                emit(
+                    "sync_auction",
+                    91,
+                    f"集合竞价延期:{today} 数据源尚未发布;近3日接口返回 {written_auction} 行",
+                )
+            else:
+                emit("sync_auction", 91, f"集合竞价完成,近3日接口返回 {written_auction} 行")
             _invalidate("auction")
         except Exception as e:  # noqa: BLE001
             logger.warning("tushare auction sync failed: %s", e)
@@ -623,59 +649,76 @@ def run_now(
         "invalid_days": 0,
         "dates": [],
     }
+    minute_readiness: dict[str, object] | None = None
     if minute_on and capset.has(Cap.KLINE_MINUTE_BATCH):
         minute_start = today - _td(days=minute_days)
-        emit("sync_minute", 92, f"获取分钟K [{minute_start} ~ {today}]…")
-        logger.info("sync_minute: [%s ~ %s] start", minute_start, today)
         minute_symbols = _resolve_minute_symbols(capset, repo)
-        def _minute_chunk_progress(cur: int, tot: int, seg_label: str = "") -> None:
-            emit("sync_minute", 92 + int(3 * cur / tot),
-                 kline_sync.format_minute_progress(
-                     cur, tot, len(minute_symbols), seg_label,
-                 ),
-                 stage_pct=int(100 * cur / tot), skip_log=True)
-        written_minute = kline_sync.sync_and_persist_minute(
-            minute_symbols, repo, capset, days=minute_days,
-            on_chunk_done=_minute_chunk_progress,
-        )
-        # 每日自动更新不能以“目录存在/写入成功”代替数据正确。盘后任务校验本次
-        # 覆盖范围内所有已有日K交易日；盘中手动运行时不把尚未收盘的今天判坏。
-        validation_end = today
-        current_cn = kline_sync.cn_now()
-        if (current_cn.hour, current_cn.minute) < (15, 5):
-            validation_end = today - _td(days=1)
-        validation_start = today - _td(days=max(minute_days, 7))
-        minute_validation = kline_sync.validate_minute_partitions(
-            repo.store.data_dir,
-            validation_start,
-            validation_end,
-        )
-        if minute_validation["checked_days"] and not minute_validation["valid"]:
-            bad_dates = [
-                str(record["date"])
-                for record in minute_validation["dates"]
-                if not record.get("complete")
-            ]
-            sample = "、".join(bad_dates[:5])
-            raise ValueError(
-                "分钟K数据校验失败: "
-                f"{minute_validation['invalid_days']} 个交易日不完整({sample})"
+        emit("sync_minute", 92, f"探测 {today} 分钟K是否已发布…")
+        minute_readiness = kline_sync.probe_configured_minute_day(minute_symbols, today)
+        if minute_readiness["applicable"] and not minute_readiness["ready"]:
+            skipped.append("sync_minute")
+            deferred.append("sync_minute")
+            reason = str(minute_readiness.get("reason") or "数据源尚未就绪")
+            emit(
+                "sync_minute",
+                95,
+                f"分钟K延期:{reason};本次未遍历全市场,下次盘后任务继续补齐",
+                stage_pct=100,
             )
-        unresolved_day = kline_sync.find_minute_repair_start(repo.store.data_dir)
-        if unresolved_day is not None:
-            raise ValueError(f"分钟K数据校验失败: {unresolved_day} 起仍有历史缺口")
-        minute_dir = repo.store.data_dir / "kline_minute"
-        minute_cover_days = len(list(minute_dir.glob("date=*"))) if minute_dir.exists() else 0
-        emit(
-            "sync_minute",
-            95,
-            "分钟K完成,"
-            f"本次校验 {minute_validation['complete_days']}/"
-            f"{minute_validation['checked_days']} 个交易日,"
-            f"全库落盘 {minute_cover_days} 天",
-        )
-        logger.info("sync_minute: [%s ~ %s] done, %d days", minute_start, today, minute_cover_days)
-        _invalidate("minute")
+            logger.info("sync_minute deferred before full-market scan: %s", reason)
+        else:
+            emit("sync_minute", 92, f"获取分钟K [{minute_start} ~ {today}]…")
+            logger.info("sync_minute: [%s ~ %s] start", minute_start, today)
+
+            def _minute_chunk_progress(cur: int, tot: int, seg_label: str = "") -> None:
+                emit("sync_minute", 92 + int(3 * cur / tot),
+                     kline_sync.format_minute_progress(
+                         cur, tot, len(minute_symbols), seg_label,
+                     ),
+                     stage_pct=int(100 * cur / tot), skip_log=True)
+
+            written_minute = kline_sync.sync_and_persist_minute(
+                minute_symbols, repo, capset, days=minute_days,
+                on_chunk_done=_minute_chunk_progress,
+            )
+            # 每日自动更新不能以“目录存在/写入成功”代替数据正确。盘后任务校验本次
+            # 覆盖范围内所有已有日K交易日；盘中手动运行时不把尚未收盘的今天判坏。
+            validation_end = today
+            current_cn = kline_sync.cn_now()
+            if (current_cn.hour, current_cn.minute) < (15, 5):
+                validation_end = today - _td(days=1)
+            validation_start = today - _td(days=max(minute_days, 7))
+            minute_validation = kline_sync.validate_minute_partitions(
+                repo.store.data_dir,
+                validation_start,
+                validation_end,
+            )
+            if minute_validation["checked_days"] and not minute_validation["valid"]:
+                bad_dates = [
+                    str(record["date"])
+                    for record in minute_validation["dates"]
+                    if not record.get("complete")
+                ]
+                sample = "、".join(bad_dates[:5])
+                raise ValueError(
+                    "分钟K数据校验失败: "
+                    f"{minute_validation['invalid_days']} 个交易日不完整({sample})"
+                )
+            unresolved_day = kline_sync.find_minute_repair_start(repo.store.data_dir)
+            if unresolved_day is not None:
+                raise ValueError(f"分钟K数据校验失败: {unresolved_day} 起仍有历史缺口")
+            minute_dir = repo.store.data_dir / "kline_minute"
+            minute_cover_days = len(list(minute_dir.glob("date=*"))) if minute_dir.exists() else 0
+            emit(
+                "sync_minute",
+                95,
+                "分钟K完成,"
+                f"本次校验 {minute_validation['complete_days']}/"
+                f"{minute_validation['checked_days']} 个交易日,"
+                f"全库落盘 {minute_cover_days} 天",
+            )
+            logger.info("sync_minute: [%s ~ %s] done, %d days", minute_start, today, minute_cover_days)
+            _invalidate("minute")
     else:
         skipped.append("sync_minute")
         if minute_on:
@@ -757,6 +800,7 @@ def run_now(
         "etf_adj_factor_symbols": etf_adj_symbols,
         "minute_rows": written_minute,
         "minute_validated_days": minute_validation["checked_days"],
+        "minute_readiness": minute_readiness,
         "auction_rows": written_auction,
         "irm_qa_rows": written_irm_qa,
         "regime_days": regime_days,
@@ -765,6 +809,7 @@ def run_now(
         "integrity_repair_from": repair_start.isoformat() if repair_start else None,
         "integrity_issues": len(integrity_issues),
         "skipped_stages": skipped,
+        "deferred_stages": deferred,
         "stage_errors": stage_errors,
     }
 
@@ -1224,7 +1269,7 @@ def start_scheduler(repo: KlineRepository, capset: CapabilitySet) -> AsyncIOSche
     工作日 09:10 — 同步个股维表
     工作日 09:25/09:30/09:31 — 盘前校验、开盘执行与终态截止
     工作日 15:05 — 账户结算与对账
-    工作日 HH:MM — 盘后管道（时间由用户偏好决定，默认 15:30）
+    工作日 HH:MM — 盘后管道（时间由用户偏好决定，默认 17:00）
     """
     from app.services import preferences
     sched = preferences.get_pipeline_schedule()

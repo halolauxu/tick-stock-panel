@@ -1079,6 +1079,92 @@ def _try_custom_minute(
         return (None, True)
 
 
+def probe_configured_minute_day(
+    symbols: list[str],
+    target_day: date,
+) -> dict[str, object]:
+    """在全市场任务前探测自定义分钟源是否已发布目标交易日。
+
+    历史分钟接口在收盘后并不保证立刻发布。如果直接对全市场逐股请求，源端尚未
+    就绪时会得到数千次空响应并占满任务槽。这里最多选择 3 只高流动性标的做小样本
+    探测；至少一只具备完整 241 根常规交易时段分钟线才允许启动全市场采集。
+
+    TickFlow 等非自定义源保持原路径，不在这里改变其既有同步语义。
+    """
+    provider_name = preferences.get_minute_data_provider()
+    provider, fallback, resolution_error = _resolve_minute_provider(provider_name)
+    if fallback:
+        return {
+            "applicable": False,
+            "ready": True,
+            "provider": provider_name,
+            "symbols": [],
+            "rows": 0,
+            "full_symbols": 0,
+            "reason": resolution_error,
+        }
+
+    universe = set(symbols)
+    preferred = ("600000.SH", "000001.SZ", "000725.SZ")
+    probes = [symbol for symbol in preferred if symbol in universe]
+    if len(probes) < 3:
+        probes.extend(symbol for symbol in symbols if symbol not in probes)
+    probes = probes[:3]
+    if not probes:
+        return {
+            "applicable": True,
+            "ready": False,
+            "provider": provider_name,
+            "symbols": [],
+            "rows": 0,
+            "full_symbols": 0,
+            "reason": "标的池为空,无法探测数据源",
+        }
+
+    start_time = datetime.combine(target_day, datetime.min.time())
+    end_time = datetime.combine(target_day, datetime.max.time())
+    try:
+        frame = provider.get_minute(
+            probes,
+            start_time=start_time,
+            end_time=end_time,
+            asset_type="stock",
+            freq="1m",
+        )
+    except Exception as exc:  # noqa: BLE001
+        raise RuntimeError(f"{provider_name} 分钟K就绪探测失败: {exc}") from exc
+
+    if frame is None or frame.is_empty():
+        return {
+            "applicable": True,
+            "ready": False,
+            "provider": provider_name,
+            "symbols": probes,
+            "rows": 0,
+            "full_symbols": 0,
+            "reason": f"{target_day.isoformat()} 尚未返回分钟K",
+        }
+
+    frame = sanitize_minute_rows(frame)
+    if "datetime" in frame.columns:
+        frame = frame.filter(pl.col("datetime").dt.date() == target_day)
+    quality = minute_quality_payload(frame)
+    ready = int(quality["full_symbols"]) > 0
+    return {
+        "applicable": True,
+        "ready": ready,
+        "provider": provider_name,
+        "symbols": probes,
+        "rows": int(quality["rows"]),
+        "full_symbols": int(quality["full_symbols"]),
+        "reason": (
+            None
+            if ready
+            else f"{target_day.isoformat()} 探测样本尚无完整 {REGULAR_MINUTE_BARS} 根分钟线"
+        ),
+    }
+
+
 def sync_minute_batch(
     symbols: list[str],
     start_time: datetime | None = None,

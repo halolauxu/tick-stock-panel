@@ -66,6 +66,11 @@ def test_run_slot_is_exclusive():
     pipeline_jobs.release_run_slot()
 
 
+def test_pipeline_schedule_defaults_after_source_publication_window(monkeypatch):
+    monkeypatch.setattr(preferences, "load", lambda: {})
+    assert preferences.get_pipeline_schedule() == {"hour": 17, "minute": 0}
+
+
 # ── 监控 sector fail-closed ──────────────────────────────────────────────
 
 def _base_price_rule(scope: str) -> dict:
