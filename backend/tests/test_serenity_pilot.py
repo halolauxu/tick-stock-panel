@@ -9,6 +9,7 @@ import pytest
 from app.services import serenity_pilot
 from app.services.serenity_pilot import (
     CHAIN_SPECS,
+    CninfoClient,
     PilotStore,
     _historical_decision_dates,
     _score_serenity,
@@ -253,6 +254,25 @@ def test_analyze_pdf_measures_text_without_ocr(tmp_path: Path) -> None:
     assert metrics["parse_status"] == "ok"
     assert text_path.exists()
     assert facts == []
+
+
+def test_cninfo_null_announcements_is_a_valid_empty_window(monkeypatch: pytest.MonkeyPatch) -> None:
+    class EmptyResponse:
+        def raise_for_status(self) -> None:
+            return None
+
+        def json(self) -> dict:
+            return {"totalAnnouncement": 0, "announcements": None}
+
+    client = CninfoClient(min_interval_s=0)
+    monkeypatch.setattr(client, "org_map", lambda: {"300975": "gssz000300975"})
+    monkeypatch.setattr(client._http, "post", lambda *_args, **_kwargs: EmptyResponse())
+    try:
+        rows = client.announcements("300975", date(2026, 8, 18), date(2026, 8, 26))
+    finally:
+        client.close()
+
+    assert rows == []
 
 
 def test_daily_decisions_are_immutable_and_next_day_not_used(tmp_path: Path) -> None:

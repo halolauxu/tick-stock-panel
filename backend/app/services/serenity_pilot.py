@@ -521,6 +521,8 @@ class CninfoClient:
         response.raise_for_status()
         payload = response.json()
         rows = payload.get("announcements") if isinstance(payload, dict) else None
+        if rows is None and isinstance(payload, dict) and int(payload.get("totalAnnouncement") or 0) == 0:
+            rows = []
         if not isinstance(rows, list):
             raise RuntimeError("CNINFO announcement query contract changed")
         result: list[dict[str, Any]] = []
