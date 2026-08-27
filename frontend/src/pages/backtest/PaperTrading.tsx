@@ -96,6 +96,7 @@ const EVENT_ICONS: Record<string, typeof Clock3> = {
   FILLED: CheckCircle2,
   PARTIALLY_FILLED: CheckCircle2,
   ACCOUNT_SETTLED: Database,
+  SETTLEMENT_RESTATED: Database,
   MISSED_EXECUTION: ShieldAlert,
   UNKNOWN_MARKET_DATA: AlertTriangle,
 }
@@ -112,6 +113,15 @@ function shortTime(value: string | null | undefined) {
   return parsed.toLocaleString('zh-CN', {
     month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', second: '2-digit',
     hour12: false, timeZone: 'Asia/Shanghai',
+  })
+}
+
+function clockTime(value: string | null | undefined) {
+  if (!value) return '—'
+  const parsed = new Date(value)
+  if (Number.isNaN(parsed.getTime())) return value
+  return parsed.toLocaleTimeString('zh-CN', {
+    hour: '2-digit', minute: '2-digit', hour12: false, timeZone: 'Asia/Shanghai',
   })
 }
 
@@ -194,33 +204,163 @@ function Metric({ label, value, sub, tone }: { label: string; value: string; sub
   )
 }
 
-function EventTimeline({ events }: { events: PaperTradingEvent[] }) {
+function EventTimeline({ account, events }: { account: PaperTradingAccount; events: PaperTradingEvent[] }) {
   if (!events.length) {
     return <div className="py-10 text-center text-xs text-muted">今天还没有交易事件</div>
   }
+
+  const today = events[0]?.occurred_at.slice(0, 10)
+  const pendingOrders = account.orders.filter(order => (
+    ['PLANNED', 'PREFLIGHT_OK'].includes(order.status) && order.created_at.slice(0, 10) === today
+  ))
+  const todayFills = account.fills.filter(fill => fill.executed_at.slice(0, 10) === today)
+  const latestSettlement = events.find(event => (
+    event.event_type === 'SETTLEMENT_RESTATED' || event.event_type === 'ACCOUNT_SETTLED'
+  ))
+  const orderById = new Map(account.orders.map(order => [order.id, order]))
+  const resolvedOrderIds = new Set(account.orders.filter(order => (
+    !['MISSED_EXECUTION', 'UNKNOWN_MARKET_DATA'].includes(order.status)
+  )).map(order => order.id))
+  const nextPlanDate = pendingOrders.map(order => order.scheduled_date).find(Boolean)
+  const nextOpenOnly = pendingOrders.length > 0 && pendingOrders.every(order => order.planned_session === 'NEXT_OPEN')
+  const fillFees = todayFills.reduce((sum, fill) => sum + fill.fee_amount, 0)
+
+  const moments: {
+    id: string
+    at: string
+    title: string
+    detail: string
+    badge?: string
+    icon: typeof Clock3
+    tone: string
+    rows?: string[]
+  }[] = []
+
+  if (pendingOrders.length) {
+    moments.push({
+      id: 'pending-orders',
+      at: pendingOrders.reduce((latest, order) => order.created_at > latest ? order.created_at : latest, pendingOrders[0].created_at),
+      title: '下一交易日订单已就绪',
+      detail: nextOpenOnly ? `${nextPlanDate ?? '下一交易日'} 09:25 自动校验 · 09:30 开盘执行` : '订单将按账户配置的下一有效交易时钟执行',
+      badge: `${pendingOrders.length} 笔`,
+      icon: ListChecks,
+      tone: 'border-accent/35 bg-accent/10 text-accent',
+      rows: pendingOrders.map(order => `${order.name || order.symbol} · ${order.side === 'BUY' ? '买入' : '卖出'} ${order.requested_qty.toLocaleString()} 股`),
+    })
+  }
+
+  if (latestSettlement) {
+    moments.push({
+      id: 'latest-settlement',
+      at: latestSettlement.occurred_at,
+      title: latestSettlement.event_type === 'SETTLEMENT_RESTATED' ? '收盘结算已更新' : '今日收盘结算完成',
+      detail: latestSettlement.detail,
+      badge: '已完成',
+      icon: Database,
+      tone: 'border-emerald-400/35 bg-emerald-400/10 text-emerald-400',
+    })
+  }
+
+  if (todayFills.length) {
+    moments.push({
+      id: 'today-fills',
+      at: todayFills.reduce((latest, fill) => fill.executed_at > latest ? fill.executed_at : latest, todayFills[0].executed_at),
+      title: '今日成交已入账',
+      detail: `${todayFills.length} 笔成交 · 总费用 ¥ ${money(fillFees)}${todayFills.some(fill => fill.quality === 'RECOVERED_LATE') ? ' · 含延迟恢复成交' : ''}`,
+      badge: `${todayFills.length} 笔`,
+      icon: CheckCircle2,
+      tone: 'border-amber-400/35 bg-amber-400/10 text-amber-400',
+      rows: todayFills.map(fill => {
+        const order = orderById.get(fill.order_id)
+        return `${order?.name || fill.symbol} · ${fill.side === 'BUY' ? '买入' : '卖出'} ${fill.quantity.toLocaleString()} 股 @ ${money(fill.price)}`
+      }),
+    })
+  }
+
+  if (account.incidents.some(item => item.status === 'open')) {
+    const incidents = account.incidents.filter(item => item.status === 'open')
+    moments.push({
+      id: 'open-incidents',
+      at: incidents.reduce((latest, item) => item.opened_at > latest ? item.opened_at : latest, incidents[0].opened_at),
+      title: '存在需要处理的异常',
+      detail: incidents[0].detail,
+      badge: `${incidents.length} 个`,
+      icon: ShieldAlert,
+      tone: 'border-red-500/40 bg-red-500/10 text-red-400',
+    })
+  }
+
+  moments.sort((left, right) => right.at.localeCompare(left.at))
+
   return (
-    <div className="grid gap-0 lg:grid-cols-2">
-      {events.slice(0, 12).map((event, index) => {
-        const Icon = EVENT_ICONS[event.event_type] ?? Clock3
-        const critical = event.severity === 'critical'
-        const displayTitle = STATUS_LABELS[event.event_type]
-          ? `${event.title.split('·')[0].trim()} · ${STATUS_LABELS[event.event_type]}`
-          : event.title
-        return (
-          <div key={event.id} className={`relative flex gap-3 px-3 py-2.5 ${index % 2 === 0 ? 'lg:border-r lg:border-border/60' : ''}`}>
-            <div className={`mt-0.5 grid h-7 w-7 shrink-0 place-items-center rounded-full border ${critical ? 'border-red-500/40 bg-red-500/10 text-red-400' : event.severity === 'warning' ? 'border-amber-400/40 bg-amber-400/10 text-amber-400' : 'border-accent/30 bg-accent/10 text-accent'}`}>
-              <Icon className="h-3.5 w-3.5" />
-            </div>
-            <div className="min-w-0 flex-1">
-              <div className="flex items-center justify-between gap-2">
-                <span className="truncate text-xs font-medium text-foreground">{displayTitle}</span>
-                <span className="shrink-0 font-mono text-[10px] text-muted">{shortTime(event.occurred_at)}</span>
+    <div>
+      <div className="divide-y divide-border/60">
+        {moments.map(moment => {
+          const Icon = moment.icon
+          return (
+            <div key={moment.id} className="grid grid-cols-[3.25rem_1.75rem_minmax(0,1fr)] gap-3 px-4 py-3.5">
+              <time className="pt-1 font-mono text-[11px] text-muted">{clockTime(moment.at)}</time>
+              <div className={`grid h-7 w-7 place-items-center rounded-full border ${moment.tone}`}>
+                <Icon className="h-3.5 w-3.5" />
               </div>
-              <div className="mt-0.5 line-clamp-2 text-[10px] leading-4 text-muted">{event.detail || event.event_type}</div>
+              <div className="min-w-0">
+                <div className="flex flex-wrap items-center gap-2">
+                  <span className="text-xs font-semibold text-foreground">{moment.title}</span>
+                  {moment.badge && <span className="rounded-full bg-elevated px-2 py-0.5 text-[10px] text-secondary">{moment.badge}</span>}
+                </div>
+                <div className="mt-0.5 text-[11px] leading-4 text-muted">{moment.detail}</div>
+                {moment.rows && (
+                  <div className="mt-2 flex flex-wrap gap-1.5">
+                    {moment.rows.map(row => <span key={row} className="rounded border border-border bg-base px-2 py-1 text-[10px] text-secondary">{row}</span>)}
+                  </div>
+                )}
+              </div>
             </div>
-          </div>
-        )
-      })}
+          )
+        })}
+        {!moments.length && <div className="py-10 text-center text-xs text-muted">今天没有需要关注的账户变化</div>}
+      </div>
+
+      <details className="group border-t border-border bg-base/35">
+        <summary className="flex cursor-pointer list-none items-center justify-between px-4 py-2.5 text-[11px] text-secondary hover:text-foreground">
+          <span>完整审计记录 <span className="ml-1 text-muted">{events.length} 条</span></span>
+          <span className="text-[10px] text-muted group-open:hidden">展开</span>
+          <span className="hidden text-[10px] text-muted group-open:inline">收起</span>
+        </summary>
+        <div className="border-t border-border/60 px-4 py-2">
+          {events.slice(0, 30).map(event => {
+            const Icon = EVENT_ICONS[event.event_type] ?? Clock3
+            const resolved = Boolean(
+              event.entity_id
+              && ['MISSED_EXECUTION', 'UNKNOWN_MARKET_DATA'].includes(event.event_type)
+              && resolvedOrderIds.has(event.entity_id)
+            )
+            const displayTitle = STATUS_LABELS[event.event_type]
+              ? `${event.title.split('·')[0].trim()} · ${STATUS_LABELS[event.event_type]}`
+              : event.title
+            const tone = resolved
+              ? 'border-border bg-elevated text-muted'
+              : event.severity === 'critical'
+                ? 'border-red-500/40 bg-red-500/10 text-red-400'
+                : event.severity === 'warning'
+                  ? 'border-amber-400/40 bg-amber-400/10 text-amber-400'
+                  : 'border-accent/30 bg-accent/10 text-accent'
+            return (
+              <div key={event.id} className="grid grid-cols-[3.25rem_1.5rem_minmax(0,1fr)] gap-2.5 border-b border-border/40 py-2 last:border-0">
+                <time className="pt-0.5 font-mono text-[10px] text-muted">{clockTime(event.occurred_at)}</time>
+                <div className={`grid h-6 w-6 place-items-center rounded-full border ${tone}`}><Icon className="h-3 w-3" /></div>
+                <div className="min-w-0">
+                  <div className="flex flex-wrap items-center gap-1.5 text-[11px] text-secondary">
+                    <span>{displayTitle}</span>
+                    {resolved && <span className="rounded-full bg-elevated px-1.5 py-0.5 text-[9px] text-muted">后续已恢复</span>}
+                  </div>
+                  <div className="mt-0.5 text-[10px] leading-4 text-muted">{event.detail || event.event_type}</div>
+                </div>
+              </div>
+            )
+          })}
+        </div>
+      </details>
     </div>
   )
 }
@@ -525,10 +665,13 @@ export function PaperTrading() {
 
           <section className="overflow-hidden rounded-card border border-border bg-surface">
             <div className="flex items-center justify-between border-b border-border px-3 py-2.5">
-              <div className="flex items-center gap-2"><History className="h-4 w-4 text-accent" /><span className="text-xs font-semibold text-foreground">今日执行时间线</span></div>
-              <span className="text-[10px] text-muted">所有时间均为北京时间 · 来自不可变事件账本</span>
+              <div>
+                <div className="flex items-center gap-2"><History className="h-4 w-4 text-accent" /><span className="text-xs font-semibold text-foreground">今日关键进展</span></div>
+                <div className="mt-0.5 pl-6 text-[10px] text-muted">默认只展示影响账户结果的节点</div>
+              </div>
+              <span className="text-[10px] text-muted">北京时间 · 完整技术记录可展开</span>
             </div>
-            <EventTimeline events={todayEvents} />
+            <EventTimeline account={account} events={todayEvents} />
           </section>
 
           <section className="overflow-hidden rounded-card border border-border bg-surface">
