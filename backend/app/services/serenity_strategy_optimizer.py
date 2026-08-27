@@ -19,7 +19,9 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import math
 import os
+import random
 import re
 import subprocess
 import sys
@@ -249,6 +251,22 @@ def initialize_optimization_tables(store: EventReplayStore) -> None:
             error VARCHAR,
             planned_at TIMESTAMP NOT NULL,
             PRIMARY KEY (optimization_id, event_id, announcement_id)
+        );
+        CREATE TABLE IF NOT EXISTS serenity_exploratory_trials (
+            optimization_id VARCHAR NOT NULL,
+            round_id VARCHAR NOT NULL,
+            policy_id VARCHAR NOT NULL,
+            fold_id VARCHAR NOT NULL,
+            horizon INTEGER NOT NULL,
+            observation_count INTEGER NOT NULL,
+            mean_net_return DOUBLE,
+            median_net_return DOUBLE,
+            win_rate DOUBLE,
+            alpha_csi300 DOUBLE,
+            alpha_chain DOUBLE,
+            status VARCHAR NOT NULL,
+            evaluated_at TIMESTAMP NOT NULL,
+            PRIMARY KEY (optimization_id, round_id, policy_id, fold_id, horizon)
         );
         """
     )
@@ -1796,6 +1814,268 @@ def evaluate_trials(store: EventReplayStore) -> dict[str, Any]:
     return report
 
 
+def evaluate_exploratory_policies(store: EventReplayStore) -> dict[str, Any]:
+    """Run a small post-hoc rule family and label the result as shadow-only."""
+    initialize_optimization_tables(store)
+    trial_report = _optimization_root(store) / "trial-report.json"
+    if not trial_report.is_file():
+        raise RuntimeError("base trial report is missing")
+    round_id = "ROUND03_POSTHOC_EXECUTION_DIAGNOSTIC"
+    contract = _with_content_hash(
+        {
+            "optimization_id": OPTIMIZATION_ID,
+            "round_id": round_id,
+            "source_trial_report_sha256": _file_hash(trial_report),
+            "outcomes_used_for_rule_selection": True,
+            "candidate_family": {
+                "P0_EVENT_GATE": "round1 semantic event gate only",
+                "P1_CAPEX_MOMENTUM": "CAPEX_PLAN and relative momentum20 >= 0",
+                "P2_GAP_CONFIRM": "next-open gap > 2%",
+                "P3_PULLBACK_ABSORB": "relative momentum20 >= 0 and next-open gap <= 0",
+                "P4_DUAL_ENTRY": (
+                    "relative momentum20 >= 0 and either next-open gap <= 0 or gap > 2%"
+                ),
+                "P5_ENRICHED_KNOWN27": "enriched gate pass and known weight >= 27",
+                "P6_FULL64": "enriched gate pass and complete 64-point score",
+            },
+            "horizons": [2, 3, 5, 10],
+            "selection_gate": {
+                "min_observations": 10,
+                "all_four_folds_nonempty": True,
+                "positive_raw_return_each_fold": True,
+                "all_sample_csi300_alpha_positive": True,
+                "all_sample_chain_alpha_positive": True,
+                "all_sample_win_rate_min": 0.65,
+            },
+            "claim_boundary": (
+                "POSTHOC_EXPLORATORY_PROMISING_SHADOW_ONLY_NO_UNSEEN_ALPHA_CLAIM"
+            ),
+        }
+    )
+    contract_path = _optimization_root(store) / "round03-exploratory-protocol.json"
+    _freeze_json(contract_path, contract, "round-three exploratory protocol")
+    rows = store.connection.execute(
+        """
+        SELECT o.event_id, o.decision_date, o.entry_date, o.exit_date, o.horizon,
+               o.net_return, o.benchmark_return, o.chain_return,
+               f.relative_momentum_20, f.next_open_gap,
+               s.event_stage,
+               se.event_gate, se.newness, se.economic_bridge,
+               se.known_dimension_weight, se.complete_dimension_score
+        FROM event_discovery_outcomes o
+        JOIN serenity_event_features f
+          ON f.optimization_id=? AND f.event_id=o.event_id
+        JOIN serenity_event_semantic_scores s
+          ON s.optimization_id=? AND s.stage=? AND s.event_id=o.event_id
+        LEFT JOIN serenity_event_semantic_scores se
+          ON se.optimization_id=? AND se.stage=? AND se.event_id=o.event_id
+        WHERE o.status='SETTLED'
+          AND s.event_gate='PASS' AND s.newness='NEW_INFORMATION'
+          AND s.economic_bridge='PASS' AND s.event_stage!='ROUTINE_ADMIN'
+        ORDER BY o.decision_date, o.event_id, o.horizon
+        """,
+        [
+            OPTIMIZATION_ID,
+            OPTIMIZATION_ID,
+            EVENT_SCORE_STAGE,
+            OPTIMIZATION_ID,
+            EVENT_ENRICHED_SCORE_STAGE,
+        ],
+    ).fetchall()
+    records = [
+        {
+            "event_id": str(row[0]),
+            "decision_date": row[1],
+            "entry_date": row[2],
+            "exit_date": row[3],
+            "horizon": int(row[4]),
+            "net_return": float(row[5]),
+            "benchmark_return": float(row[6]),
+            "chain_return": float(row[7]),
+            "relative_momentum_20": row[8],
+            "next_open_gap": row[9],
+            "event_stage": row[10],
+            "enriched_gate": row[11],
+            "enriched_newness": row[12],
+            "enriched_bridge": row[13],
+            "enriched_known_weight": float(row[14]) if row[14] is not None else 0.0,
+            "complete_score": row[15],
+        }
+        for row in rows
+    ]
+
+    def enriched_pass(row: dict[str, Any]) -> bool:
+        return (
+            row["enriched_gate"] == "PASS"
+            and row["enriched_newness"] == "NEW_INFORMATION"
+            and row["enriched_bridge"] == "PASS"
+        )
+
+    policies: dict[str, Callable[[dict[str, Any]], bool]] = {
+        "P0_EVENT_GATE": lambda row: True,
+        "P1_CAPEX_MOMENTUM": lambda row: (
+            row["event_stage"] == "CAPEX_PLAN"
+            and row["relative_momentum_20"] is not None
+            and row["relative_momentum_20"] >= 0
+        ),
+        "P2_GAP_CONFIRM": lambda row: (
+            row["next_open_gap"] is not None and row["next_open_gap"] > 0.02
+        ),
+        "P3_PULLBACK_ABSORB": lambda row: (
+            row["relative_momentum_20"] is not None
+            and row["relative_momentum_20"] >= 0
+            and row["next_open_gap"] is not None
+            and row["next_open_gap"] <= 0
+        ),
+        "P4_DUAL_ENTRY": lambda row: (
+            row["relative_momentum_20"] is not None
+            and row["relative_momentum_20"] >= 0
+            and row["next_open_gap"] is not None
+            and (row["next_open_gap"] <= 0 or row["next_open_gap"] > 0.02)
+        ),
+        "P5_ENRICHED_KNOWN27": lambda row: (
+            enriched_pass(row) and row["enriched_known_weight"] >= 27
+        ),
+        "P6_FULL64": lambda row: (
+            enriched_pass(row) and row["complete_score"] is not None
+        ),
+    }
+    store.connection.execute(
+        "DELETE FROM serenity_exploratory_trials WHERE optimization_id=? AND round_id=?",
+        [OPTIMIZATION_ID, round_id],
+    )
+    results: list[dict[str, Any]] = []
+    all_folds = (*FOLDS, ("ALL", FROZEN_START, FROZEN_END))
+    for policy_id, predicate in policies.items():
+        for fold_id, fold_start, fold_end in all_folds:
+            for horizon in (2, 3, 5, 10):
+                selected = [
+                    row
+                    for row in records
+                    if row["horizon"] == horizon
+                    and fold_start <= row["decision_date"] <= fold_end
+                    and predicate(row)
+                ]
+                summary = _trial_summary(selected)
+                status = "OBSERVED" if selected else "NO_OBSERVATIONS"
+                result = {
+                    "policy_id": policy_id,
+                    "fold_id": fold_id,
+                    "horizon": horizon,
+                    **summary,
+                    "status": status,
+                }
+                results.append(result)
+                store.connection.execute(
+                    """
+                    INSERT INTO serenity_exploratory_trials VALUES
+                    (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    [
+                        OPTIMIZATION_ID,
+                        round_id,
+                        policy_id,
+                        fold_id,
+                        horizon,
+                        summary["observation_count"],
+                        summary["mean_net_return"],
+                        summary["median_net_return"],
+                        summary["win_rate"],
+                        summary["alpha_csi300"],
+                        summary["alpha_chain"],
+                        status,
+                        datetime.now(),
+                    ],
+                )
+
+    by_key = {
+        (row["policy_id"], row["fold_id"], row["horizon"]): row for row in results
+    }
+    survivors: list[dict[str, Any]] = []
+    for policy_id in policies:
+        for horizon in (2, 3, 5, 10):
+            overall = by_key[(policy_id, "ALL", horizon)]
+            folds = [by_key[(policy_id, fold_id, horizon)] for fold_id, *_ in FOLDS]
+            if (
+                overall["observation_count"] >= 10
+                and all(row["observation_count"] > 0 for row in folds)
+                and all((row["mean_net_return"] or 0.0) > 0 for row in folds)
+                and (overall["alpha_csi300"] or 0.0) > 0
+                and (overall["alpha_chain"] or 0.0) > 0
+                and (overall["win_rate"] or 0.0) >= 0.65
+            ):
+                survivors.append(overall)
+    survivors.sort(
+        key=lambda row: (
+            -int(row["observation_count"]),
+            -float(row["alpha_csi300"] or 0.0),
+            int(row["horizon"]),
+        )
+    )
+    selected_policy = survivors[0] if survivors else None
+    diagnostics: dict[str, Any] | None = None
+    if selected_policy:
+        predicate = policies[str(selected_policy["policy_id"])]
+        selected_records = [
+            row
+            for row in records
+            if row["horizon"] == int(selected_policy["horizon"]) and predicate(row)
+        ]
+        values = [float(row["net_return"]) for row in selected_records]
+        rng = random.Random(20260828)
+        bootstrap = sorted(
+            sum(values[rng.randrange(len(values))] for _ in values) / len(values)
+            for _ in range(20_000)
+        )
+        wins = sum(value > 0 for value in values)
+        sign_p = sum(math.comb(len(values), k) for k in range(wins, len(values) + 1)) / (
+            2 ** len(values)
+        )
+        ordered = sorted(selected_records, key=lambda row: row["entry_date"])
+        overlap_count = sum(
+            ordered[index]["entry_date"] <= ordered[index - 1]["exit_date"]
+            for index in range(1, len(ordered))
+        )
+        wealth = peak = 1.0
+        max_drawdown = 0.0
+        for row in ordered:
+            value = float(row["net_return"])
+            wealth *= 1 + value
+            peak = max(peak, wealth)
+            max_drawdown = min(max_drawdown, wealth / peak - 1)
+        diagnostics = {
+            "policy_id": selected_policy["policy_id"],
+            "horizon": selected_policy["horizon"],
+            "observation_count": len(values),
+            "bootstrap_mean_95pct": [
+                bootstrap[int(0.025 * len(bootstrap))],
+                bootstrap[int(0.975 * len(bootstrap))],
+            ],
+            "raw_sign_test_one_sided_p": sign_p,
+            "overlap_count": overlap_count,
+            "sequential_compound_return": wealth - 1 if overlap_count == 0 else None,
+            "event_to_event_max_drawdown": max_drawdown if overlap_count == 0 else None,
+            "statistical_warning": (
+                "post-hoc rule selection invalidates confirmatory p-values and confidence claims"
+            ),
+        }
+    report = {
+        "optimization_id": OPTIMIZATION_ID,
+        "round_id": round_id,
+        "protocol_sha256": _file_hash(contract_path),
+        "results": results,
+        "survivors": survivors,
+        "selected_policy_diagnostics": diagnostics,
+        "strategy_status": (
+            "PROMISING_SHADOW_CANDIDATE" if selected_policy else "NO_SURVIVING_CANDIDATE"
+        ),
+        "alpha_status": "UNVERIFIED_ALPHA_POSTHOC_SELECTION",
+        "generated_at": datetime.now().isoformat(timespec="seconds"),
+    }
+    _atomic_json(_optimization_root(store) / "round03-exploratory-report.json", report)
+    return report
+
+
 def status_report(store: EventReplayStore) -> dict[str, Any]:
     initialize_optimization_tables(store)
     root = _optimization_root(store)
@@ -1848,6 +2128,10 @@ def status_report(store: EventReplayStore) -> dict[str, Any]:
             "SELECT count(*) FROM serenity_optimization_trials WHERE optimization_id=?",
             [OPTIMIZATION_ID],
         ).fetchone()[0],
+        "exploratory_trial_rows": store.connection.execute(
+            "SELECT count(*) FROM serenity_exploratory_trials WHERE optimization_id=?",
+            [OPTIMIZATION_ID],
+        ).fetchone()[0],
         "claim_boundary": "UNVERIFIED_ALPHA_NO_CAPITAL_AUTHORITY",
     }
 
@@ -1865,6 +2149,7 @@ def main(argv: list[str] | None = None) -> int:
             "plan-enriched-score",
             "enriched-score",
             "evaluate",
+            "explore",
             "status",
         ),
     )
@@ -1897,6 +2182,8 @@ def main(argv: list[str] | None = None) -> int:
                 )
             elif args.command == "evaluate":
                 payload = evaluate_trials(store)
+            elif args.command == "explore":
+                payload = evaluate_exploratory_policies(store)
             else:
                 payload = status_report(store)
         finally:
