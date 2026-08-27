@@ -403,19 +403,39 @@ def load_event_score_states(
     universe = {row["symbol"]: row for row in store.universe()}
     anchors = store.connection.execute(
         """
-        SELECT DISTINCT e.event_id, e.symbol, e.decision_date, e.primary_event_type
+        SELECT DISTINCT e.event_id, e.symbol, e.decision_date, e.primary_event_type,
+               f.deterministic_subtype, f.fact_count
         FROM event_candidates e
         JOIN document_metrics d ON d.announcement_id=e.announcement_id
+        JOIN serenity_event_features f
+          ON f.optimization_id=? AND f.event_id=e.event_id
         WHERE EXISTS (
             SELECT 1 FROM event_discovery_outcomes o
             WHERE o.event_id=e.event_id AND o.status='SETTLED'
         )
         ORDER BY e.decision_date, e.symbol, e.event_id
-        """
+        """,
+        [OPTIMIZATION_ID],
     ).fetchall()
     states: list[EventScoreState] = []
     blocked: list[dict[str, Any]] = []
-    for event_id, symbol, decision_day, event_type in anchors:
+    for event_id, symbol, decision_day, event_type, subtype, fact_count in anchors:
+        event_only_eligible = bool(
+            event_type == "ORDER_CONTRACT"
+            or subtype != "FINANCING_ADMIN"
+            or int(fact_count) > 0
+        )
+        if stage == EVENT_SCORE_STAGE and not event_only_eligible:
+            blocked.append(
+                {
+                    "event_id": str(event_id),
+                    "status": "DEFERRED_ZERO_COST_LOW_INFORMATION",
+                    "selection_rule": (
+                        "order events OR non-financing-admin events OR regex fact_count>0"
+                    ),
+                }
+            )
+            continue
         company = universe[str(symbol)]
         documents = store.connection.execute(
             """
@@ -868,6 +888,29 @@ def run_event_scores(
         "preflight": preflight,
         "execute": execute,
     }
+    paid_population = _with_content_hash(
+        {
+            "optimization_id": OPTIMIZATION_ID,
+            "stage": stage,
+            "selection_rule": (
+                "ORDER_CONTRACT OR deterministic_subtype!=FINANCING_ADMIN OR fact_count>0"
+            ),
+            "selection_uses_outcomes": False,
+            "pending_slots": [
+                {
+                    "event_id": state.event_id,
+                    "slot_id": spec.slot_id,
+                    "input_sha256": spec.input_sha256,
+                }
+                for state, spec in zip(pending_states, specs, strict=True)
+            ],
+        }
+    )
+    _freeze_json(
+        paths["run_root"] / f"{stage.lower()}-paid-population.json",
+        paid_population,
+        f"{stage} paid population",
+    )
     _atomic_json(paths["run_root"] / f"{stage.lower()}-plan.json", plan)
     if not execute or not specs:
         return plan
