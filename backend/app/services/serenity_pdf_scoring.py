@@ -1075,6 +1075,13 @@ def _usage_path(paths: dict[str, Path], trade_date: date) -> Path:
     return paths["run_root"] / f"model-usage-{trade_date.isoformat()}.jsonl"
 
 
+def _verified_output_hash(raw_output: str, ledger_row: dict[str, Any]) -> str:
+    actual = hashlib.sha256(raw_output.encode()).hexdigest()
+    if actual != ledger_row.get("output_sha256"):
+        raise RuntimeError("DeepSeek adapter output does not match its immutable receipt")
+    return actual
+
+
 def _budget_environment(paths: dict[str, Path], spec: ModelCallSpec) -> dict[str, str]:
     if current_ai_provider() != "openai_compat" or current_ai_model() != MODEL:
         raise RuntimeError("server AI configuration must use openai_compat/deepseek-v4-flash")
@@ -1148,9 +1155,6 @@ def _adapter_runner(paths: dict[str, Path]) -> Callable[[ModelCallSpec], CachedM
             raise RuntimeError("DeepSeek adapter audit stream is incomplete")
         raw_output = output_path.read_text(encoding="utf-8")
         json.loads(raw_output)
-        raw_output_sha256 = hashlib.sha256(raw_output.encode()).hexdigest()
-        if raw_output_sha256 != turn.get("output_sha256"):
-            raise RuntimeError("DeepSeek adapter output does not match its immutable receipt")
         ledger_row: dict[str, Any] | None = None
         usage_path = _usage_path(paths, spec.trade_date)
         if usage_path.is_file():
@@ -1165,9 +1169,10 @@ def _adapter_runner(paths: dict[str, Path]) -> Callable[[ModelCallSpec], CachedM
                     break
         if ledger_row is None:
             raise RuntimeError("DeepSeek paid call is missing from the immutable usage ledger")
+        raw_output_sha256 = _verified_output_hash(raw_output, ledger_row)
         return CachedModelResult(
             raw_output=raw_output,
-            response_sha256=str(turn["response_sha256"]),
+            response_sha256=str(ledger_row["response_sha256"]),
             output_sha256=raw_output_sha256,
             context_id=str(thread["thread_id"]),
             api_request_id=ledger_row.get("api_request_id"),

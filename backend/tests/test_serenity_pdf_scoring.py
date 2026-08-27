@@ -14,6 +14,7 @@ from app.services.serenity_pdf_scoring import (
     PENALTY_MULTIPLIER,
     CachedModelResult,
     ModelCallSpec,
+    _verified_output_hash,
     compute_full_score,
     execute_cached_call,
     initialize_semantic_tables,
@@ -185,6 +186,15 @@ def test_cached_model_call_fails_closed_if_persisted_raw_json_is_corrupted(
     with pytest.raises(RuntimeError, match="persisted model output hash mismatch"):
         execute_cached_call(store.connection, spec, runner)
     store.close()
+
+
+def test_adapter_output_hash_is_bound_to_immutable_ledger_receipt() -> None:
+    raw = '{"ok":true}'
+    receipt = {"output_sha256": hashlib.sha256(raw.encode()).hexdigest()}
+
+    assert _verified_output_hash(raw, receipt) == receipt["output_sha256"]
+    with pytest.raises(RuntimeError, match="immutable receipt"):
+        _verified_output_hash(raw + "\n", receipt)
 
 
 def test_score_validation_rejects_unbound_quote() -> None:
