@@ -65,8 +65,8 @@ ANNUAL_LOOKBACK_DAYS = 550
 MAX_THESIS_DOCUMENTS = 16
 MAX_THESIS_RAW_BYTES = 200_000_000
 MAX_THESIS_PAGES_PER_DOCUMENT = 12
-MAX_THESIS_CONTEXTS = 10
-THESIS_WORST_CASE_CAP_MICROS_CNY = 10_000_000
+MAX_THESIS_CONTEXTS = 14
+THESIS_WORST_CASE_CAP_MICROS_CNY = 13_000_000
 MIN_COMPLETE_SCORE = 38.4
 MIN_DIMENSION_RATING = 3
 
@@ -622,9 +622,9 @@ def load_states(store: EventReplayStore) -> tuple[list[EventScoreState], list[di
         blocked.append(
             {
                 "event_id": state.event_id,
-                "status": "DEFERRED_THESIS_CNY10_CAP",
+                "status": "DEFERRED_THESIS_CNY13_CAP",
                 "selection_rule": (
-                    "10 largest return-blind T0 PDF contexts; ties by decision date and event id"
+                    "14 largest return-blind T0 PDF contexts; ties by decision date and event id"
                 ),
             }
         )
@@ -676,7 +676,7 @@ def run_scores(store: EventReplayStore, *, execute: bool) -> dict[str, Any]:
         .get("charged_cost_micros_cny", 0)
     )
     if worst_case > THESIS_WORST_CASE_CAP_MICROS_CNY:
-        raise RuntimeError("thesis evidence repair exceeds its CNY10 worst-case cap")
+        raise RuntimeError("thesis evidence repair exceeds its CNY13 worst-case cap")
     current_stage_cost = int(
         store.connection.execute(
             """
@@ -694,7 +694,7 @@ def run_scores(store: EventReplayStore, *, execute: bool) -> dict[str, Any]:
         "parent_stage": EVENT_ENRICHED_SCORE_STAGE,
         "selection_uses_outcomes": False,
         "selection_rule": (
-            "10 largest return-blind T0 PDF contexts; ties by decision date and event id"
+            "14 largest return-blind T0 PDF contexts; ties by decision date and event id"
         ),
         "reason": (
             "red team rejected P4 because the PDF-backed 64-point thesis was not a hard gate; "
