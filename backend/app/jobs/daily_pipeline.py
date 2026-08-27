@@ -1176,12 +1176,26 @@ def _paper_clock_call(method: str) -> None:
         logger.warning("paper clock %s skipped: service not ready", method)
         return
     try:
-        if method in {"preflight_all", "execute_open_orders", "finalize_open_window"}:
+        quotes = None
+        if method in {
+            "probe_quote_chain",
+            "preflight_all",
+            "execute_open_orders",
+            "finalize_open_window",
+        }:
             quote_service = getattr(state, "quote_service", None)
             if quote_service is not None and service.subscription_symbols():
-                refresh = getattr(quote_service, "refresh_paper_symbols", quote_service.refresh)
-                refresh()
-        result = getattr(service, method)()
+                refresh = getattr(quote_service, "refresh_paper_symbols", None)
+                if refresh is not None:
+                    payload = refresh(notify=False)
+                    records = payload.get("records", []) if isinstance(payload, dict) else []
+                    normalize = getattr(service, "quotes_from_records", None)
+                    if normalize is not None:
+                        quotes = normalize(records, source="realtime")
+                else:
+                    quote_service.refresh()
+        target = getattr(service, method)
+        result = target(quotes=quotes) if quotes is not None else target()
         logger.info("paper clock %s result: %s", method, result)
     except Exception:
         logger.exception("paper clock %s failed", method)
@@ -1189,6 +1203,14 @@ def _paper_clock_call(method: str) -> None:
 
 def _register_paper_clock_jobs(scheduler) -> None:
     """Register exchange-clock boundaries plus persistent evidence recovery."""
+    scheduler.add_job(
+        lambda: _paper_clock_call("probe_quote_chain"),
+        trigger=CronTrigger(day_of_week="mon-fri", hour=9, minute=20,
+                            timezone="Asia/Shanghai"),
+        id="paper_quote_canary",
+        misfire_grace_time=240,
+        replace_existing=True,
+    )
     scheduler.add_job(
         lambda: _paper_clock_call("preflight_all"),
         trigger=CronTrigger(day_of_week="mon-fri", hour=9, minute=25,
@@ -1257,6 +1279,22 @@ def _paper_quote_tick() -> None:
     service = getattr(state, "paper_trading_service", None) if state else None
     quote_service = getattr(state, "quote_service", None) if state else None
     if service is None or quote_service is None or not service.subscription_symbols():
+        return
+    critical_open_window = dt_time(9, 20) <= current < dt_time(9, 32)
+    quote_status = getattr(quote_service, "status", lambda: {})()
+    global_poll_owns_channel = bool(
+        quote_status.get("enabled")
+        and quote_status.get("running")
+        and not quote_status.get("paused")
+    )
+    covers_paper = getattr(
+        quote_service,
+        "global_poll_covers_paper_symbols",
+        lambda: False,
+    )()
+    if global_poll_owns_channel and covers_paper and not critical_open_window:
+        # 全局 watchlist 已强制并入全部模拟盘订单和持仓。非开盘关键窗口只保留
+        # 一个拉取者；全局开关关闭时，模拟盘独立通道仍照常工作。
         return
     if in_close_finalization:
         claim = getattr(service, "claim_close_quote_refresh", None)

@@ -218,6 +218,19 @@ class QuoteService:
         # 午休/收盘最终同步状态: 到边界后必须成功拉取一版行情, 再进入休盘态。
         self._final_sync_done: set[tuple[date, str]] = set()
         self._final_sync_failed: dict[tuple[date, str], str] = {}
+        # 模拟交易关键时钟共享同一次定向行情结果。09:25 预检、09:30 撮合和
+        # 09:31 截止可能与 10 秒行情 tick 同时触发；若各自直接请求，Free 档会
+        # 瞬间打满 quote.by_symbol 限额。网络拉取仍由 _fetch_lock 串行化。
+        self._paper_fetch_key: tuple[str, ...] = ()
+        self._paper_fetch_at: float = 0.0
+        self._paper_fetch_result: dict = {
+            "fetched": 0,
+            "records": [],
+            "requested": [],
+            "missing": [],
+            "errors": [],
+            "from_cache": False,
+        }
 
     # ================================================================
     # 生命周期
@@ -540,7 +553,7 @@ class QuoteService:
         self._fetch_quotes()
         return self.status()
 
-    def refresh_paper_symbols(self) -> dict:
+    def refresh_paper_symbols(self, *, notify: bool = True) -> dict:
         """Fetch only symbols required by paper execution, independent of the UI switch."""
         paper_service = (
             getattr(self._app_state, "paper_trading_service", None)
@@ -548,7 +561,14 @@ class QuoteService:
         )
         tracked_symbols = sorted(paper_service.subscription_symbols()) if paper_service else []
         if not tracked_symbols:
-            return {"fetched": 0, "records": []}
+            return {
+                "fetched": 0,
+                "records": [],
+                "requested": [],
+                "missing": [],
+                "errors": [],
+                "from_cache": False,
+            }
         # 上证指数只作为开市探针。单个订单行情缺失时, 仍能确认交易日并在
         # 09:31 将该订单置为 UNKNOWN_MARKET_DATA, 而不是无限停留在计划态。
         symbols = sorted(set(tracked_symbols) | {"000001.SH"})
@@ -556,52 +576,83 @@ class QuoteService:
         from app.tickflow.capabilities import Cap
         from app.tickflow.client import get_paid_realtime_client
         from app.tickflow.policy import detect_capabilities
-        from app.tickflow.rate_limits import chunked, resolve_limit, sleep_between_batches
+        from app.tickflow.rate_limits import (
+            batch_interval,
+            chunked,
+            resolve_limit,
+            sleep_between_batches,
+        )
 
-        client = get_paid_realtime_client()
-        if client is None:
-            logger.warning("模拟交易行情拉取失败: 未配置实时行情 API Key")
-            return {"fetched": 0, "records": []}
         limit = resolve_limit(detect_capabilities(), Cap.QUOTE_BY_SYMBOL, default_batch=5)
-        responses: list[dict] = []
-        batches = chunked(symbols, limit.batch)
-        started = time.perf_counter()
-        for index, batch in enumerate(batches):
-            sleep_between_batches(index, limit.rpm)
-            try:
-                responses.extend(client.quotes.get(symbols=batch) or [])
-            except Exception as exc:
-                logger.warning(
-                    "模拟交易行情批次 %d/%d 拉取失败: %s",
-                    index + 1,
-                    len(batches),
-                    exc,
-                )
-        records = []
-        for quote in responses:
-            extension = quote.get("ext") or {}
-            records.append({
-                "symbol": quote.get("symbol"),
-                "name": quote.get("name") or extension.get("name"),
-                "last_price": quote.get("last_price"),
-                "prev_close": quote.get("prev_close"),
-                "open": quote.get("open"),
-                "high": quote.get("high"),
-                "low": quote.get("low"),
-                "volume": quote.get("volume"),
-                "amount": quote.get("amount"),
-                "timestamp": quote.get("timestamp"),
-                "session": quote.get("session"),
-            })
+        cache_seconds = max(batch_interval(limit.rpm, default=self.DEFAULT_INTERVAL), 1.0)
+        fetch_key = tuple(symbols)
+        with self._fetch_lock:
+            started = time.perf_counter()
+            if (
+                fetch_key == self._paper_fetch_key
+                and self._paper_fetch_at
+                and started - self._paper_fetch_at < cache_seconds
+            ):
+                cached = {**self._paper_fetch_result, "from_cache": True}
+                if notify and cached["records"]:
+                    self._notify_paper_trading(cached["records"])
+                return cached
+
+            client = get_paid_realtime_client()
+            responses: list[dict] = []
+            errors: list[str] = []
+            if client is None:
+                errors.append("未配置实时行情 API Key")
+                logger.warning("模拟交易行情拉取失败: %s", errors[0])
+            else:
+                batches = chunked(symbols, limit.batch)
+                for index, batch in enumerate(batches):
+                    sleep_between_batches(index, limit.rpm)
+                    try:
+                        responses.extend(client.quotes.get(symbols=batch) or [])
+                    except Exception as exc:
+                        error = f"批次 {index + 1}/{len(batches)}: {exc}"
+                        errors.append(error)
+                        logger.warning("模拟交易行情拉取失败: %s", error)
+
+            records = []
+            for quote in responses:
+                extension = quote.get("ext") or {}
+                records.append({
+                    "symbol": quote.get("symbol"),
+                    "name": quote.get("name") or extension.get("name"),
+                    "last_price": quote.get("last_price"),
+                    "prev_close": quote.get("prev_close"),
+                    "open": quote.get("open"),
+                    "high": quote.get("high"),
+                    "low": quote.get("low"),
+                    "volume": quote.get("volume"),
+                    "amount": quote.get("amount"),
+                    "timestamp": quote.get("timestamp"),
+                    "session": quote.get("session"),
+                })
+            returned = {str(row.get("symbol") or "") for row in records}
+            result = {
+                "fetched": len(records),
+                "records": records,
+                "requested": symbols,
+                "missing": [symbol for symbol in symbols if symbol not in returned],
+                "errors": errors,
+                "from_cache": False,
+            }
+            self._paper_fetch_key = fetch_key
+            self._paper_fetch_at = time.perf_counter()
+            self._paper_fetch_result = result
         if records:
             fetched_at = time.time() * 1000
             with self._lock:
-                self._fetch_time = time.perf_counter()
+                self._fetch_time = self._paper_fetch_at
                 self._fetch_ms = (time.perf_counter() - started) * 1000
                 self._fetched_at = fetched_at
             _persist_last_fetch(fetched_at)
-            self._notify_paper_trading(records)
-        return {"fetched": len(records), "records": records}
+            if notify:
+                self._notify_paper_trading(records)
+        return result
 
     # ================================================================
     # 后台轮询
@@ -614,7 +665,9 @@ class QuoteService:
                 # 线程继续存活 + 分片 sleep, resume() 后即时恢复, 无需重启线程。
                 if not self._paused:
                     phase = self._market_phase()
-                    if self._should_fetch_for_phase(phase):
+                    if self._paper_execution_priority_active():
+                        logger.debug("模拟盘开盘执行优先, 跳过本轮全局行情拉取")
+                    elif self._should_fetch_for_phase(phase):
                         is_final = phase in {"morning_final", "close_final"}
                         ok = self._fetch_quotes(final=is_final)
                         if is_final:
@@ -981,6 +1034,42 @@ class QuoteService:
                 if symbol not in merged:
                     merged.append(symbol)
         return merged
+
+    def _paper_execution_priority_active(self) -> bool:
+        """Reserve the single quote channel for paper execution around the open."""
+        paper_service = (
+            getattr(self._app_state, "paper_trading_service", None)
+            if self._app_state else None
+        )
+        if paper_service is None or not paper_service.subscription_symbols():
+            return False
+        now = cn_now()
+        return now.weekday() < 5 and dt_time(9, 20) <= now.time() < dt_time(9, 32)
+
+    def global_poll_covers_paper_symbols(self) -> bool:
+        """Whether the configured global feed proves coverage of every paper symbol."""
+        from app.services import preferences
+
+        tracked = self._include_paper_symbols([])
+        if not tracked:
+            return True
+        mode = self.realtime_mode()
+        if mode == "watchlist":
+            return True
+        if mode != "full_market" or preferences.get_realtime_data_provider() != "tickflow":
+            return False
+        index_symbols = self._repo.get_index_symbol_set() if self._repo else set()
+        etf_symbols = self._repo.get_etf_symbol_set() if self._repo else set()
+        for symbol in tracked:
+            if symbol in etf_symbols:
+                if not preferences.get_realtime_pull_etf():
+                    return False
+            elif symbol in index_symbols:
+                if not preferences.get_realtime_pull_index():
+                    return False
+            elif not preferences.get_realtime_pull_stock():
+                return False
+        return True
 
     def _notify_paper_trading(self, records: list[dict]) -> None:
         service = getattr(self._app_state, "paper_trading_service", None) if self._app_state else None

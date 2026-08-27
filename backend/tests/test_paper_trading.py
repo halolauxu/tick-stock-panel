@@ -20,6 +20,12 @@ TRADE_DAY = date(2026, 8, 27)
 OPEN_TIME = datetime(2026, 8, 27, 9, 30, 5, tzinfo=CN_TZ)
 
 
+@pytest.fixture(autouse=True)
+def _freeze_ledger_clock(monkeypatch):
+    """Keep historical execution tests independent of the machine's current date."""
+    monkeypatch.setattr("app.services.paper_ledger.cn_now", lambda: OPEN_TIME)
+
+
 def _config(**overrides) -> dict:
     config = {
         "strategy_id": "n_day_low_reversal",
@@ -185,6 +191,7 @@ def test_scheduler_registers_and_dispatches_all_exchange_clock_boundaries():
 
     calls: list[str] = []
     service = SimpleNamespace(
+        probe_quote_chain=lambda quotes=None: calls.append("canary"),
         preflight_all=lambda: calls.append("preflight"),
         execute_open_orders=lambda: calls.append("open"),
         finalize_open_window=lambda: calls.append("deadline"),
@@ -195,6 +202,7 @@ def test_scheduler_registers_and_dispatches_all_exchange_clock_boundaries():
 
     daily_pipeline._register_paper_clock_jobs(Scheduler())
     for job_id in (
+        "paper_quote_canary",
         "paper_preflight",
         "paper_open_execution",
         "paper_open_deadline",
@@ -203,13 +211,89 @@ def test_scheduler_registers_and_dispatches_all_exchange_clock_boundaries():
     ):
         jobs[job_id]["func"]()
 
-    assert calls == ["preflight", "open", "deadline", "settlement", "recovery"]
+    assert calls == ["canary", "preflight", "open", "deadline", "settlement", "recovery"]
+    assert "hour='9', minute='20'" in str(jobs["paper_quote_canary"]["trigger"])
     assert str(jobs["paper_preflight"]["trigger"]).startswith("cron[day_of_week='mon-fri'")
     assert "hour='9', minute='30', second='5,25,45'" in str(
         jobs["paper_open_execution"]["trigger"]
     )
     assert "interval[0:00:10]" in str(jobs["paper_quote_tick"]["trigger"])
     assert "interval[0:01:00]" in str(jobs["paper_evidence_recovery"]["trigger"])
+
+
+def test_clock_passes_targeted_quotes_directly_to_preflight():
+    received: list[dict] = []
+    records = [{"symbol": "000001.SH", "last_price": 3_900, "timestamp": OPEN_TIME}]
+    service = SimpleNamespace(
+        subscription_symbols=lambda: {"000001.SZ"},
+        quotes_from_records=lambda values, source: {row["symbol"]: row for row in values},
+        preflight_all=lambda *, quotes: received.append(quotes) or {"assigned": 0},
+    )
+    quote_service = SimpleNamespace(
+        refresh_paper_symbols=lambda *, notify: {"records": records}
+    )
+    daily_pipeline.set_app_state(SimpleNamespace(
+        paper_trading_service=service,
+        quote_service=quote_service,
+    ))
+
+    daily_pipeline._paper_clock_call("preflight_all")
+
+    assert received == [{"000001.SH": records[0]}]
+
+
+def test_quote_canary_opens_and_resolves_a_visible_incident(tmp_path):
+    service = _service(tmp_path)
+    account, _ = _account_with_buy_order(service)
+    at = datetime(2026, 8, 27, 9, 20, tzinfo=CN_TZ)
+    index_quote = _quote(symbol="000001.SH", price=3_900, previous=3_880, at=at)
+
+    failed = service.probe_quote_chain(
+        now=at,
+        quotes={"000001.SH": index_quote},
+    )
+    after_failure = service.account(account["id"])
+
+    assert failed["ready"] is False
+    assert failed["missing"] == ["000001.SZ"]
+    assert after_failure["summary"]["critical_incident_count"] == 1
+    assert any(
+        incident["code"] == "QUOTE_CHAIN_NOT_READY"
+        and incident["status"] == "open"
+        for incident in after_failure["incidents"]
+    )
+
+    ready = service.probe_quote_chain(
+        now=at,
+        quotes={
+            "000001.SH": index_quote,
+            "000001.SZ": _quote(at=at),
+        },
+    )
+    after_recovery = service.account(account["id"])
+
+    assert ready == {"ready": True, "required": 2, "available": 2, "missing": []}
+    assert after_recovery["summary"]["critical_incident_count"] == 0
+
+
+def test_preflight_requires_each_orders_own_current_quote(tmp_path):
+    service = _service(tmp_path)
+    account, _ = _account_with_buy_order(service)
+    at = datetime(2026, 8, 27, 9, 25, tzinfo=CN_TZ)
+
+    result = service.preflight_all(
+        now=at,
+        quotes={"000001.SH": _quote(symbol="000001.SH", at=at)},
+    )
+    current = service.account(account["id"])
+
+    assert result == {"checked": 1, "deferred": 1, "assigned": 0}
+    assert current["orders"][0]["status"] == "PLANNED"
+    assert any(
+        incident["code"] == "ORDER_QUOTE_NOT_READY"
+        and incident["status"] == "open"
+        for incident in current["incidents"]
+    )
 
 
 def test_quote_tick_refreshes_tracked_paper_symbols_during_market(monkeypatch):
@@ -230,6 +314,30 @@ def test_quote_tick_refreshes_tracked_paper_symbols_during_market(monkeypatch):
     daily_pipeline._paper_quote_tick()
 
     assert calls == ["refresh"]
+
+
+def test_quote_tick_does_not_duplicate_a_running_global_poll(monkeypatch):
+    calls: list[str] = []
+    state = SimpleNamespace(
+        paper_trading_service=SimpleNamespace(
+            subscription_symbols=lambda: {"000001.SZ"}
+        ),
+        quote_service=SimpleNamespace(
+            refresh=lambda: calls.append("refresh"),
+            status=lambda: {"enabled": True, "running": True, "paused": False},
+            global_poll_covers_paper_symbols=lambda: True,
+        ),
+    )
+    daily_pipeline.set_app_state(state)
+    monkeypatch.setattr(
+        daily_pipeline,
+        "cn_now",
+        lambda: datetime(2026, 8, 27, 11, 25, tzinfo=CN_TZ),
+    )
+
+    daily_pipeline._paper_quote_tick()
+
+    assert calls == []
 
 
 def test_quote_tick_finalizes_close_marks_without_hammering_provider(monkeypatch):

@@ -289,6 +289,13 @@ class PaperTradingService:
     def subscription_symbols(self) -> set[str]:
         return self.ledger.tracked_symbols()
 
+    @staticmethod
+    def quotes_from_records(
+        records: list[dict[str, Any]], *, source: str = "realtime"
+    ) -> dict[str, dict[str, Any]]:
+        """Normalize one provider response for direct use by the execution clock."""
+        return _quote_map(records, source=source)
+
     def _quotes_from_cache(self) -> dict[str, dict[str, Any]]:
         service = getattr(self.app_state, "quote_service", None)
         if service is None:
@@ -327,6 +334,80 @@ class PaperTradingService:
             for quote in quotes.values()
         )
 
+    @staticmethod
+    def _quote_ready_for_preflight(
+        quote: dict[str, Any] | None, trading_date: date
+    ) -> bool:
+        return bool(
+            quote
+            and quote.get("_quote_dt") is not None
+            and quote["_quote_dt"].date() == trading_date
+            and _valid_price(quote.get("last_price"))
+            and _valid_price(quote.get("prev_close"))
+        )
+
+    def probe_quote_chain(
+        self,
+        *,
+        now: datetime | None = None,
+        quotes: dict[str, dict[str, Any]] | None = None,
+    ) -> dict[str, Any]:
+        """09:20 canary: prove the next-open execution data path before preflight."""
+        current = _as_cn(now)
+        trading_date = current.date()
+        quotes = quotes if quotes is not None else self._quotes_from_cache()
+        tracked = self.subscription_symbols()
+        required = set(tracked)
+        if tracked:
+            required.add("000001.SH")
+        missing = sorted(
+            symbol
+            for symbol in required
+            if not self._quote_ready_for_preflight(quotes.get(symbol), trading_date)
+        )
+        ready = not missing
+        accounts = [
+            item for item in self.ledger.list_accounts() if item["status"] == "active"
+        ]
+        for account in accounts:
+            incident_key = f"account:{account['id']}:QUOTE_CHAIN_NOT_READY:{trading_date}"
+            if ready:
+                self.ledger.resolve_incident(incident_key)
+            else:
+                self.ledger.open_incident(
+                    account_id=account["id"],
+                    incident_key=incident_key,
+                    code="QUOTE_CHAIN_NOT_READY",
+                    severity="critical",
+                    title="开盘行情链路未就绪",
+                    detail=f"09:20 探针未取得当日有效行情: {', '.join(missing)}",
+                    entity_type="account",
+                    entity_id=account["id"],
+                )
+            self.ledger.record_account_event(
+                account["id"],
+                event_key=(
+                    f"{account['id']}:QUOTE_CHAIN:"
+                    f"{'READY' if ready else 'NOT_READY'}:{trading_date}"
+                ),
+                event_type="QUOTE_CHAIN_READY" if ready else "QUOTE_CHAIN_NOT_READY",
+                trading_date=trading_date,
+                severity="info" if ready else "critical",
+                title="开盘行情链路已就绪" if ready else "开盘行情链路未就绪",
+                detail=(
+                    f"已验证 {len(required)} 个执行/市场探针标的"
+                    if ready
+                    else f"缺少当日有效行情: {', '.join(missing)}"
+                ),
+                payload={"required": sorted(required), "missing": missing},
+            )
+        return {
+            "ready": ready,
+            "required": len(required),
+            "available": len(required) - len(missing),
+            "missing": missing,
+        }
+
     def preflight_all(
         self,
         *,
@@ -359,6 +440,15 @@ class PaperTradingService:
                 self.ledger.resolve_incident(
                     f"account:{account['id']}:TRADING_DAY_UNCONFIRMED:{trading_date}"
                 )
+            tracked_ready = all(
+                self._quote_ready_for_preflight(quotes.get(symbol), trading_date)
+                for symbol in self.subscription_symbols()
+            )
+            if tracked_ready:
+                for account in self.ledger.list_accounts():
+                    self.ledger.resolve_incident(
+                        f"account:{account['id']}:QUOTE_CHAIN_NOT_READY:{trading_date}"
+                    )
             self._release_t1_waiting_exits(trading_date)
             accounts = {row["id"]: row for row in self.ledger.list_account_rows(active_only=True)}
             for order in self.ledger.planned_orders():
@@ -369,6 +459,24 @@ class PaperTradingService:
                 if order["scheduled_date"] and order["scheduled_date"] != trading_date.isoformat():
                     continue
                 summary["checked"] += 1
+                quote = quotes.get(str(order["symbol"]))
+                quote_incident = (
+                    f"order:{order['id']}:ORDER_QUOTE_NOT_READY:{trading_date}"
+                )
+                if not self._quote_ready_for_preflight(quote, trading_date):
+                    self.ledger.open_incident(
+                        account_id=order["account_id"],
+                        incident_key=quote_incident,
+                        code="ORDER_QUOTE_NOT_READY",
+                        severity="warning",
+                        title=f"{order['name'] or order['symbol']} 行情未就绪",
+                        detail="盘前未取得该标的当日价格和昨收, 订单保持计划态",
+                        entity_type="order",
+                        entity_id=order["id"],
+                    )
+                    summary["deferred"] += 1
+                    continue
+                self.ledger.resolve_incident(quote_incident)
                 self.ledger.assign_due_date(
                     order["id"],
                     trading_date,
@@ -376,6 +484,9 @@ class PaperTradingService:
                         "market_observed": True,
                         "checked_at": current.isoformat(timespec="seconds"),
                         "cash": float(accounts[order["account_id"]]["cash_balance"]),
+                        "quote_at": quote["quote_at"],
+                        "quote_source": quote.get("source"),
+                        "previous_close": quote.get("prev_close"),
                     },
                 )
                 summary["assigned"] += 1
@@ -461,8 +572,34 @@ class PaperTradingService:
         summary = {"filled": 0, "partial": 0, "rejected": 0, "unknown": 0, "waiting": 0}
         with self._lock:
             self.preflight_all(now=current, quotes=quotes)
+            market_observed = self._market_is_observed(trading_date, quotes)
             for row in self.ledger.planned_orders():
                 order = dict(row)
+                eligible_today = (
+                    date.fromisoformat(str(order["signal_date"])) < trading_date
+                    and (
+                        not order["scheduled_date"]
+                        or order["scheduled_date"] == trading_date.isoformat()
+                    )
+                )
+                if (
+                    finalize_missing
+                    and market_observed
+                    and order["status"] == "PLANNED"
+                    and eligible_today
+                ):
+                    self.ledger.resolve_incident(
+                        f"order:{order['id']}:ORDER_QUOTE_NOT_READY:{trading_date}"
+                    )
+                    self.ledger.terminal_order(
+                        order["id"],
+                        status="UNKNOWN_MARKET_DATA",
+                        reason="09:31 前未取得该标的当日价格和昨收, 盘前校验未通过",
+                        quality="NO_RELIABLE_OPEN_DATA",
+                        scheduled_date=trading_date,
+                    )
+                    summary["unknown"] += 1
+                    continue
                 if order["status"] != "PREFLIGHT_OK" or order["scheduled_date"] != trading_date.isoformat():
                     continue
                 quote = quotes.get(order["symbol"])
@@ -546,11 +683,20 @@ class PaperTradingService:
                     summary["rejected"] += 1
         return summary
 
-    def finalize_open_window(self, *, now: datetime | None = None) -> dict[str, int]:
-        return self.execute_open_orders(now=now, finalize_missing=True)
+    def finalize_open_window(
+        self,
+        *,
+        now: datetime | None = None,
+        quotes: dict[str, dict[str, Any]] | None = None,
+    ) -> dict[str, int]:
+        return self.execute_open_orders(
+            now=now,
+            quotes=quotes,
+            finalize_missing=True,
+        )
 
     def on_quote_records(self, records: list[dict[str, Any]], *, source: str) -> dict[str, int]:
-        quotes = _quote_map(records, source=source)
+        quotes = self.quotes_from_records(records, source=source)
         if not quotes:
             return {"marked": 0, "executed": 0, "risk_triggers": 0}
         current = max(quote["_quote_dt"] for quote in quotes.values())
@@ -1195,6 +1341,14 @@ class PaperTradingService:
                                 or "minute_k_targeted_recovery"
                             ),
                         }
+            # 分钟 K 通常不携带昨收；恢复路径仍需用冻结信号日收盘价完成
+            # 涨跌停校验，不能因为盘前接口字段缺失而绕过同一套规则。
+            for row in self.ledger.planned_orders():
+                order = dict(row)
+                minute_quote = minute_quotes.get(str(order["symbol"]))
+                if minute_quote is None or _valid_price(minute_quote.get("prev_close")):
+                    continue
+                minute_quote["prev_close"] = self._reference_close(order, minute_quote)
             confirmation_quotes = {**minute_quotes, **quotes}
             if current.time() >= OPEN_DEADLINE and (
                 self._market_is_observed(current.date(), confirmation_quotes)
@@ -1203,6 +1357,30 @@ class PaperTradingService:
                 self.preflight_all(now=current, quotes=confirmation_quotes)
                 for row in self.ledger.planned_orders():
                     order = dict(row)
+                    eligible_today = (
+                        date.fromisoformat(str(order["signal_date"])) < current.date()
+                        and (
+                            not order["scheduled_date"]
+                            or order["scheduled_date"] == current.date().isoformat()
+                        )
+                    )
+                    if not eligible_today:
+                        continue
+                    if order["status"] == "PLANNED":
+                        self.ledger.resolve_incident(
+                            f"order:{order['id']}:ORDER_QUOTE_NOT_READY:{current.date()}"
+                        )
+                        self.ledger.terminal_order(
+                            order["id"],
+                            status="UNKNOWN_MARKET_DATA",
+                            reason="开盘窗口已结束, 但该标的盘前/开盘行情证据不足",
+                            quality="NO_RELIABLE_OPEN_DATA",
+                            scheduled_date=current.date(),
+                            severity="critical",
+                        )
+                        result["missed"] += 1
+                        result["unknown"] += 1
+                        continue
                     if (
                         order["status"] != "PREFLIGHT_OK"
                         or order["scheduled_date"] != current.date().isoformat()

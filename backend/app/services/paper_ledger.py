@@ -644,6 +644,7 @@ class PaperLedger:
         reason: str,
         quality: str | None = None,
         occurred_at: datetime | None = None,
+        scheduled_date: date | None = None,
         severity: str = "warning",
     ) -> None:
         if status not in TERMINAL_ORDER_STATUSES:
@@ -665,9 +666,18 @@ class PaperLedger:
             ):
                 return
             conn.execute(
-                """UPDATE orders SET status=?,reason=?,execution_quality=?,terminal_at=?,updated_at=?
+                """UPDATE orders SET status=?,reason=?,execution_quality=?,terminal_at=?,updated_at=?,
+                    scheduled_date=coalesce(scheduled_date,?)
                     WHERE id=?""",
-                (status, reason, quality, now, now, order_id),
+                (
+                    status,
+                    reason,
+                    quality,
+                    now,
+                    now,
+                    scheduled_date.isoformat() if scheduled_date else None,
+                    order_id,
+                ),
             )
             for prior_status in ("MISSED_EXECUTION", "UNKNOWN_MARKET_DATA"):
                 if order["status"] == prior_status and status != prior_status:
@@ -682,7 +692,11 @@ class PaperLedger:
                 account_id=order["account_id"],
                 event_type=status,
                 occurred_at=now,
-                trading_date=order["scheduled_date"],
+                trading_date=(
+                    scheduled_date.isoformat()
+                    if scheduled_date
+                    else order["scheduled_date"]
+                ),
                 entity_type="order",
                 entity_id=order_id,
                 severity=severity,
