@@ -584,11 +584,21 @@ export function Dashboard() {
     queryKey: QK.pipelineJob(fetchJobId ?? ''),
     queryFn: () => api.pipelineJob(fetchJobId!),
     enabled: !!fetchJobId,
+    retry: (failureCount, error) => {
+      const missing = /job not found|任务记录不存在/.test(String((error as Error)?.message ?? error))
+      return !missing && failureCount < 2
+    },
     refetchInterval: (q: any) => {
       const j = q.state.data
       return j && (j.status === 'succeeded' || j.status === 'failed') ? false : 1_000
     },
   })
+  useEffect(() => {
+    const missing = /job not found|任务记录不存在/.test(
+      String((fetchStatus.error as Error | null)?.message ?? ''),
+    )
+    if (fetchStatus.isError && missing) setFetchJobId(null)
+  }, [fetchStatus.isError, fetchStatus.error])
   const startFetch = useMutation({
     mutationFn: api.pipelineRun,
     onSuccess: ({ job_id }) => setFetchJobId(job_id),

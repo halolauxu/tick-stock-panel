@@ -91,6 +91,10 @@ export function Data() {
     queryKey: QK.pipelineJob(activeJobId ?? ''),
     queryFn: () => api.pipelineJob(activeJobId!),
     enabled: !!activeJobId,
+    retry: (failureCount, error) => {
+      const missing = /job not found|任务记录不存在/.test(String((error as Error)?.message ?? error))
+      return !missing && failureCount < 2
+    },
     refetchInterval: (q: any) => {
       const j = q.state.data
       return j && (j.status === 'succeeded' || j.status === 'failed') ? false : 1_000

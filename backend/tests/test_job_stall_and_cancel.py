@@ -97,6 +97,37 @@ def test_progress_updates_heartbeat(tmp_path):
     assert store.get(jid)["last_progress_at"] is not None
 
 
+def test_running_job_is_recovered_as_failed_after_restart(tmp_path):
+    """运行中重启: 新进程仍能查询旧 id，并得到明确的中断终态而非 404。"""
+    store_dir = tmp_path / "jobs"
+    first = JobStore(store_dir=store_dir)
+    jid = _make_running_job(first, timeout_s=60)
+    first.progress(jid, "sync_minute", 92, "当前分段标的 206/5553", stage_pct=3)
+
+    restarted = JobStore(store_dir=store_dir)
+    recovered = restarted.get(jid)
+
+    assert recovered is not None
+    assert recovered["status"] == "failed"
+    assert recovered["stage"] == "sync_minute"
+    assert "服务在任务执行期间重启" in recovered["error"]
+    assert restarted.active_id() is None
+
+
+def test_completed_job_is_not_rewritten_after_restart(tmp_path):
+    """正常终态在新进程中保持原结果，不得被误判为中断。"""
+    store_dir = tmp_path / "jobs"
+    first = JobStore(store_dir=store_dir)
+    jid = _make_running_job(first, timeout_s=60)
+    first.succeed(jid, {"minute_rows": 241})
+
+    restarted = JobStore(store_dir=store_dir)
+    completed = restarted.get(jid)
+
+    assert completed["status"] == "succeeded"
+    assert completed["result"] == {"minute_rows": 241}
+
+
 # ── 协作式取消 ──────────────────────────────────────────────────────────
 
 def test_progress_raises_after_cancel(tmp_path):

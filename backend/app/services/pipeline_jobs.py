@@ -105,19 +105,53 @@ class JobStore:
         self._active_id: str | None = None
         self._lock = threading.Lock()
         self._store_dir.mkdir(parents=True, exist_ok=True)
+        self._recover_interrupted_jobs()
 
     # ===== persistence =====
 
     def _write_file(self, job: dict[str, Any]) -> None:
-        """将终态 job 写入独立 JSON 文件。"""
+        """原子写入 job JSON，避免查询读到半写文件。"""
         path = self._store_dir / f"{job['id']}.json"
+        tmp = path.with_suffix(".json.tmp")
         try:
-            path.write_text(
+            tmp.write_text(
                 json.dumps(job, ensure_ascii=False, indent=None),
                 encoding="utf-8",
             )
-        except Exception:
-            logger.warning("failed to write job file %s", path)
+            os.replace(tmp, path)
+        except Exception as exc:
+            logger.warning("failed to write job file %s: %s", path, exc)
+            try:
+                tmp.unlink(missing_ok=True)
+            except Exception:
+                pass
+
+    def _recover_interrupted_jobs(self) -> None:
+        """进程启动时把遗留的活跃记录明确标为“服务重启中断”。
+
+        数据任务在线程内运行，进程退出后不可能继续。运行态若只放内存，页面会在
+        重启后得到 404；把 create/start 状态同时落盘，下一进程就能给出真实终态。
+        """
+        recovered = 0
+        finished_at = datetime.utcnow().isoformat(timespec="seconds") + "Z"
+        for path in self._store_dir.glob("*.json"):
+            try:
+                job = json.loads(path.read_text("utf-8"))
+            except Exception:
+                continue
+            if job.get("status") not in ("pending", "running"):
+                continue
+            job["status"] = "failed"
+            job["finished_at"] = finished_at
+            job["duration_s"] = _duration_s(job)
+            job["error"] = (
+                "服务在任务执行期间重启，任务已中断；此前已落盘的数据予以保留，"
+                "请重新执行以补齐并校验。"
+            )
+            self._write_file(job)
+            recovered += 1
+        if recovered:
+            logger.warning("recovered %d interrupted pipeline job(s) after service restart", recovered)
 
     def _read_file(self, job_id: str) -> dict[str, Any] | None:
         """从磁盘读取单个 job 文件。"""
@@ -189,7 +223,7 @@ class JobStore:
                     return self._active_id, False
 
             job_id = uuid.uuid4().hex[:10]
-            self._active_jobs[job_id] = {
+            job = {
                 "id": job_id,
                 "status": "pending",
                 "stage": "init",
@@ -204,7 +238,12 @@ class JobStore:
                 "error": None,
                 "timeout_s": timeout_s,
             }
+            self._active_jobs[job_id] = job
             self._active_id = job_id
+            # 活跃任务也必须有磁盘记录：服务重启后才能把中断解释成明确失败，
+            # 而不是让前端轮询得到含糊的 job not found。
+            self._delete_oldest()
+            self._write_file(job)
         _register_cancel_flag(job_id)
         return job_id, True
 
@@ -218,6 +257,7 @@ class JobStore:
             # 心跳基准初始化为启动时刻: start() 到首次 progress() 之间的
             # 初始化阶段(解析标的池等)同样计入停滞计时。
             j["last_progress_at"] = j["started_at"]
+            self._write_file(j)
 
     def succeed(self, job_id: str, result: Any) -> None:
         with self._lock:
@@ -261,12 +301,13 @@ class JobStore:
                 if cancelled is not None and cancelled.is_set():
                     raise JobCancelledError(job_id)
                 return
+            previous_stage = j["stage"]
             j["stage"] = stage
             j["progress"] = max(0, min(100, int(pct)))
             j["last_progress_at"] = datetime.utcnow().isoformat(timespec="seconds") + "Z"
             if stage_pct is not None:
                 j["stage_pct"] = max(0, min(100, int(stage_pct)))
-            elif j["stage"] != stage:
+            elif previous_stage != stage:
                 j["stage_pct"] = 0
             entry = {
                 "ts": datetime.utcnow().isoformat(timespec="seconds") + "Z",
@@ -281,6 +322,9 @@ class JobStore:
                 j["log"].append(entry)
                 if len(j["log"]) > 200:
                     j["log"] = j["log"][-200:]
+            # 阶段切换才更新磁盘快照，避免逐标的进度造成高频 I/O。
+            if previous_stage != stage:
+                self._write_file(j)
         # 锁外检查取消: reap 可能在本次更新刚结束后置位,下一次回调必然命中;
         # 在这里立即检查可以把终止延迟压缩到当次回调。
         ev = _CANCEL_FLAGS.get(job_id)

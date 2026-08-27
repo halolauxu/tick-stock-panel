@@ -215,7 +215,10 @@ def get_job(job_id: str) -> dict:
     job_store.reap_stale()
     j = job_store.get(job_id)
     if not j:
-        raise HTTPException(status_code=404, detail="job not found")
+        raise HTTPException(
+            status_code=404,
+            detail="任务记录不存在，可能因旧版本服务重启而中断",
+        )
     return j
 
 

@@ -10,10 +10,12 @@ const BASE = ''
 type RequestOptions = RequestInit & {
   /** 为 true 时不弹错误 toast（由调用方自行汇总提示，如多图串行队列） */
   quiet?: boolean
+  /** 仅静默指定 HTTP 状态，适合轮询中预期可恢复的 404。 */
+  quietStatuses?: number[]
 }
 
 async function request<T>(path: string, init?: RequestOptions): Promise<T> {
-  const { quiet, ...fetchInit } = init ?? {}
+  const { quiet, quietStatuses, ...fetchInit } = init ?? {}
   const isFormData = fetchInit.body instanceof FormData
   const headers: Record<string, string> = {}
   if (!isFormData) headers['Content-Type'] = 'application/json'
@@ -36,7 +38,7 @@ async function request<T>(path: string, init?: RequestOptions): Promise<T> {
     } catch { /* ignore */ }
     const msg = detail || `${res.status} ${res.statusText}`
     // 401 (未登录/会话过期) 不弹 toast — 由全局认证拦截器统一跳登录页, 避免刷屏
-    if (res.status !== 401 && !quiet) toast(msg, 'error')
+    if (res.status !== 401 && !quiet && !quietStatuses?.includes(res.status)) toast(msg, 'error')
     throw new Error(msg)
   }
   return res.json() as Promise<T>
@@ -2654,7 +2656,9 @@ export const api = {
       method: 'POST',
       body: JSON.stringify({ dataset, start_date: startDate, end_date: endDate }),
     }),
-  pipelineJob: (id: string) => request<PipelineJob>(`/api/pipeline/jobs/${id}`),
+  pipelineJob: (id: string) => request<PipelineJob>(`/api/pipeline/jobs/${id}`, {
+    quietStatuses: [404],
+  }),
   pipelineJobs: (limit = 20) =>
     request<{ active_id: string | null; jobs: PipelineJobSummary[] }>(
       `/api/pipeline/jobs?limit=${limit}`,
