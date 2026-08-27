@@ -496,13 +496,15 @@ def load_states(store: EventReplayStore) -> tuple[list[EventScoreState], list[di
         ).fetchone()[0]
         documents = store.connection.execute(
             """
-            SELECT e.announcement_id, e.published_at, e.title, d.sha256, 'EVENT' AS kind
+            SELECT e.announcement_id, e.published_at, e.title, d.sha256,
+                   'EVENT' AS kind, 1 AS kind_priority
             FROM event_candidates e
             JOIN document_metrics d ON d.announcement_id=e.announcement_id
             WHERE e.symbol=? AND e.decision_date=?
               AND e.polarity IN ('LONG_CANDIDATE', 'MIXED_REVIEW')
             UNION ALL
-            SELECT m.announcement_id, a.announce_time, a.title, d.sha256, m.selection_kind
+            SELECT m.announcement_id, a.announce_time, a.title, d.sha256,
+                   m.selection_kind, 2 AS kind_priority
             FROM serenity_event_support_documents m
             JOIN announcements a USING (announcement_id)
             JOIN document_metrics d USING (announcement_id)
@@ -510,12 +512,12 @@ def load_states(store: EventReplayStore) -> tuple[list[EventScoreState], list[di
               AND CAST(a.announce_time AS DATE)<=m.decision_date
             UNION ALL
             SELECT m.announcement_id, m.announce_time, m.title, d.sha256,
-                   'THESIS_ANNUAL_REPORT' AS kind
+                   'THESIS_ANNUAL_REPORT' AS kind, 0 AS kind_priority
             FROM serenity_thesis_support_documents m
             JOIN document_metrics d USING (announcement_id)
             WHERE m.optimization_id=? AND m.event_id=? AND m.status='READY'
               AND CAST(m.announce_time AS DATE)<=m.decision_date
-            ORDER BY 2, 1
+            ORDER BY 2, 1, 6
             """,
             [
                 symbol,
@@ -530,7 +532,7 @@ def load_states(store: EventReplayStore) -> tuple[list[EventScoreState], list[di
         document_map: dict[str, str] = {}
         seen: set[str] = set()
         thesis_ready = False
-        for index, (document_id, published_at, title, sha256, kind) in enumerate(
+        for index, (document_id, published_at, title, sha256, kind, _priority) in enumerate(
             documents, start=1
         ):
             document_id = str(document_id)
@@ -720,7 +722,37 @@ def run_scores(store: EventReplayStore, *, execute: bool) -> dict[str, Any]:
         ],
     }
     amendment_path = paths["run_root"] / "thesis-evidence-paid-population-amendment.json"
-    _freeze_json(amendment_path, amendment, "thesis evidence paid population amendment")
+    if amendment_path.is_file():
+        existing = json.loads(amendment_path.read_text(encoding="utf-8"))
+        if existing != amendment:
+            paid_calls = store.connection.execute(
+                """
+                SELECT count(*) FROM semantic_model_calls
+                WHERE replay_id=? AND stage=? AND slot_id LIKE 'SLOT-THESIS-%'
+                """,
+                [OPTIMIZATION_ID, EVENT_ENRICHED_SCORE_STAGE],
+            ).fetchone()[0]
+            if paid_calls:
+                raise RuntimeError("thesis paid population cannot change after a model call")
+            correction = {
+                **amendment,
+                "supersedes_sha256": _file_hash(amendment_path),
+                "correction_reason": (
+                    "preflight exposed unstable duplicate-document ordering; no paid call occurred"
+                ),
+            }
+            correction_path = (
+                paths["run_root"]
+                / "thesis-evidence-paid-population-amendment-correction-01.json"
+            )
+            _freeze_json(
+                correction_path,
+                correction,
+                "corrected thesis evidence paid population amendment",
+            )
+            amendment_path = correction_path
+    else:
+        _freeze_json(amendment_path, amendment, "thesis evidence paid population amendment")
     plan = {
         "substage": THESIS_SUBSTAGE,
         "states": len(states),
