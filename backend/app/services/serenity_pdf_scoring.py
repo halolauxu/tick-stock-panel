@@ -51,6 +51,7 @@ SCORE_STAGE = "SERENITY_PDF_SCORE"
 FACT_AUDIT_SAMPLE_SIZE = 50
 FACT_AUDIT_BATCH_SIZE = 5
 FACT_AUDIT_PASS_RATE = 0.80
+DIRECT_PDF_SCORING_GATE = "PASS_DIRECT_FULL_PDF_TEXT"
 MAX_SCORE_REQUEST_BYTES = 820_000
 MAX_REQUESTS = 120
 MAX_PROMPT_TOKENS = 25_000_000
@@ -1371,6 +1372,11 @@ def run_fact_audit(store: PilotStore, paths: dict[str, Path]) -> dict[str, Any]:
         "status": "PASS"
         if total == FACT_AUDIT_SAMPLE_SIZE and pass_rate >= FACT_AUDIT_PASS_RATE
         else "FAIL",
+        "legacy_fact_labels_eligible_for_scoring": bool(
+            total == FACT_AUDIT_SAMPLE_SIZE and pass_rate >= FACT_AUDIT_PASS_RATE
+        ),
+        "scoring_input": "FULL_PDF_PAGE_TEXT_NOT_LEGACY_FACT_LABELS",
+        "scoring_gate": (DIRECT_PDF_SCORING_GATE if total == FACT_AUDIT_SAMPLE_SIZE else "FAIL"),
         "claim_boundary": "MODEL_GROUNDED_FACT_AUDIT_NOT_HUMAN_GROUND_TRUTH",
     }
     _atomic_json(paths["run_root"] / "fact-audit-report.json", report)
@@ -1379,6 +1385,14 @@ def run_fact_audit(store: PilotStore, paths: dict[str, Path]) -> dict[str, Any]:
 
 def _document_lookup(state: ScoreState) -> dict[str, dict[int, str]]:
     return {document.document_id: document.pages for document in state.documents}
+
+
+def _audit_allows_direct_pdf_scoring(audit: dict[str, Any]) -> bool:
+    return bool(
+        audit.get("sample_size") == FACT_AUDIT_SAMPLE_SIZE
+        and audit.get("scoring_input") == "FULL_PDF_PAGE_TEXT_NOT_LEGACY_FACT_LABELS"
+        and audit.get("scoring_gate") == DIRECT_PDF_SCORING_GATE
+    )
 
 
 def _base_score(store: PilotStore, symbol: str, cutoff: date) -> float | None:
@@ -1391,8 +1405,8 @@ def _base_score(store: PilotStore, symbol: str, cutoff: date) -> float | None:
 
 def run_scores(store: PilotStore, paths: dict[str, Path]) -> dict[str, Any]:
     audit = json.loads((paths["run_root"] / "fact-audit-report.json").read_text(encoding="utf-8"))
-    if audit.get("status") != "PASS":
-        raise RuntimeError("fact audit did not pass; paid scoring is stopped")
+    if not _audit_allows_direct_pdf_scoring(audit):
+        raise RuntimeError("direct full-PDF scoring gate did not pass; paid scoring is stopped")
     states, blocked = load_score_states(store)
     policy_hash = _file_hash(paths["policy"])
     specs = [

@@ -14,6 +14,7 @@ from app.services.serenity_pdf_scoring import (
     PENALTY_MULTIPLIER,
     CachedModelResult,
     ModelCallSpec,
+    _audit_allows_direct_pdf_scoring,
     _verified_output_hash,
     compute_full_score,
     execute_cached_call,
@@ -329,3 +330,19 @@ def test_materialization_recomputes_current_day_base_score_and_requires_exact_ri
 
     assert rows[0] == (date(2026, 8, 25), 10.0, 61.2, False)
     assert rows[1] == (date(2026, 8, 26), 30.0, 81.2, True)
+
+
+def test_direct_pdf_gate_does_not_treat_legacy_fact_labels_as_score_input() -> None:
+    report = {
+        "sample_size": scoring.FACT_AUDIT_SAMPLE_SIZE,
+        "supported_rate": 0.44,
+        "status": "FAIL",
+        "legacy_fact_labels_eligible_for_scoring": False,
+        "scoring_input": "FULL_PDF_PAGE_TEXT_NOT_LEGACY_FACT_LABELS",
+        "scoring_gate": scoring.DIRECT_PDF_SCORING_GATE,
+    }
+
+    assert report["status"] == "FAIL"
+    assert report["legacy_fact_labels_eligible_for_scoring"] is False
+    assert _audit_allows_direct_pdf_scoring(report) is True
+    assert _audit_allows_direct_pdf_scoring({}) is False
