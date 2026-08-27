@@ -506,6 +506,42 @@ def sanitize_score_evidence(
     ):
         for item in sanitized.get(collection, []):
             if item.get("status") == "UNKNOWN":
+                evidence = item.get("evidence") or []
+                if item.get("rating") is not None or evidence:
+                    if evidence:
+                        for citation_index, citation in enumerate(evidence):
+                            adjustments.append(
+                                {
+                                    "item_type": item_type,
+                                    "item_id": str(item.get(id_key) or ""),
+                                    "citation_index": citation_index,
+                                    "action": "CLEARED_UNKNOWN_PAYLOAD",
+                                    "original_quote": str(citation.get("quote") or ""),
+                                    "canonical_quote": None,
+                                }
+                            )
+                    else:
+                        adjustments.append(
+                            {
+                                "item_type": item_type,
+                                "item_id": str(item.get(id_key) or ""),
+                                "citation_index": -1,
+                                "action": "CLEARED_UNKNOWN_PAYLOAD",
+                                "original_quote": "",
+                                "canonical_quote": None,
+                            }
+                        )
+                    original_reason = str(item.get("reason") or "")
+                    item.update(
+                        {
+                            "rating": None,
+                            "reason": (
+                                "模型已判定UNKNOWN，已清除不一致评分和证据；原理由："
+                                + original_reason[:180]
+                            ),
+                            "evidence": [],
+                        }
+                    )
                 continue
             invalid = False
             for citation_index, citation in enumerate(item.get("evidence") or []):
