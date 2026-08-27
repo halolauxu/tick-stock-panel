@@ -581,6 +581,41 @@ def sanitize_score_evidence(
                         "evidence": [],
                     }
                 )
+                continue
+            directions = {
+                citation.get("direction")
+                for citation in item.get("evidence") or []
+                if isinstance(citation, dict)
+            }
+            rating = item.get("rating")
+            direction_mismatch = bool(
+                (isinstance(rating, int) and rating > 0 and "SUPPORT" not in directions)
+                or (rating == 0 and "COUNTER" not in directions)
+                or (item.get("status") == "CONTRADICTED" and "COUNTER" not in directions)
+            )
+            if direction_mismatch:
+                adjustments.append(
+                    {
+                        "item_type": item_type,
+                        "item_id": str(item.get(id_key) or ""),
+                        "citation_index": -1,
+                        "action": "DOWNGRADED_DIRECTION_MISMATCH",
+                        "original_quote": "",
+                        "canonical_quote": None,
+                    }
+                )
+                original_reason = str(item.get("reason") or "")
+                item.update(
+                    {
+                        "status": "UNKNOWN",
+                        "rating": None,
+                        "reason": (
+                            "模型分值方向与引用方向矛盾，已按UNKNOWN处理；原理由："
+                            + original_reason[:180]
+                        ),
+                        "evidence": [],
+                    }
+                )
     return sanitized, adjustments
 
 

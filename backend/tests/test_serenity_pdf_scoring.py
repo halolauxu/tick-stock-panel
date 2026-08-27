@@ -361,6 +361,7 @@ def test_score_evidence_is_canonicalized_or_downgraded_without_mutating_raw() ->
             "reason": "信息不足但错误保留了评分",
         }
     )
+    raw["dimensions"][3]["evidence"][0]["direction"] = "COUNTER"
     raw["penalties"][0] = {
         "penalty_id": "dilution_financing",
         "status": "EVIDENCED",
@@ -389,12 +390,16 @@ def test_score_evidence_is_canonicalized_or_downgraded_without_mutating_raw() ->
     assert sanitized["dimensions"][2]["status"] == "UNKNOWN"
     assert sanitized["dimensions"][2]["rating"] is None
     assert sanitized["dimensions"][2]["evidence"] == []
+    assert sanitized["dimensions"][3]["status"] == "UNKNOWN"
+    assert sanitized["dimensions"][3]["rating"] is None
+    assert sanitized["dimensions"][3]["evidence"] == []
     assert sanitized["penalties"][0]["evidence"][0]["quote"] == (
         "唯一供应商，扩产建设周期为\n24个月。"
     )
     assert {row["action"] for row in adjustments} == {
         "CANONICALIZED_WHITESPACE",
         "CLEARED_UNKNOWN_PAYLOAD",
+        "DOWNGRADED_DIRECTION_MISMATCH",
         "DOWNGRADED_TO_UNKNOWN",
     }
     assert validate_score_output(sanitized, entity_id="ENTITY-1", documents=documents) == []
