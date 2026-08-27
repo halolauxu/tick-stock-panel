@@ -425,8 +425,7 @@ def load_event_score_states(
     blocked: list[dict[str, Any]] = []
     for event_id, symbol, decision_day, event_type, subtype, fact_count in anchors:
         event_only_eligible = bool(
-            event_type == "ORDER_CONTRACT"
-            or (event_type == "CAPACITY_MILESTONE" and subtype != "FINANCING_ADMIN")
+            (event_type == "CAPACITY_MILESTONE" and subtype != "FINANCING_ADMIN")
             or int(fact_count) > 0
         )
         if stage == EVENT_SCORE_STAGE and not event_only_eligible:
@@ -435,7 +434,7 @@ def load_event_score_states(
                     "event_id": str(event_id),
                     "status": "DEFERRED_ZERO_COST_LOW_INFORMATION",
                     "selection_rule": (
-                        "order events OR non-financing-admin events OR regex fact_count>0"
+                        "non-financing-admin capacity events OR regex fact_count>0"
                     ),
                 }
             )
@@ -907,8 +906,7 @@ def run_event_scores(
             "optimization_id": OPTIMIZATION_ID,
             "stage": stage,
             "selection_rule": (
-                "ORDER_CONTRACT OR (CAPACITY_MILESTONE AND subtype!=FINANCING_ADMIN) "
-                "OR fact_count>0"
+                "(CAPACITY_MILESTONE AND subtype!=FINANCING_ADMIN) OR fact_count>0"
             ),
             "selection_uses_outcomes": False,
             "pending_slots": [
