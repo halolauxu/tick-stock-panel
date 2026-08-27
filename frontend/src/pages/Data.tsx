@@ -210,7 +210,7 @@ export function Data() {
 
   const minuteAuto = prefs.data?.minute_sync_enabled ?? false
   const supplementalAuto = prefs.data?.tushare_supplemental_sync_enabled ?? false
-  const pipelineSched = prefs.data?.pipeline_schedule ?? { hour: 17, minute: 0 }
+  const pipelineSched = prefs.data?.pipeline_schedule ?? { hour: 21, minute: 0 }
   const instrumentsSched = prefs.data?.instruments_schedule ?? { hour: 9, minute: 10 }
   const indexDailyBatchSize = prefs.data?.index_daily_batch_size ?? 100
 

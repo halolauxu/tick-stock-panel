@@ -68,7 +68,7 @@ def test_run_slot_is_exclusive():
 
 def test_pipeline_schedule_defaults_after_source_publication_window(monkeypatch):
     monkeypatch.setattr(preferences, "load", lambda: {})
-    assert preferences.get_pipeline_schedule() == {"hour": 17, "minute": 0}
+    assert preferences.get_pipeline_schedule() == {"hour": 21, "minute": 0}
 
 
 # ── 监控 sector fail-closed ──────────────────────────────────────────────

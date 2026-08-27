@@ -5,7 +5,7 @@
   09:25 模拟交易盘前校验
   09:30 模拟交易开盘撮合, 09:31 终态截止
   15:05 模拟交易收盘结算
-  17:00 盘后 — 日K同步 + 增量除权因子 + enriched 计算 + 刷新视图
+  21:00 盘后 — 日K同步 + 增量除权因子 + enriched 计算 + 刷新视图
   数据管道成功后 — 生成并冻结下一交易日信号和订单计划
 
 盘后同步策略:
@@ -1275,7 +1275,7 @@ def start_scheduler(repo: KlineRepository, capset: CapabilitySet) -> AsyncIOSche
     工作日 09:10 — 同步个股维表
     工作日 09:25/09:30/09:31 — 盘前校验、开盘执行与终态截止
     工作日 15:05 — 账户结算与对账
-    工作日 HH:MM — 盘后管道（时间由用户偏好决定，默认 17:00）
+    工作日 HH:MM — 盘后管道（时间由用户偏好决定，默认 21:00）
     """
     from app.services import preferences
     sched = preferences.get_pipeline_schedule()
