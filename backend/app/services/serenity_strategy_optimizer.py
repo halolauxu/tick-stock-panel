@@ -70,6 +70,7 @@ MAX_PROMPT_TOKENS = 8_000_000
 MAX_COMPLETION_TOKENS = 700_000
 MAX_TOTAL_TOKENS = 8_700_000
 MAX_REQUEST_BYTES = 820_000
+MAX_EVENT_ONLY_CONTEXTS = 50
 FROZEN_START = date(2025, 8, 26)
 FROZEN_END = date(2026, 8, 27)
 FROZEN_UNIVERSE_SIZE = 100
@@ -423,11 +424,45 @@ def load_event_score_states(
     ).fetchall()
     states: list[EventScoreState] = []
     blocked: list[dict[str, Any]] = []
+    eligible_anchors = [
+        row
+        for row in anchors
+        if bool(
+            (row[3] == "CAPACITY_MILESTONE" and row[4] != "FINANCING_ADMIN")
+            or int(row[5]) > 0
+        )
+    ]
+    event_type_priority = {
+        "CAPACITY_MILESTONE": 0,
+        "ORDER_CONTRACT": 1,
+        "POSITIVE_EARNINGS_REVISION": 2,
+        "PRICE_OR_SUPPLY": 3,
+    }
+    eligible_anchors.sort(
+        key=lambda row: (
+            4 if row[4] == "FINANCING_ADMIN" else event_type_priority.get(row[3], 5),
+            -int(row[5]),
+            row[2],
+            str(row[0]),
+        )
+    )
+    selected_ids = {
+        str(row[0]) for row in eligible_anchors[:MAX_EVENT_ONLY_CONTEXTS]
+    }
     for event_id, symbol, decision_day, event_type, subtype, fact_count in anchors:
         event_only_eligible = bool(
             (event_type == "CAPACITY_MILESTONE" and subtype != "FINANCING_ADMIN")
             or int(fact_count) > 0
         )
+        if stage == EVENT_SCORE_STAGE and event_only_eligible and str(event_id) not in selected_ids:
+            blocked.append(
+                {
+                    "event_id": str(event_id),
+                    "status": "DEFERRED_STAGE_CNY15_CAP",
+                    "selection_rule": "50 highest-information PIT contexts; outcomes were not used",
+                }
+            )
+            continue
         if stage == EVENT_SCORE_STAGE and not event_only_eligible:
             blocked.append(
                 {
@@ -906,7 +941,9 @@ def run_event_scores(
             "optimization_id": OPTIMIZATION_ID,
             "stage": stage,
             "selection_rule": (
-                "(CAPACITY_MILESTONE AND subtype!=FINANCING_ADMIN) OR fact_count>0"
+                "50 highest-information PIT contexts from non-admin capacity or fact_count>0; "
+                "priority=non-admin capacity, order, earnings, price/supply, financing-admin; "
+                "outcomes excluded"
             ),
             "selection_uses_outcomes": False,
             "pending_slots": [
