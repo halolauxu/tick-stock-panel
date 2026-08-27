@@ -70,6 +70,7 @@ OPTIMIZATION_ID = "serenity-event-1y-opt-v1"
 OPTIMIZATION_VERSION = "1.0.0"
 EVENT_SCORE_STAGE = "SERENITY_EVENT_SCORE"
 EVENT_ENRICHED_SCORE_STAGE = "SERENITY_EVENT_ENRICHED_SCORE"
+POLICY_RED_TEAM_SUBSTAGE = "POLICY_RED_TEAM"
 STAGE_COST_CAP_MICROS_CNY = {
     EVENT_SCORE_STAGE: 15_000_000,
     EVENT_ENRICHED_SCORE_STAGE: 25_000_000,
@@ -267,6 +268,16 @@ def initialize_optimization_tables(store: EventReplayStore) -> None:
             status VARCHAR NOT NULL,
             evaluated_at TIMESTAMP NOT NULL,
             PRIMARY KEY (optimization_id, round_id, policy_id, fold_id, horizon)
+        );
+        CREATE TABLE IF NOT EXISTS serenity_policy_red_team_reviews (
+            optimization_id VARCHAR NOT NULL,
+            policy_id VARCHAR NOT NULL,
+            reviewer_id VARCHAR NOT NULL,
+            verdict VARCHAR NOT NULL,
+            raw_output_json VARCHAR NOT NULL,
+            model_input_sha256 VARCHAR NOT NULL,
+            reviewed_at TIMESTAMP NOT NULL,
+            PRIMARY KEY (optimization_id, policy_id, reviewer_id)
         );
         """
     )
@@ -782,6 +793,53 @@ def _event_score_schema() -> dict[str, Any]:
         },
     }
     return schema
+
+
+def _red_team_schema() -> dict[str, Any]:
+    return {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object",
+        "additionalProperties": False,
+        "required": [
+            "reviewer_id",
+            "verdict",
+            "fatal_flaws",
+            "overfit_mechanisms",
+            "required_freeze_changes",
+            "forbidden_posthoc_changes",
+            "minimum_prospective_events",
+            "reason",
+        ],
+        "properties": {
+            "reviewer_id": {"type": "string", "minLength": 3, "maxLength": 80},
+            "verdict": {"enum": ["REJECT", "SHADOW_ONLY", "PROSPECTIVE_SHADOW"]},
+            "fatal_flaws": {
+                "type": "array",
+                "maxItems": 8,
+                "items": {"type": "string", "minLength": 2, "maxLength": 240},
+            },
+            "overfit_mechanisms": {
+                "type": "array",
+                "minItems": 1,
+                "maxItems": 8,
+                "items": {"type": "string", "minLength": 2, "maxLength": 240},
+            },
+            "required_freeze_changes": {
+                "type": "array",
+                "minItems": 1,
+                "maxItems": 8,
+                "items": {"type": "string", "minLength": 2, "maxLength": 240},
+            },
+            "forbidden_posthoc_changes": {
+                "type": "array",
+                "minItems": 1,
+                "maxItems": 8,
+                "items": {"type": "string", "minLength": 2, "maxLength": 240},
+            },
+            "minimum_prospective_events": {"type": "integer", "minimum": 5, "maximum": 100},
+            "reason": {"type": "string", "minLength": 10, "maxLength": 800},
+        },
+    }
 
 
 def _mask_identity(text: str, *, symbol: str, code: str, name: str) -> str:
@@ -2078,6 +2136,283 @@ def evaluate_exploratory_policies(store: EventReplayStore) -> dict[str, Any]:
     return report
 
 
+def _red_team_prompt(
+    reviewer_id: str,
+    role: str,
+    evidence: dict[str, Any],
+) -> str:
+    policy = {
+        "task": "审查一个已标记为后验探索的A股事件策略,不得把漂亮回测当成Alpha证明",
+        "reviewer_id": reviewer_id,
+        "role": role,
+        "candidate_rule": {
+            "event_gate": (
+                "官方公告PDF语义门槛PASS,新增信息,经济传导PASS,排除日常管理"
+            ),
+            "prior_trend": "事件日前20日相对沪深300动量不为负",
+            "entry": (
+                "下一交易日开盘; gap>2%为确认分支, gap<=0为回落承接分支, "
+                "0<gap<=2%跳过"
+            ),
+            "exit": "入场后的第2个交易日收盘",
+            "cost": "往返20bp已计入净收益",
+        },
+        "rules": [
+            "只能依据给定统计,不得使用外部公司知识或补造样本",
+            "必须明确多重试验、后验阈值、样本相关性、幸存者偏差和执行偏差",
+            "不得建议继续调整已看过区间的2%阈值或持有期来美化结果",
+            "可以允许前瞻影子验证,但不得授权实盘或宣称Alpha",
+            "若建议冻结修改,必须是可在未来事件到来前固定的因果或风控条件",
+            "只输出Schema规定的JSON对象",
+        ],
+        "evidence": evidence,
+    }
+    return json.dumps(policy, ensure_ascii=False, sort_keys=True)
+
+
+def run_policy_red_team(
+    store: EventReplayStore,
+    paths: dict[str, Path],
+    *,
+    execute: bool,
+    runner: Callable[[ModelCallSpec], CachedModelResult] | None = None,
+) -> dict[str, Any]:
+    """Blindly challenge the sole Round-3 survivor under the shared CNY 60 budget."""
+    initialize_optimization_tables(store)
+    report_path = _optimization_root(store) / "round03-exploratory-report.json"
+    if not report_path.is_file():
+        raise RuntimeError("round-three exploratory report is missing")
+    report = json.loads(report_path.read_text(encoding="utf-8"))
+    survivors = report.get("survivors") or []
+    if len(survivors) != 1 or survivors[0].get("policy_id") != "P4_DUAL_ENTRY":
+        raise RuntimeError("red team requires exactly the frozen P4 survivor")
+    fold_rows = store.connection.execute(
+        """
+        SELECT fold_id, observation_count, mean_net_return, alpha_csi300,
+               alpha_chain, win_rate
+        FROM serenity_exploratory_trials
+        WHERE optimization_id=? AND round_id=? AND policy_id='P4_DUAL_ENTRY'
+          AND horizon=2 ORDER BY fold_id
+        """,
+        [OPTIMIZATION_ID, "ROUND03_POSTHOC_EXECUTION_DIAGNOSTIC"],
+    ).fetchall()
+    branch_rows = store.connection.execute(
+        """
+        SELECT policy_id, observation_count, mean_net_return, alpha_csi300,
+               alpha_chain, win_rate
+        FROM serenity_exploratory_trials
+        WHERE optimization_id=? AND round_id=?
+          AND policy_id IN ('P2_GAP_CONFIRM', 'P3_PULLBACK_ABSORB')
+          AND fold_id='ALL' AND horizon=2 ORDER BY policy_id
+        """,
+        [OPTIMIZATION_ID, "ROUND03_POSTHOC_EXECUTION_DIAGNOSTIC"],
+    ).fetchall()
+    horizon_rows = store.connection.execute(
+        """
+        SELECT horizon, observation_count, mean_net_return, alpha_csi300,
+               alpha_chain, win_rate
+        FROM serenity_exploratory_trials
+        WHERE optimization_id=? AND round_id=? AND policy_id='P4_DUAL_ENTRY'
+          AND fold_id='ALL' ORDER BY horizon
+        """,
+        [OPTIMIZATION_ID, "ROUND03_POSTHOC_EXECUTION_DIAGNOSTIC"],
+    ).fetchall()
+    diagnostics = report["selected_policy_diagnostics"]
+    evidence = {
+        "one_year_only": True,
+        "universe": "100 companies across three frozen chains",
+        "candidate_events": 125,
+        "round1_semantic_scored": 50,
+        "round1_trade_gate_pass": 22,
+        "round2_pdf_enriched": 21,
+        "complete_64_and_gate_pass": 1,
+        "candidate": survivors[0],
+        "folds": fold_rows,
+        "branches": branch_rows,
+        "candidate_horizons": horizon_rows,
+        "bootstrap_mean_95pct": diagnostics["bootstrap_mean_95pct"],
+        "raw_sign_test_one_sided_p": diagnostics["raw_sign_test_one_sided_p"],
+        "overlap_count": diagnostics["overlap_count"],
+        "sequential_compound_return": diagnostics["sequential_compound_return"],
+        "event_to_event_max_drawdown": diagnostics["event_to_event_max_drawdown"],
+        "known_invalidity": (
+            "candidate family and threshold were selected after inspecting the same outcomes"
+        ),
+    }
+    reviewers = (
+        (
+            "CAUSAL_OVERFIT_AUDITOR",
+            "专查多重试验、后验阈值、样本独立性、置信区间与不可识别因果",
+        ),
+        (
+            "EXECUTION_REALISM_AUDITOR",
+            "专查次日开盘可交易性、涨跌停/停牌、冲击成本、持仓容量和复现路径",
+        ),
+        (
+            "CHOKEPOINT_THESIS_AUDITOR",
+            "专查事件门槛与卡脖子64分是否错配,以及短期收益是否只是动量而非卡点",
+        ),
+    )
+    schema_path = paths["run_root"] / "policy-red-team.schema.json"
+    _freeze_json(schema_path, _red_team_schema(), "policy red-team schema")
+    policy_hash = _file_hash(paths["policy"])
+    trade_date = store.connection.execute(
+        "SELECT min(decision_date) FROM event_discovery_outcomes WHERE status='SETTLED'"
+    ).fetchone()[0]
+    completed = {
+        row[0]
+        for row in store.connection.execute(
+            """
+            SELECT reviewer_id FROM serenity_policy_red_team_reviews
+            WHERE optimization_id=? AND policy_id='P4_DUAL_ENTRY'
+            """,
+            [OPTIMIZATION_ID],
+        ).fetchall()
+    }
+    specs = [
+        ModelCallSpec(
+            OPTIMIZATION_ID,
+            EVENT_ENRICHED_SCORE_STAGE,
+            "SLOT-REDTEAM-" + reviewer_id,
+            trade_date,
+            _red_team_prompt(reviewer_id, role, evidence),
+            schema_path,
+            policy_hash,
+        )
+        for reviewer_id, role in reviewers
+        if reviewer_id not in completed
+    ]
+    pending_reviewers = [item for item in reviewers if item[0] not in completed]
+    preflight = (
+        _preflight_stage(
+            paths,
+            stage=EVENT_ENRICHED_SCORE_STAGE,
+            trade_date=trade_date,
+            prompts=[spec.prompt for spec in specs],
+        )
+        if specs
+        else {"status": "NO_PENDING_CALLS"}
+    )
+    worst_case_cost = int(
+        (preflight.get("preflight") or {})
+        .get("worst_case_increment", {})
+        .get("charged_cost_micros_cny", 0)
+    )
+    current_enriched_cost = int(
+        store.connection.execute(
+            """
+            SELECT coalesce(sum(cost_micros_cny),0) FROM semantic_model_calls
+            WHERE replay_id=? AND stage=?
+            """,
+            [OPTIMIZATION_ID, EVENT_ENRICHED_SCORE_STAGE],
+        ).fetchone()[0]
+    )
+    if worst_case_cost > 10_000_000:
+        raise RuntimeError("red-team worst-case cost exceeds the frozen CNY 10 allocation")
+    if current_enriched_cost + worst_case_cost > STAGE_COST_CAP_MICROS_CNY[
+        EVENT_ENRICHED_SCORE_STAGE
+    ]:
+        raise RuntimeError("enriched score plus red team exceeds the frozen CNY 25 stage cap")
+    amendment = _with_content_hash(
+        {
+            "optimization_id": OPTIMIZATION_ID,
+            "substage": POLICY_RED_TEAM_SUBSTAGE,
+            "parent_stage": EVENT_ENRICHED_SCORE_STAGE,
+            "base_population_sha256": _file_hash(
+                paths["run_root"]
+                / f"{EVENT_ENRICHED_SCORE_STAGE.lower()}-paid-population.json"
+            ),
+            "reason": "frozen protocol permits blind red team only after one policy survives",
+            "outcomes_visible_to_red_team": True,
+            "slots": [
+                {
+                    "reviewer_id": reviewer_id,
+                    "slot_id": spec.slot_id,
+                    "input_sha256": spec.input_sha256,
+                }
+                for (reviewer_id, _role), spec in zip(
+                    pending_reviewers, specs, strict=True
+                )
+            ],
+        }
+    )
+    amendment_path = paths["run_root"] / "policy-red-team-paid-population-amendment.json"
+    _freeze_json(amendment_path, amendment, "policy red-team paid population amendment")
+    plan = {
+        "substage": POLICY_RED_TEAM_SUBSTAGE,
+        "completed": len(completed),
+        "pending": len(specs),
+        "preflight": preflight,
+        "current_enriched_cost_micros_cny": current_enriched_cost,
+        "execute": execute,
+        "amendment_path": str(amendment_path),
+    }
+    if not execute or not specs:
+        return plan
+    paid_runner = runner or _adapter_runner(paths)
+    for (reviewer_id, _role), spec in zip(pending_reviewers, specs, strict=True):
+        result = execute_cached_call(store.connection, spec, paid_runner)
+        output = json.loads(result.raw_output)
+        if output.get("reviewer_id") != reviewer_id:
+            raise RuntimeError(f"red-team reviewer identity mismatch: {reviewer_id}")
+        store.connection.execute(
+            """
+            INSERT OR REPLACE INTO serenity_policy_red_team_reviews VALUES
+            (?, 'P4_DUAL_ENTRY', ?, ?, ?, ?, ?)
+            """,
+            [
+                OPTIMIZATION_ID,
+                reviewer_id,
+                output["verdict"],
+                result.raw_output,
+                spec.input_sha256,
+                datetime.now(),
+            ],
+        )
+        print(
+            json.dumps(
+                {
+                    "event": "serenity_policy_red_team_progress",
+                    "reviewer_id": reviewer_id,
+                    "verdict": output["verdict"],
+                },
+                ensure_ascii=False,
+            ),
+            flush=True,
+        )
+    verdicts = [
+        row[0]
+        for row in store.connection.execute(
+            """
+            SELECT verdict FROM serenity_policy_red_team_reviews
+            WHERE optimization_id=? AND policy_id='P4_DUAL_ENTRY'
+            ORDER BY reviewer_id
+            """,
+            [OPTIMIZATION_ID],
+        ).fetchall()
+    ]
+    consensus = (
+        "REJECTED"
+        if "REJECT" in verdicts
+        else (
+            "PROSPECTIVE_SHADOW_ALLOWED"
+            if verdicts and all(value == "PROSPECTIVE_SHADOW" for value in verdicts)
+            else "SHADOW_ONLY"
+        )
+    )
+    red_report = {
+        "optimization_id": OPTIMIZATION_ID,
+        "policy_id": "P4_DUAL_ENTRY",
+        "review_count": len(verdicts),
+        "verdicts": verdicts,
+        "consensus": consensus,
+        "capital_authority": "NONE",
+        "generated_at": datetime.now().isoformat(timespec="seconds"),
+    }
+    _atomic_json(paths["run_root"] / "policy-red-team-report.json", red_report)
+    return {**plan, "report": red_report}
+
+
 def status_report(store: EventReplayStore) -> dict[str, Any]:
     initialize_optimization_tables(store)
     root = _optimization_root(store)
@@ -2134,6 +2469,13 @@ def status_report(store: EventReplayStore) -> dict[str, Any]:
             "SELECT count(*) FROM serenity_exploratory_trials WHERE optimization_id=?",
             [OPTIMIZATION_ID],
         ).fetchone()[0],
+        "red_team_reviews": store.connection.execute(
+            """
+            SELECT reviewer_id, verdict FROM serenity_policy_red_team_reviews
+            WHERE optimization_id=? ORDER BY reviewer_id
+            """,
+            [OPTIMIZATION_ID],
+        ).fetchall(),
         "claim_boundary": "UNVERIFIED_ALPHA_NO_CAPITAL_AUTHORITY",
     }
 
@@ -2152,6 +2494,8 @@ def main(argv: list[str] | None = None) -> int:
             "enriched-score",
             "evaluate",
             "explore",
+            "plan-red-team",
+            "red-team",
             "status",
         ),
     )
@@ -2186,6 +2530,13 @@ def main(argv: list[str] | None = None) -> int:
                 payload = evaluate_trials(store)
             elif args.command == "explore":
                 payload = evaluate_exploratory_policies(store)
+            elif args.command in {"plan-red-team", "red-team"}:
+                paths = write_optimization_contract(store)
+                payload = run_policy_red_team(
+                    store,
+                    paths,
+                    execute=args.command == "red-team",
+                )
             else:
                 payload = status_report(store)
         finally:
