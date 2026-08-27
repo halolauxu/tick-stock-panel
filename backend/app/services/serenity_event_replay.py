@@ -630,6 +630,7 @@ def collect_event_documents(
         """
         SELECT e.event_id, e.symbol, a.pdf_url
         FROM event_candidates e JOIN announcements a USING (announcement_id)
+        WHERE e.polarity IN ('LONG_CANDIDATE', 'MIXED_REVIEW')
         ORDER BY e.published_at, e.symbol, e.event_id
         """
     ).fetchall()
@@ -1059,7 +1060,8 @@ def build_event_report(store: EventReplayStore) -> dict[str, Any]:
                        ) AS company_rank
                 FROM event_candidates e
                 JOIN announcements a USING (announcement_id)
-                WHERE a.announced_size_kb IS NOT NULL
+                WHERE e.polarity IN ('LONG_CANDIDATE', 'MIXED_REVIEW')
+                  AND a.announced_size_kb IS NOT NULL
             )
             SELECT announced_size_kb FROM ranked
             WHERE company_rank <= ?
