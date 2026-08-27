@@ -135,6 +135,14 @@ export const storage = {
     result: any
   } | null>('strategy-backtest-last'),
 
+  /** 策略回测参数（按资产类型 + 策略分别保存，避免切换策略后恢复默认） */
+  strategyBacktestConfigs: kv<Record<string, {
+    symbols: string
+    params: Record<string, any>
+    overrides: Record<string, any>
+    strategyConfigSignature: string
+  }>>('strategy-backtest-configs'),
+
   /** 概念分析页面字段配置 */
   conceptAnalysisConfig: kv<Record<string, any>>('concept-analysis-config'),
 

@@ -14,6 +14,7 @@ const SOURCE_CLS: Record<string, string> = {
   builtin: 'bg-accent/10 text-accent border-accent/20',
   custom: 'bg-amber-400/10 text-amber-400 border-amber-400/30',
   ai: 'bg-purple-500/10 text-purple-400 border-purple-500/20',
+  composite: 'bg-teal-500/10 text-teal-400 border-teal-500/30',
   invalid: 'bg-danger/10 text-danger border-danger/20',
 }
 
@@ -21,16 +22,18 @@ const SOURCE_LABEL: Record<string, string> = {
   builtin: '内置',
   custom: '自定义',
   ai: 'AI',
+  composite: '叠加',
   invalid: '失效',
 }
 
-type SourceTab = 'all' | 'builtin' | 'custom' | 'ai'
+type SourceTab = 'all' | 'builtin' | 'custom' | 'ai' | 'composite'
 
 const TABS: { id: SourceTab; label: string }[] = [
   { id: 'all', label: '全部' },
   { id: 'builtin', label: '内置' },
   { id: 'custom', label: '自定义' },
   { id: 'ai', label: 'AI' },
+  { id: 'composite', label: '叠加' },
 ]
 
 function parseMetaId(code: string): string {

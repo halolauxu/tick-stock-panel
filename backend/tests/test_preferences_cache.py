@@ -6,6 +6,7 @@ import os
 
 import pytest
 
+from app.api.settings import StrategyPoolPrefs, get_strategy_pool, update_strategy_pool
 from app.services import preferences
 
 
@@ -121,3 +122,34 @@ def test_mining_schedule_setter_rejects_invalid_weekday(weekday):
 def test_mining_schedule_setter_rejects_invalid_profile():
     with pytest.raises(ValueError, match="profile"):
         preferences.set_mining_schedule(True, 4, "exploratory")
+
+
+def test_strategy_pool_distinguishes_unmigrated_from_empty(_isolated):
+    assert preferences.get_strategy_pool_ids() is None
+
+    assert preferences.set_strategy_pool_ids([]) == []
+    assert preferences.get_strategy_pool_ids() == []
+
+
+def test_strategy_pool_normalizes_ids_and_preserves_order(_isolated):
+    saved = preferences.set_strategy_pool_ids([
+        " composite_a ",
+        "n_day_low_reversal",
+        "composite_a",
+        "",
+        123,
+    ])
+
+    assert saved == ["composite_a", "n_day_low_reversal"]
+    assert preferences.get_strategy_pool_ids() == saved
+
+
+def test_strategy_pool_preferences_api_round_trip(_isolated):
+    assert get_strategy_pool() == {"strategy_ids": None}
+
+    result = update_strategy_pool(
+        StrategyPoolPrefs(strategy_ids=["n_day_low_reversal", "composite_a"])
+    )
+
+    assert result == {"strategy_ids": ["n_day_low_reversal", "composite_a"]}
+    assert get_strategy_pool() == result

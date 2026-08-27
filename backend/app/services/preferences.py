@@ -905,6 +905,38 @@ def get_strategy_monitor_ids() -> list[str]:
     return load().get("strategy_monitor_ids", [])
 
 
+def _normalize_strategy_ids(raw) -> list[str]:
+    """清理策略 ID 列表: 只保留非空字符串, 去重并保持用户排序。"""
+    if not isinstance(raw, list):
+        return []
+    seen: set[str] = set()
+    cleaned: list[str] = []
+    for value in raw:
+        if not isinstance(value, str):
+            continue
+        strategy_id = value.strip()
+        if not strategy_id or strategy_id in seen:
+            continue
+        seen.add(strategy_id)
+        cleaned.append(strategy_id)
+    return cleaned
+
+
+def get_strategy_pool_ids() -> list[str] | None:
+    """返回跨浏览器共享的策略池; None 表示尚未从旧版 localStorage 迁移。"""
+    data = load()
+    if "strategy_pool_ids" not in data:
+        return None
+    return _normalize_strategy_ids(data.get("strategy_pool_ids"))
+
+
+def set_strategy_pool_ids(strategy_ids: list[str]) -> list[str]:
+    """保存跨浏览器共享的策略池, 保留用户排序。"""
+    cleaned = _normalize_strategy_ids(strategy_ids)
+    save({"strategy_pool_ids": cleaned})
+    return cleaned
+
+
 def set_realtime_monitor_config(cfg: dict) -> dict:
     """批量更新实时监控配置。"""
     updates = {}

@@ -53,7 +53,16 @@ export function Screener() {
   const [builderMode, setBuilderMode] = useState<'create' | 'modify'>('create')
   const [showStore, setShowStore] = useState(false)
   const [showComposite, setShowComposite] = useState(false)
-  const { pool, addToPool, removeFromPool, reorderPool, prune } = useStrategyPool()
+  const {
+    pool,
+    hydrated: poolHydrated,
+    needsMigration: poolNeedsMigration,
+    initializePool,
+    addToPool,
+    removeFromPool,
+    reorderPool,
+    prune,
+  } = useStrategyPool()
   const [cardSize, setCardSize] = useState<CardSize>(loadCardSize)
   // 日k蜡烛图显示开关（仅当 candle 列可见时才有意义；持久化）
   const [dailyKChartVisible, setDailyKChartVisible] = useState<boolean>(() => storage.screenerCandle.get(true))
@@ -195,17 +204,29 @@ export function Screener() {
   )
   const visiblePool = useMemo(() => pool.filter(id => availableStrategyIds.has(id)), [pool, availableStrategyIds])
 
+  // 首次升级时把旧浏览器策略池迁到服务端，并补入已存在的叠加策略。
+  // 后续以服务端池为权威来源，从而在 Chrome / 应用内浏览器间保持一致。
+  useEffect(() => {
+    if (!poolHydrated || !poolNeedsMigration || !strategies.isSuccess) return
+    const compositeStrategyIds = (strategies.data?.presets ?? [])
+      .filter(strategy => strategy.source === 'composite')
+      .map(strategy => strategy.id)
+    initializePool([...new Set([...pool, ...compositeStrategyIds])])
+  }, [initializePool, pool, poolHydrated, poolNeedsMigration, strategies.data, strategies.isSuccess])
+
   // 策略列表加载后,自动清除池中失效的自定义策略(如本地开发残留的、
   // 当前后端已不存在的策略 ID),避免"策略池"对话框持续显示失效项。
   // 关键: 仅当本次拉取成功且返回非空列表时才 prune。
   // 拉取中/失败/返回空(如引擎 reload 瞬时把某策略跳过)时一律不碰池,
   // 否则会把用户池里仍有效的 ID 永久清空并写入 localStorage,导致卡片全没。
   useEffect(() => {
+    if (!poolHydrated) return
+    if (poolNeedsMigration) return
     if (strategies.isError) return        // 拉取失败: 不 prune
     if (!strategies.isSuccess) return     // 加载中: 不 prune
     if (allStrategyIds.size === 0) return  // 空列表: 不 prune
     prune(allStrategyIds)
-  }, [allStrategyIds, prune, strategies.isError, strategies.isSuccess])
+  }, [allStrategyIds, poolHydrated, poolNeedsMigration, prune, strategies.isError, strategies.isSuccess])
 
   // 策略文件加载失败时提示用户(避免"策略静默消失"被误判为正常)
   const loadErrors = strategies.data?.load_errors ?? []
@@ -446,7 +467,7 @@ export function Screener() {
   useEffect(() => {
     // ETF 模式无股票盘后缓存/ runAll, 单策略走实时单跑, 不触发 runAll
     if (assetType !== 'stock') return
-    if (!asOf || strategyPresets.length === 0 || !summaryQuery.isSuccess || runAll.isPending || visiblePool.length === 0) return
+    if (!poolHydrated || !asOf || strategyPresets.length === 0 || !summaryQuery.isSuccess || runAll.isPending || visiblePool.length === 0) return
     const runKey = `${asOf}|${visiblePool.join(',')}`
     if (runAllDateRef.current === runKey) return
     // 缓存已覆盖当前策略池 → 秒加载, 不触发 runAll
@@ -458,7 +479,7 @@ export function Screener() {
     if (!screenerAutoRun) return
     runAllDateRef.current = runKey
     requestRunAll({ date: asOf, strategyIds: missingStrategyIds })
-  }, [asOf, strategyPresets.length, summaryQuery.isSuccess, visiblePool, cacheCoversPool, missingStrategyIds, screenerAutoRun, assetType, runAll.isPending, requestRunAll])
+  }, [asOf, strategyPresets.length, summaryQuery.isSuccess, visiblePool, cacheCoversPool, missingStrategyIds, screenerAutoRun, assetType, poolHydrated, runAll.isPending, requestRunAll])
 
   const run = useMutation({
     mutationFn: ({ id, date }: { id: string; date: string }) =>

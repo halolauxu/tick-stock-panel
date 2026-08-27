@@ -326,6 +326,9 @@ const strategyBacktestConfigSignature = (detail: StrategyDetail) => JSON.stringi
   max_hold_days: detail.max_hold_days,
 })
 
+const strategyBacktestStorageKey = (assetType: 'stock' | 'etf', strategyId: string) =>
+  `${assetType}:${strategyId}`
+
 const fmtMoney = (v: number | null | undefined) => {
   if (v == null || Number.isNaN(v)) return '—'
   return v.toLocaleString('zh-CN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })
@@ -950,6 +953,7 @@ export function StrategyBacktest() {
   const [settingsTab, setSettingsTab] = useState<AdvancedSettingsTab>('params')
   const [strategyParams, setStrategyParams] = useState<Record<string, any>>(saved?.params ?? {})
   const [overrides, setOverrides] = useState<Record<string, any>>(saved?.overrides ?? {})
+  const [configLoadedKey, setConfigLoadedKey] = useState<string | null>(null)
   // result 不从 localStorage 恢复:它是运行产物(净值/交易),大且易过时,
   // 跨会话/拉新代码后自动渲染一个可能对应已失效策略的旧结果会造成困惑
   // (切页不卸载组件,内存中的 result 仍保留,无需靠 localStorage 恢复)。
@@ -979,6 +983,7 @@ export function StrategyBacktest() {
       setSelectedStrategy(null)
       setStrategyParams({})
       setOverrides({})
+      setConfigLoadedKey(null)
       setResult(null)
     }
   }, [strategies.isLoading, strategyList, selectedStrategy])
@@ -1048,24 +1053,58 @@ export function StrategyBacktest() {
 
   useEffect(() => {
     const detail = strategyDetail.data
-    if (!detail) return
+    if (!detail || detail.id !== selectedStrategy) return
     const configSignature = strategyBacktestConfigSignature(detail)
     const configKey = `${assetType}:${detail.id}:${configSignature}`
     if (loadedStrategyRef.current === configKey) return
     loadedStrategyRef.current = configKey
+    const storedConfig = storage.strategyBacktestConfigs.get({})[
+      strategyBacktestStorageKey(assetType, detail.id)
+    ]
+    if (storedConfig?.strategyConfigSignature === configSignature) {
+      setSymbols(storedConfig.symbols ?? '')
+      setStrategyParams(mergeStrategyParams(detail, storedConfig.params))
+      setOverrides(normalizeStrategyOverrides(detail, storedConfig.overrides))
+      setConfigLoadedKey(configKey)
+      return
+    }
     if (
       saved?.assetType === assetType
       && saved.selectedStrategy === detail.id
       && saved.strategyConfigSignature === configSignature
       && (saved.params || saved.overrides)
     ) {
+      setSymbols(saved.symbols ?? '')
       setStrategyParams(mergeStrategyParams(detail, saved.params))
       setOverrides(normalizeStrategyOverrides(detail, saved.overrides ?? buildDefaultOverrides(detail)))
+      setConfigLoadedKey(configKey)
       return
     }
+    setSymbols('')
     resetConfigFromDetail(detail)
+    setConfigLoadedKey(configKey)
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [assetType, strategyDetail.data])
+  }, [assetType, selectedStrategy, strategyDetail.data])
+
+  // 每个策略独立保存临时参数；切换策略时不再用后一策略的配置覆盖前一策略。
+  useEffect(() => {
+    const detail = strategyDetail.data
+    if (!detail || detail.id !== selectedStrategy) return
+    const configSignature = strategyBacktestConfigSignature(detail)
+    const loadedKey = `${assetType}:${detail.id}:${configSignature}`
+    if (configLoadedKey !== loadedKey) return
+    const storageKey = strategyBacktestStorageKey(assetType, detail.id)
+    const configs = storage.strategyBacktestConfigs.get({})
+    storage.strategyBacktestConfigs.set({
+      ...configs,
+      [storageKey]: {
+        symbols,
+        params: strategyParams,
+        overrides,
+        strategyConfigSignature: configSignature,
+      },
+    })
+  }, [assetType, configLoadedKey, overrides, selectedStrategy, strategyDetail.data, strategyParams, symbols])
 
   // 当全局回测任务完成时, 把结果写入组件 (切页回来也能恢复)
   useEffect(() => {
@@ -1375,6 +1414,22 @@ export function StrategyBacktest() {
         resultRegimeFilter.min_score != null ? `最低 ${resultRegimeFilter.min_score} 分` : null,
       ].filter(Boolean).join(' · ')
     : ''
+  const resultBoardSummary = useMemo(() => {
+    const resultSymbols = result?.config?.symbols
+    if (Array.isArray(resultSymbols) && resultSymbols.length > 0) {
+      return `${assetType === 'etf' ? 'ETF池' : '股票池'} ${resultSymbols.length} 只`
+    }
+    if (assetType === 'etf') return 'ETF范围 全市场'
+    const resultFilter = result?.config?.overrides?.basic_filter as Record<string, any> | undefined
+    if (resultFilter?.enabled === false) return '股票范围 全市场（过滤关）'
+    const boards = Array.isArray(resultFilter?.boards)
+      ? resultFilter.boards.filter((board: unknown): board is string => typeof board === 'string')
+      : []
+    if (boards.length === 0 || BOARD_OPTIONS.every(board => boards.includes(board))) {
+      return '股票范围 全部板块'
+    }
+    return `股票范围 ${boards.join('/')}`
+  }, [assetType, result])
   const selectionStats = result?.stats?.selection as Record<string, number | boolean> | undefined
   const selectionStages = selectionStats
     ? [
@@ -1959,6 +2014,9 @@ export function StrategyBacktest() {
             <div className="flex items-center gap-3">
               <span className="text-sm font-medium text-foreground">{result.strategy_info?.name ?? '策略'}</span>
               <span className="text-[10px] px-1 py-px rounded border border-accent/30 bg-accent/10 text-accent">全量模拟</span>
+              <span className="rounded border border-border bg-elevated px-1.5 py-px text-[10px] text-secondary">
+                {resultBoardSummary}
+              </span>
               {resultRegimeSummary && (
                 <span className="inline-flex items-center gap-1 rounded border border-accent/25 bg-accent/10 px-1.5 py-px text-[10px] text-accent">
                   <Gauge className="h-2.5 w-2.5" />
@@ -2035,6 +2093,9 @@ export function StrategyBacktest() {
                       {SRC_MAP[result.strategy_info.source] ?? ''}
                     </span>
                   )}
+                  <span className="rounded border border-border bg-elevated px-1.5 py-px text-[9px] text-secondary">
+                    {resultBoardSummary}
+                  </span>
                   {resultRegimeSummary && (
                     <span className="inline-flex items-center gap-1 rounded border border-accent/25 bg-accent/10 px-1.5 py-px text-[9px] text-accent">
                       <Gauge className="h-2.5 w-2.5" />

@@ -470,6 +470,10 @@ class MiningSchedulePrefs(BaseModel):
     mining_budget_profile: Literal["balanced", "strict"]
 
 
+class StrategyPoolPrefs(BaseModel):
+    strategy_ids: list[str]
+
+
 @router.get("/preferences")
 def get_preferences() -> dict:
     """返回用户偏好设置。"""
@@ -508,6 +512,7 @@ def get_preferences() -> dict:
         "sse_refresh_pages": preferences.get_sse_refresh_pages(),
         "strategy_monitor_enabled": preferences.get_strategy_monitor_enabled(),
         "strategy_monitor_ids": preferences.get_strategy_monitor_ids(),
+        "strategy_pool_ids": preferences.get_strategy_pool_ids(),
         "system_notify_enabled": preferences.get_system_notify_enabled(),
         "feishu_webhook_url": preferences.get_feishu_webhook_url(),
         "feishu_webhook_secret": preferences.get_feishu_webhook_secret(),
@@ -771,6 +776,20 @@ def get_watchlist_columns() -> dict:
     from app.services import preferences
     cols = preferences.get_watchlist_columns()
     return {"columns": cols}
+
+
+@router.get("/preferences/strategy-pool")
+def get_strategy_pool() -> dict:
+    """返回服务端策略池; null 表示旧用户尚未完成浏览器配置迁移。"""
+    from app.services import preferences
+    return {"strategy_ids": preferences.get_strategy_pool_ids()}
+
+
+@router.put("/preferences/strategy-pool")
+def update_strategy_pool(req: StrategyPoolPrefs) -> dict:
+    """保存策略池, 使策略页选择在不同浏览器间保持一致。"""
+    from app.services import preferences
+    return {"strategy_ids": preferences.set_strategy_pool_ids(req.strategy_ids)}
 
 
 class NavOrderIn(BaseModel):

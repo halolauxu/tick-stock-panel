@@ -1738,6 +1738,7 @@ export interface Preferences {
   sse_refresh_pages: Record<string, boolean>
   strategy_monitor_enabled: boolean
   strategy_monitor_ids: string[]
+  strategy_pool_ids?: string[] | null
   system_notify_enabled: boolean
   feishu_webhook_url?: string
   feishu_webhook_secret?: string
@@ -2127,6 +2128,15 @@ export const api = {
     request<{ columns: any[] }>('/api/settings/preferences/screener-result-columns', {
       method: 'PUT',
       body: JSON.stringify({ columns }),
+    }),
+
+  // 策略池（服务端持久化，跨浏览器共享）
+  strategyPoolPreferences: () =>
+    request<{ strategy_ids: string[] | null }>('/api/settings/preferences/strategy-pool'),
+  updateStrategyPoolPreferences: (strategyIds: string[]) =>
+    request<{ strategy_ids: string[] }>('/api/settings/preferences/strategy-pool', {
+      method: 'PUT',
+      body: JSON.stringify({ strategy_ids: strategyIds }),
     }),
 
   capabilities: () => request<CapabilitiesResponse>('/api/capabilities'),
