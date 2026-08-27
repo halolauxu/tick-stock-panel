@@ -551,6 +551,23 @@ def test_intraday_snapshot_does_not_masquerade_as_completed_open_evidence(tmp_pa
     assert current["fills"] == []
 
 
+def test_cached_after_close_quote_requires_a_fresh_targeted_snapshot(tmp_path):
+    service = _service(tmp_path)
+    account, _ = _account_with_buy_order(service)
+    cached_quote = _quote(at=datetime(2026, 8, 27, 16, 5, tzinfo=CN_TZ))
+    service._quotes_from_cache = lambda: {"000001.SZ": cached_quote}  # type: ignore[method-assign]
+
+    result = service.recover_missed_open(
+        now=datetime(2026, 8, 27, 16, 5, tzinfo=CN_TZ)
+    )
+    current = service.account(account["id"])
+
+    assert result["waiting_evidence"] == 1
+    assert result["recovered"] == 0
+    assert current["orders"][0]["status"] == "UNKNOWN_MARKET_DATA"
+    assert current["fills"] == []
+
+
 def test_unknown_order_is_reconciled_when_opening_evidence_arrives_later(tmp_path):
     service = _service(tmp_path)
     account, _ = _account_with_buy_order(service)

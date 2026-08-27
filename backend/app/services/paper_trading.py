@@ -1066,6 +1066,12 @@ class PaperTradingService:
         with self._lock:
             quotes = self._quotes_from_cache()
             symbols = sorted(self.subscription_symbols())
+            current_recovery_symbols = {
+                str(row["symbol"])
+                for row in self.ledger.recovery_orders()
+                if row["scheduled_date"] == current.date().isoformat()
+            }
+            fresh_recovery_quotes: dict[str, dict[str, Any]] = {}
             missing_current_quotes = [
                 symbol for symbol in symbols
                 if symbol not in quotes
@@ -1076,7 +1082,10 @@ class PaperTradingService:
                 self._recovery_quote_fetch_last is None
                 or (current - self._recovery_quote_fetch_last).total_seconds() >= 300
             )
-            if missing_current_quotes and quote_retry_due:
+            requires_completed_day_evidence = (
+                current.time() >= dt_time(15, 0) and bool(current_recovery_symbols)
+            )
+            if (missing_current_quotes or requires_completed_day_evidence) and quote_retry_due:
                 quote_service = getattr(self.app_state, "quote_service", None)
                 if quote_service is not None:
                     self._recovery_quote_fetch_last = current
@@ -1086,7 +1095,11 @@ class PaperTradingService:
                             refresh = quote_service.refresh
                         fetched = refresh()
                         records = fetched.get("records", []) if isinstance(fetched, dict) else []
-                        quotes.update(_quote_map(records, source="realtime_recovery"))
+                        fresh_recovery_quotes = _quote_map(
+                            records,
+                            source="realtime_recovery",
+                        )
+                        quotes.update(fresh_recovery_quotes)
                     except Exception:
                         logger.exception("paper recovery quote refresh failed")
 
@@ -1192,7 +1205,7 @@ class PaperTradingService:
                             order,
                             trading_date,
                             current,
-                            quotes,
+                            fresh_recovery_quotes,
                         )
                         if minute is not None:
                             minute_by_symbol[str(order["symbol"])] = minute
@@ -1282,7 +1295,10 @@ class PaperTradingService:
                             quality="RECOVERED_LATE",
                             previous_close=self._reference_close(order, quote),
                         )
-                        current_quote = quotes.get(str(order["symbol"]))
+                        current_quote = (
+                            fresh_recovery_quotes.get(str(order["symbol"]))
+                            or quotes.get(str(order["symbol"]))
+                        )
                         if current_quote is not None:
                             self.ledger.update_marks(
                                 {str(order["symbol"]): current_quote},
