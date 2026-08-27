@@ -1460,6 +1460,56 @@ def _preflight_stage(
     return json.loads(completed.stdout)
 
 
+def _request_payload_sizes(
+    paths: dict[str, Path],
+    *,
+    stage: str,
+    trade_date: date,
+    prompts: list[str],
+    schema: Path,
+) -> list[int]:
+    """Measure each exact provider payload before any paid network operation."""
+    runtime_scripts = _runtime_scripts()
+    helper = (
+        "import json,os,sys; from pathlib import Path; "
+        "sys.path.insert(0, os.environ['RUNTIME_SCRIPTS']); "
+        "from deepseek_payload import build_request_payload; "
+        "from model_budget import stage_profile; "
+        "schema=json.loads(Path(os.environ['SCHEMA_PATH']).read_text()); "
+        "prompts=json.loads(Path(os.environ['PROMPTS_PATH']).read_text()); "
+        "profile=stage_profile(os.environ['ASHARE_LLM_STAGE']); "
+        "thinking=profile.get('thinking_type','enabled'); "
+        "print(json.dumps([len(json.dumps(build_request_payload(p,schema,profile,thinking_type=thinking),ensure_ascii=False,sort_keys=True,separators=(',',':')).encode()) for p in prompts]))"
+    )
+    prompts_path = paths["run_root"] / f"{stage.lower()}-request-size-prompts.json"
+    _atomic_json(prompts_path, prompts)
+    dummy_spec = ModelCallSpec(REPLAY_ID, stage, "SLOT-SIZE-ONLY", trade_date, "x", schema)
+    env = _budget_environment(paths, dummy_spec)
+    env.update(
+        {
+            "RUNTIME_SCRIPTS": str(runtime_scripts),
+            "SCHEMA_PATH": str(schema),
+            "PROMPTS_PATH": str(prompts_path),
+        }
+    )
+    completed = subprocess.run(
+        [os.environ.get("PYTHON", sys.executable), "-c", helper],
+        text=True,
+        capture_output=True,
+        env=env,
+        timeout=60,
+        check=False,
+    )
+    if completed.returncode != 0:
+        raise RuntimeError(
+            f"exact request-size measurement failed: {completed.stderr.strip()[:500]}"
+        )
+    sizes = [int(value) for value in json.loads(completed.stdout)]
+    if len(sizes) != len(prompts):
+        raise RuntimeError("exact request-size measurement returned an incomplete result")
+    return sizes
+
+
 def audit_budget_ledgers(paths: dict[str, Path]) -> dict[str, Any]:
     """Reconcile every per-date model ledger against the cumulative budget state."""
     if not paths["state"].is_file():
@@ -1660,6 +1710,38 @@ def run_scores(store: PilotStore, paths: dict[str, Path]) -> dict[str, Any]:
         state for state in states if (state.symbol, state.cutoff_date) not in completed
     ]
     compact_paths = _write_compact_score_contract(store, paths)
+    pending_prompts = [build_score_prompt(state) for state in pending_states]
+    request_sizes = (
+        _request_payload_sizes(
+            compact_paths,
+            stage=COMPACT_SCORE_STAGE,
+            trade_date=pending_states[0].cutoff_date,
+            prompts=pending_prompts,
+            schema=compact_paths["score_schema"],
+        )
+        if pending_states
+        else []
+    )
+    payable_rows = [
+        (state, prompt, request_bytes)
+        for state, prompt, request_bytes in zip(
+            pending_states, pending_prompts, request_sizes, strict=True
+        )
+        if request_bytes <= MAX_SCORE_REQUEST_BYTES
+    ]
+    exact_oversize = [
+        {
+            "symbol": state.symbol,
+            "cutoff_date": state.cutoff_date.isoformat(),
+            "status": "DATA_INSUFFICIENT_OVERSIZE_REQUEST",
+            "request_bytes": request_bytes,
+        }
+        for state, _prompt, request_bytes in zip(
+            pending_states, pending_prompts, request_sizes, strict=True
+        )
+        if request_bytes > MAX_SCORE_REQUEST_BYTES
+    ]
+    pending_states = [row[0] for row in payable_rows]
     policy_hash = _file_hash(compact_paths["policy"])
     specs = [
         ModelCallSpec(
@@ -1668,11 +1750,11 @@ def run_scores(store: PilotStore, paths: dict[str, Path]) -> dict[str, Any]:
             "SLOT-SCORE-COMPACT-"
             + _stable_hash(REPLAY_ID, state.symbol, state.cutoff_date.isoformat())[:28],
             state.cutoff_date,
-            build_score_prompt(state),
+            prompt,
             compact_paths["score_schema"],
             policy_hash,
         )
-        for state in pending_states
+        for state, prompt, _request_bytes in payable_rows
     ]
     if specs:
         _preflight_stage(
@@ -1683,7 +1765,8 @@ def run_scores(store: PilotStore, paths: dict[str, Path]) -> dict[str, Any]:
             schema=compact_paths["score_schema"],
         )
     runner = _adapter_runner(compact_paths)
-    already_scored = len(states) - len(pending_states)
+    already_scored = len(completed)
+    score_contexts = already_scored + len(pending_states)
     for index, (state, spec) in enumerate(zip(pending_states, specs, strict=True), start=1):
         result = execute_cached_call(store.connection, spec, runner)
         raw_output = json.loads(result.raw_output)
@@ -1746,7 +1829,7 @@ def run_scores(store: PilotStore, paths: dict[str, Path]) -> dict[str, Any]:
                 {
                     "event": "serenity_full64_progress",
                     "completed": already_scored + index,
-                    "total": len(states),
+                    "total": score_contexts,
                     "symbol": state.symbol,
                     "cutoff": state.cutoff_date.isoformat(),
                     "evidence_adjustments": len(evidence_adjustments),
@@ -1756,9 +1839,10 @@ def run_scores(store: PilotStore, paths: dict[str, Path]) -> dict[str, Any]:
             flush=True,
         )
     report = {
-        "score_contexts": len(states),
+        "score_contexts": score_contexts,
         "continued_in_compact_mode": len(pending_states),
-        "blocked_contexts": blocked,
+        "blocked_contexts": [*blocked, *exact_oversize],
+        "exact_request_oversize": exact_oversize,
         "scored_rows": store.connection.execute(
             "SELECT count(*) FROM semantic_score_results WHERE replay_id=?", [REPLAY_ID]
         ).fetchone()[0],
