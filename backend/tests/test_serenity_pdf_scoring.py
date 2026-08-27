@@ -15,7 +15,9 @@ from app.services.serenity_pdf_scoring import (
     CachedModelResult,
     ModelCallSpec,
     _audit_allows_direct_pdf_scoring,
+    _remaining_budget_limits,
     _verified_output_hash,
+    _write_compact_score_contract,
     compute_full_score,
     execute_cached_call,
     initialize_semantic_tables,
@@ -346,3 +348,43 @@ def test_direct_pdf_gate_does_not_treat_legacy_fact_labels_as_score_input() -> N
     assert report["legacy_fact_labels_eligible_for_scoring"] is False
     assert _audit_allows_direct_pdf_scoring(report) is True
     assert _audit_allows_direct_pdf_scoring({}) is False
+
+
+def test_compact_continuation_budget_uses_only_original_remaining_allowance(
+    tmp_path: Path,
+) -> None:
+    store = PilotStore(tmp_path / "pilot")
+    store.set_meta(
+        "manifest",
+        {"decision_dates": [date(2026, 8, day).isoformat() for day in range(20, 27)]},
+    )
+    run_root = tmp_path / "pilot" / "full64"
+    run_root.mkdir(parents=True)
+    state_path = run_root / "model-budget-state.json"
+    usage = {
+        "request_count": 13,
+        "charged_prompt_tokens": 118_377,
+        "charged_completion_tokens": 16_945,
+        "charged_total_tokens": 135_322,
+        "charged_cost_micros_cny": 583_416,
+    }
+    state_path.write_text(json.dumps({"usage": usage}), encoding="utf-8")
+    primary_paths = {
+        "run_root": run_root,
+        "state": state_path,
+        "score_schema": run_root / "score.schema.json",
+    }
+    primary_paths["score_schema"].write_text("{}", encoding="utf-8")
+
+    compact_paths = _write_compact_score_contract(store, primary_paths)
+    authorization = json.loads(compact_paths["authorization"].read_text(encoding="utf-8"))
+    policy = json.loads(compact_paths["policy"].read_text(encoding="utf-8"))
+    store.close()
+
+    assert authorization["limits"] == _remaining_budget_limits(usage)
+    assert authorization["limits"]["max_requests"] + usage["request_count"] == 120
+    assert (
+        authorization["limits"]["max_cost_micros_cny"] + usage["charged_cost_micros_cny"]
+        == 120_000_000
+    )
+    assert policy["stage_profiles"][scoring.COMPACT_SCORE_STAGE]["thinking_type"] == "disabled"

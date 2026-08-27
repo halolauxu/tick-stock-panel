@@ -48,6 +48,7 @@ MODEL = "deepseek-v4-flash"
 OFFICIAL_BASE_URL = "https://api.deepseek.com"
 FACT_AUDIT_STAGE = "FACT_AUDIT"
 SCORE_STAGE = "SERENITY_PDF_SCORE"
+COMPACT_SCORE_STAGE = "SERENITY_PDF_SCORE_COMPACT"
 FACT_AUDIT_SAMPLE_SIZE = 50
 FACT_AUDIT_BATCH_SIZE = 5
 FACT_AUDIT_PASS_RATE = 0.80
@@ -772,6 +773,7 @@ def build_score_prompt(state: ScoreState) -> str:
             "发行人自身PDF通常不能构成独立交叉验证，证据质量据此受限",
             "评分只输出0到5整数；分值换算由本地确定性程序完成",
             "区分支持证据和反证，遇到冲突优先降低评级或标CONTRADICTED",
+            "只输出最终JSON，不输出思考过程；quote取足以证明结论的最短连续原句，reason每项不超过80汉字",
         ],
         "rating_anchors": RATING_ANCHORS,
         "penalty_guidance": PENALTY_GUIDANCE,
@@ -1072,8 +1074,142 @@ def _write_run_contract(store: PilotStore) -> dict[str, Path]:
     }
 
 
+def _remaining_budget_limits(usage: dict[str, Any]) -> dict[str, int]:
+    remaining = {
+        "max_requests": MAX_REQUESTS - int(usage.get("request_count") or 0),
+        "max_prompt_tokens": MAX_PROMPT_TOKENS - int(usage.get("charged_prompt_tokens") or 0),
+        "max_completion_tokens": MAX_COMPLETION_TOKENS
+        - int(usage.get("charged_completion_tokens") or 0),
+        "max_total_tokens": MAX_TOTAL_TOKENS - int(usage.get("charged_total_tokens") or 0),
+        "max_cost_micros_cny": MAX_COST_MICROS_CNY - int(usage.get("charged_cost_micros_cny") or 0),
+        "max_attempts_per_context": 2,
+    }
+    if any(value < 0 for key, value in remaining.items() if key != "max_attempts_per_context"):
+        raise RuntimeError("primary DeepSeek budget already exceeds the owner authorization")
+    return remaining
+
+
+def _write_compact_score_contract(
+    store: PilotStore, primary_paths: dict[str, Path]
+) -> dict[str, Path]:
+    """Freeze a non-thinking continuation budget using only the original remainder."""
+    if not primary_paths["state"].is_file():
+        raise RuntimeError("primary paid-model budget state is missing")
+    primary_state = json.loads(primary_paths["state"].read_text(encoding="utf-8"))
+    primary_usage = primary_state.get("usage") or {}
+    limits = _remaining_budget_limits(primary_usage)
+    run_root = primary_paths["run_root"]
+    policy_path = run_root / "model-execution-policy-compact.json"
+    authorization_path = run_root / "model-budget-authorization-compact.json"
+    state_path = run_root / "model-budget-state-compact.json"
+    compact_manifest_path = run_root / "compact-run-manifest.json"
+    policy = {
+        "schema_version": "1.0.0",
+        "policy_id": "SERENITY-PDF-FULL64-DEEPSEEK-V4-FLASH-COMPACT-V2",
+        "provider": PROVIDER,
+        "base_url": "https://api.deepseek.com/chat/completions",
+        "model": MODEL,
+        "paid_execution_default": "DISABLED_WITHOUT_ASSET_OWNER_BUDGET",
+        "network_execution_status": "ACTIVE_EXPLICIT_ASSET_OWNER_AUTHORIZATION",
+        "thinking": "disabled",
+        "http_timeout_seconds": 1100,
+        "semantic_worker_limit": 1,
+        "max_attempts_per_context_cap": 2,
+        "stage_profiles": {
+            COMPACT_SCORE_STAGE: {
+                "thinking_type": "disabled",
+                "reasoning_effort": "high",
+                "max_output_tokens": 4096,
+                "max_request_bytes": MAX_SCORE_REQUEST_BYTES,
+                "max_attempts_per_context": 2,
+                "max_retry_contexts": 4,
+            }
+        },
+        "response_format": "json_object",
+        "tools_allowed": False,
+        "fallback_model_allowed": False,
+        "mixed_provider_run_allowed": False,
+        "credential_sources": ["PROCESS_ENV:DEEPSEEK_API_KEY"],
+        "credential_persistence_allowed": False,
+        "required_audit_fields": [
+            "provider",
+            "model",
+            "request_sha256",
+            "response_sha256",
+            "finish_reason",
+            "usage",
+            "context_id",
+        ],
+    }
+    _freeze_json(policy_path, policy, "compact model execution policy")
+    policy_hash = _file_hash(policy_path)
+    manifest = store.get_meta("manifest", {})
+    decision_dates = list(manifest.get("decision_dates", []))
+    authorization = _with_content_hash(
+        {
+            "schema_version": "1.0.0",
+            "budget_id": "SERENITY-FULL64-CNY120-REMAINDER-COMPACT-V2",
+            "authorization_status": "APPROVED",
+            "authorized_by": "ASSET_OWNER",
+            "approval_evidence": (
+                "用户在Codex任务中明确确认总计120元上限；本预算仅可使用主预算实际消耗后的剩余额度"
+            ),
+            "replay_id": REPLAY_ID,
+            "allowed_trade_dates": decision_dates,
+            "provider": PROVIDER,
+            "model": MODEL,
+            "policy_sha256": policy_hash,
+            "effective_at": "2026-08-27T00:00:00+08:00",
+            "expires_at": "2026-08-29T23:59:00+08:00",
+            "budget_state_path": str(state_path.resolve()),
+            "limits": limits,
+            "tariff": {
+                "input_cache_hit_micros_cny_per_million": 112000,
+                "input_cache_miss_micros_cny_per_million": 3520000,
+                "output_micros_cny_per_million": 10560000,
+                "evidence": "https://api-docs.deepseek.com/quick_start/pricing; peak USD price converted at conservative 8 CNY/USD cap basis",
+            },
+        }
+    )
+    _freeze_json(authorization_path, authorization, "compact model budget authorization")
+    compact_manifest = _with_content_hash(
+        {
+            "schema_version": "1.0.0",
+            "replay_id": REPLAY_ID,
+            "parent_budget_id": "SERENITY-FULL64-CNY120-V1",
+            "parent_budget_state_sha256": _file_hash(primary_paths["state"]),
+            "parent_usage_at_freeze": primary_usage,
+            "combined_owner_limits": {
+                "max_requests": MAX_REQUESTS,
+                "max_prompt_tokens": MAX_PROMPT_TOKENS,
+                "max_completion_tokens": MAX_COMPLETION_TOKENS,
+                "max_total_tokens": MAX_TOTAL_TOKENS,
+                "max_cost_micros_cny": MAX_COST_MICROS_CNY,
+            },
+            "continuation_limits": limits,
+            "stage": COMPACT_SCORE_STAGE,
+            "model": MODEL,
+            "thinking_type": "disabled",
+            "policy_sha256": policy_hash,
+            "authorization_sha256": _file_hash(authorization_path),
+            "reason": "thinking-mode length stop; preserve completed rows and continue concise JSON scoring",
+        }
+    )
+    _freeze_json(compact_manifest_path, compact_manifest, "compact continuation manifest")
+    return {
+        **primary_paths,
+        "policy": policy_path,
+        "authorization": authorization_path,
+        "state": state_path,
+        "usage_prefix": Path("model-usage-compact"),
+        "audit_prefix": Path("budget-audit-compact"),
+        "compact_manifest": compact_manifest_path,
+    }
+
+
 def _usage_path(paths: dict[str, Path], trade_date: date) -> Path:
-    return paths["run_root"] / f"model-usage-{trade_date.isoformat()}.jsonl"
+    prefix = str(paths.get("usage_prefix") or "model-usage")
+    return paths["run_root"] / f"{prefix}-{trade_date.isoformat()}.jsonl"
 
 
 def _verified_output_hash(raw_output: str, ledger_row: dict[str, Any]) -> str:
@@ -1243,9 +1379,10 @@ def audit_budget_ledgers(paths: dict[str, Path]) -> dict[str, Any]:
     )
     runtime_script = _runtime_scripts() / "audit-model-budget.py"
     reports: list[dict[str, Any]] = []
+    audit_prefix = str(paths.get("audit_prefix") or "budget-audit")
     for trade_date_value in trade_dates:
         trade_date = date.fromisoformat(trade_date_value)
-        output_path = paths["run_root"] / f"budget-audit-{trade_date_value}.json"
+        output_path = paths["run_root"] / f"{audit_prefix}-{trade_date_value}.json"
         spec = ModelCallSpec(
             REPLAY_ID,
             SCORE_STAGE,
@@ -1284,6 +1421,15 @@ def audit_budget_ledgers(paths: dict[str, Path]) -> dict[str, Any]:
                 f"{'; '.join(report.get('errors') or [])}"
             )
     return {"status": "PASS", "reports": reports}
+
+
+def audit_all_budget_ledgers(store: PilotStore, primary_paths: dict[str, Path]) -> dict[str, Any]:
+    result = {"primary": audit_budget_ledgers(primary_paths)}
+    compact_authorization = primary_paths["run_root"] / "model-budget-authorization-compact.json"
+    if compact_authorization.is_file():
+        compact_paths = _write_compact_score_contract(store, primary_paths)
+        result["compact"] = audit_budget_ledgers(compact_paths)
+    return result
 
 
 def run_fact_audit(store: PilotStore, paths: dict[str, Path]) -> dict[str, Any]:
@@ -1408,38 +1554,42 @@ def run_scores(store: PilotStore, paths: dict[str, Path]) -> dict[str, Any]:
     if not _audit_allows_direct_pdf_scoring(audit):
         raise RuntimeError("direct full-PDF scoring gate did not pass; paid scoring is stopped")
     states, blocked = load_score_states(store)
-    policy_hash = _file_hash(paths["policy"])
+    completed = {
+        (str(symbol), cutoff_date)
+        for symbol, cutoff_date in store.connection.execute(
+            "SELECT symbol, cutoff_date FROM semantic_score_results WHERE replay_id=?",
+            [REPLAY_ID],
+        ).fetchall()
+    }
+    pending_states = [
+        state for state in states if (state.symbol, state.cutoff_date) not in completed
+    ]
+    compact_paths = _write_compact_score_contract(store, paths)
+    policy_hash = _file_hash(compact_paths["policy"])
     specs = [
         ModelCallSpec(
             REPLAY_ID,
-            SCORE_STAGE,
-            "SLOT-SCORE-"
+            COMPACT_SCORE_STAGE,
+            "SLOT-SCORE-COMPACT-"
             + _stable_hash(REPLAY_ID, state.symbol, state.cutoff_date.isoformat())[:28],
             state.cutoff_date,
             build_score_prompt(state),
-            paths["score_schema"],
+            compact_paths["score_schema"],
             policy_hash,
         )
-        for state in states
+        for state in pending_states
     ]
-    pending = [
-        spec
-        for spec in specs
-        if not store.connection.execute(
-            "SELECT 1 FROM semantic_model_calls WHERE replay_id=? AND stage=? AND slot_id=? AND input_sha256=? AND status='PASS'",
-            [spec.replay_id, spec.stage, spec.slot_id, spec.input_sha256],
-        ).fetchone()
-    ]
-    if pending:
+    if specs:
         _preflight_stage(
-            paths,
-            stage=SCORE_STAGE,
-            trade_date=pending[0].trade_date,
-            prompts=[spec.prompt for spec in pending],
-            schema=paths["score_schema"],
+            compact_paths,
+            stage=COMPACT_SCORE_STAGE,
+            trade_date=specs[0].trade_date,
+            prompts=[spec.prompt for spec in specs],
+            schema=compact_paths["score_schema"],
         )
-    runner = _adapter_runner(paths)
-    for index, (state, spec) in enumerate(zip(states, specs, strict=True), start=1):
+    runner = _adapter_runner(compact_paths)
+    already_scored = len(states) - len(pending_states)
+    for index, (state, spec) in enumerate(zip(pending_states, specs, strict=True), start=1):
         result = execute_cached_call(store.connection, spec, runner)
         output = json.loads(result.raw_output)
         errors = validate_score_output(
@@ -1479,7 +1629,7 @@ def run_scores(store: PilotStore, paths: dict[str, Path]) -> dict[str, Any]:
             json.dumps(
                 {
                     "event": "serenity_full64_progress",
-                    "completed": index,
+                    "completed": already_scored + index,
                     "total": len(states),
                     "symbol": state.symbol,
                     "cutoff": state.cutoff_date.isoformat(),
@@ -1490,10 +1640,12 @@ def run_scores(store: PilotStore, paths: dict[str, Path]) -> dict[str, Any]:
         )
     report = {
         "score_contexts": len(states),
+        "continued_in_compact_mode": len(pending_states),
         "blocked_contexts": blocked,
         "scored_rows": store.connection.execute(
             "SELECT count(*) FROM semantic_score_results WHERE replay_id=?", [REPLAY_ID]
         ).fetchone()[0],
+        "compact_budget": audit_budget_ledgers(compact_paths),
     }
     _atomic_json(paths["run_root"] / "score-stage-report.json", report)
     return report
@@ -1721,7 +1873,7 @@ def main(argv: list[str] | None = None) -> int:
         elif args.command == "score":
             payload = run_scores(store, paths)
         elif args.command == "audit-budget":
-            payload = audit_budget_ledgers(paths)
+            payload = audit_all_budget_ledgers(store, paths)
         elif args.command == "materialize":
             payload = materialize_decisions_and_outcomes(store, paths)
         elif args.command == "run":
@@ -1729,11 +1881,11 @@ def main(argv: list[str] | None = None) -> int:
                 payload = {
                     "audit": run_fact_audit(store, paths),
                     "scores": run_scores(store, paths),
-                    "budget": audit_budget_ledgers(paths),
+                    "budget": audit_all_budget_ledgers(store, paths),
                     "result": materialize_decisions_and_outcomes(store, paths),
                 }
             finally:
-                audit_budget_ledgers(paths)
+                audit_all_budget_ledgers(store, paths)
         else:
             payload = status(store, paths)
     finally:
