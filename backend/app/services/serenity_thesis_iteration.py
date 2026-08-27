@@ -21,6 +21,7 @@ from typing import Any
 
 from app.services.serenity_event_replay import EventReplayStore
 from app.services.serenity_pdf_scoring import (
+    DIMENSION_WEIGHTS,
     DocumentPacket,
     ModelCallSpec,
     ScoreState,
@@ -104,6 +105,56 @@ def thesis_dimension_gate(
     )
 
 
+def conservative_dimension_consensus(
+    *dimension_sets: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Merge independently validated calls without choosing the higher rating."""
+    result: list[dict[str, Any]] = []
+    for dimension_id in DIMENSION_WEIGHTS:
+        candidates = [
+            item
+            for dimensions in dimension_sets
+            for item in dimensions
+            if item.get("dimension_id") == dimension_id
+            and item.get("status") != "UNKNOWN"
+            and item.get("rating") is not None
+        ]
+        if not candidates:
+            result.append(
+                {
+                    "dimension_id": dimension_id,
+                    "status": "UNKNOWN",
+                    "rating": None,
+                    "reason": "all independently validated calls remain unknown",
+                    "evidence": [],
+                }
+            )
+            continue
+        minimum = min(int(item["rating"]) for item in candidates)
+        retained = [item for item in candidates if int(item["rating"]) == minimum]
+        evidence: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        for item in retained:
+            for citation in item.get("evidence") or []:
+                key = json.dumps(citation, ensure_ascii=False, sort_keys=True)
+                if key not in seen:
+                    seen.add(key)
+                    evidence.append(citation)
+        result.append(
+            {
+                "dimension_id": dimension_id,
+                "status": "EVIDENCED",
+                "rating": minimum,
+                "reason": (
+                    "conservative cross-call consensus; minimum evidenced rating retained; "
+                    "UNKNOWN is absence, not a contradictory score"
+                ),
+                "evidence": evidence,
+            }
+        )
+    return result
+
+
 def initialize_thesis_tables(store: EventReplayStore) -> None:
     initialize_optimization_tables(store)
     store.connection.execute(
@@ -159,6 +210,19 @@ def initialize_thesis_tables(store: EventReplayStore) -> None:
             status VARCHAR NOT NULL,
             evaluated_at TIMESTAMP NOT NULL,
             PRIMARY KEY (optimization_id, round_id, policy_id, fold_id, horizon)
+        );
+        CREATE TABLE IF NOT EXISTS serenity_thesis_consensus_scores (
+            optimization_id VARCHAR NOT NULL,
+            event_id VARCHAR NOT NULL,
+            symbol VARCHAR NOT NULL,
+            decision_date DATE NOT NULL,
+            event_gate VARCHAR NOT NULL,
+            complete_dimension_score DOUBLE,
+            dimension_json VARCHAR NOT NULL,
+            hard_gate_pass BOOLEAN NOT NULL,
+            derivation_rule VARCHAR NOT NULL,
+            derived_at TIMESTAMP NOT NULL,
+            PRIMARY KEY (optimization_id, event_id)
         );
         """
     )
@@ -856,16 +920,26 @@ def evaluate(store: EventReplayStore) -> dict[str, Any]:
                o.net_return, o.benchmark_return, o.chain_return, o.mae, o.mfe,
                f.relative_momentum_20, f.next_open_gap,
                s.event_gate, s.newness, s.economic_bridge, s.event_stage,
-               s.complete_dimension_score, s.dimension_json
+               s.complete_dimension_score, s.dimension_json,
+               b.event_gate, b.newness, b.economic_bridge, b.event_stage,
+               b.complete_dimension_score, b.dimension_json, s.symbol
         FROM event_discovery_outcomes o
         JOIN serenity_event_features f
           ON f.optimization_id=? AND f.event_id=o.event_id
         JOIN serenity_thesis_scores s
           ON s.optimization_id=? AND s.substage=? AND s.event_id=o.event_id
+        JOIN serenity_event_semantic_scores b
+          ON b.optimization_id=? AND b.stage=? AND b.event_id=o.event_id
         WHERE o.status='SETTLED'
         ORDER BY o.decision_date, o.event_id, o.horizon
         """,
-        [OPTIMIZATION_ID, OPTIMIZATION_ID, THESIS_SUBSTAGE],
+        [
+            OPTIMIZATION_ID,
+            OPTIMIZATION_ID,
+            THESIS_SUBSTAGE,
+            OPTIMIZATION_ID,
+            EVENT_ENRICHED_SCORE_STAGE,
+        ],
     ).fetchall()
     records = [
         {
@@ -886,17 +960,61 @@ def evaluate(store: EventReplayStore) -> dict[str, Any]:
             "economic_bridge": row[14],
             "event_stage": row[15],
             "complete_score": row[16],
-            "dimensions": json.loads(row[17]),
+            "dimensions": conservative_dimension_consensus(
+                json.loads(row[17]), json.loads(row[23])
+            ),
+            "base_event_gate": row[18],
+            "base_newness": row[19],
+            "base_economic_bridge": row[20],
+            "base_event_stage": row[21],
+            "base_complete_score": row[22],
+            "symbol": row[24],
         }
         for row in rows
     ]
-
-    def pure(row: dict[str, Any]) -> bool:
-        return (
+    store.connection.execute(
+        "DELETE FROM serenity_thesis_consensus_scores WHERE optimization_id=?",
+        [OPTIMIZATION_ID],
+    )
+    for row in records:
+        consensus_score = _dimension_score({"dimensions": row["dimensions"]})["complete"]
+        row["complete_score"] = consensus_score
+        gates_agree = (
             row["event_gate"] == "PASS"
             and row["newness"] == "NEW_INFORMATION"
             and row["economic_bridge"] == "PASS"
             and row["event_stage"] != "ROUTINE_ADMIN"
+            and row["base_event_gate"] == "PASS"
+            and row["base_newness"] == "NEW_INFORMATION"
+            and row["base_economic_bridge"] == "PASS"
+            and row["base_event_stage"] != "ROUTINE_ADMIN"
+        )
+        hard_gate = gates_agree and thesis_dimension_gate(
+            row["dimensions"], consensus_score
+        )
+        row["consensus_event_gate"] = "PASS" if gates_agree else "FAIL_CROSS_CALL"
+        store.connection.execute(
+            """
+            INSERT INTO serenity_thesis_consensus_scores VALUES
+            (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            [
+                OPTIMIZATION_ID,
+                row["event_id"],
+                row["symbol"],
+                row["decision_date"],
+                row["consensus_event_gate"],
+                consensus_score,
+                json.dumps(row["dimensions"], ensure_ascii=False, sort_keys=True),
+                hard_gate,
+                "minimum evidenced rating across Round2 and Round4; UNKNOWN is not contradiction",
+                datetime.now(),
+            ],
+        )
+
+    def pure(row: dict[str, Any]) -> bool:
+        return (
+            row["consensus_event_gate"] == "PASS"
             and thesis_dimension_gate(row["dimensions"], row["complete_score"])
         )
 
@@ -974,6 +1092,10 @@ def evaluate(store: EventReplayStore) -> dict[str, Any]:
             "pdf64_gate": {
                 "complete_score_min": MIN_COMPLETE_SCORE,
                 "each_dimension_rating_min": MIN_DIMENSION_RATING,
+                "consensus": (
+                    "minimum evidenced rating across Round2 and Round4; "
+                    "UNKNOWN is absence rather than contradiction"
+                ),
             },
             "momentum_or_gap_filter": "NONE",
         },
@@ -1013,11 +1135,11 @@ def status(store: EventReplayStore) -> dict[str, Any]:
         "hard_gate_events": store.connection.execute(
             """
             SELECT event_id, symbol, decision_date, complete_dimension_score, dimension_json
-            FROM serenity_thesis_scores
-            WHERE optimization_id=? AND substage=? AND event_gate='PASS'
+            FROM serenity_thesis_consensus_scores
+            WHERE optimization_id=? AND hard_gate_pass=true
             ORDER BY decision_date, event_id
             """,
-            [OPTIMIZATION_ID, THESIS_SUBSTAGE],
+            [OPTIMIZATION_ID],
         ).fetchall(),
         "parent_stage_cost_micros_cny": store.connection.execute(
             """
