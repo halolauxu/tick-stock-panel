@@ -1,4 +1,4 @@
-"""分钟K精确成交 (_resolve_minute_fill / _load_minute_for_fills) 回归测试。
+"""分钟K成交价、分钟触发卖出与数据加载回归测试。
 
 背景: 原实现用 df.to_numpy() 转 structured array 再按字段名索引 (arr["open"])。
 当 DataFrame 含 datetime 列 + float 列时, to_numpy() 退化为 dtype=object 的二维
@@ -8,7 +8,7 @@
 当前设计:
   - _load_minute_for_fills 按触发日分批读取分区 (get_minute_by_dates), 返回
     {(symbol, date_str): float64 2D ndarray} (列顺序 = _MINUTE_NUMERIC_COLS)。
-  - _resolve_minute_fill 接收 float64 2D 数组, 按整数列索引访问。
+  - _resolve_minute_fill 接收 float64 2D 数组, 只按明确成交时点取首分钟开盘/末分钟收盘。
 .cast(Float64) 保证 to_numpy 不退化, 整数索引避免列名依赖。
 """
 from __future__ import annotations
@@ -19,10 +19,22 @@ import numpy as np
 import polars as pl
 import pytest
 
-from app.backtest.engine import BacktestEngine, MinuteFillDataUnavailableError
+from app.backtest.engine import BacktestEngine, MatcherConfig, MinuteFillDataUnavailableError
 from app.backtest.minute_trigger import build_minute_exit_reference
 
 NUMERIC_COLS = BacktestEngine._MINUTE_NUMERIC_COLS  # open/high/low/close/volume/amount
+
+
+def test_minute_price_and_exit_settings_are_independent_with_legacy_compatibility():
+    price_only = MatcherConfig(minute_price_fill=True, minute_exit_trigger=False)
+    trigger_only = MatcherConfig(minute_price_fill=False, minute_exit_trigger=True)
+    legacy_price = MatcherConfig(minute_fill=True, exit_fill="close_t")
+    legacy_trigger = MatcherConfig(minute_fill=True, exit_fill="signal_next_minute")
+
+    assert price_only.minute_price_enabled() and not price_only.minute_exit_enabled()
+    assert trigger_only.minute_exit_enabled() and not trigger_only.minute_price_enabled()
+    assert legacy_price.minute_price_enabled() and not legacy_price.minute_exit_enabled()
+    assert legacy_trigger.minute_price_enabled() and legacy_trigger.minute_exit_enabled()
 
 
 def _sample_minute_df(symbol: str = "000001.SZ") -> pl.DataFrame:
@@ -55,37 +67,29 @@ def test_resolve_minute_fill_with_compact_array_no_index_error():
     """
     arr = _to_compact_arr(_sample_minute_df())
     assert arr.dtype == np.float64  # 必须是 float64, 不能退化成 object
-    # 三种分支都应正常返回
-    assert BacktestEngine._resolve_minute_fill(arr, ref_price=10.5, side="buy") is not None
-    assert BacktestEngine._resolve_minute_fill(arr, ref_price=10.5, side="sell") is not None
-    vwap = BacktestEngine._resolve_minute_fill(arr, ref_price=None, side="buy")
-    assert vwap is not None and vwap > 0
+    assert BacktestEngine._resolve_minute_fill(arr, "open") == 10.0
+    assert BacktestEngine._resolve_minute_fill(arr, "close") == 10.65
 
 
-def test_resolve_minute_fill_buy_cross_above_ref():
-    """买入: 价格涨破参考线 → 开盘已高于则按开盘。"""
+def test_resolve_minute_open_fill_does_not_read_later_bars():
+    """次日开盘成交只能读取首分钟开盘，后续价格不得改变成交价。"""
     arr = _to_compact_arr(_sample_minute_df())
-    assert BacktestEngine._resolve_minute_fill(arr, 9.5, "buy") == 10.0
+    changed = arr.copy()
+    changed[1:, :4] = 99.0
+    assert BacktestEngine._resolve_minute_fill(arr, "open") == 10.0
+    assert BacktestEngine._resolve_minute_fill(changed, "open") == 10.0
 
 
-def test_resolve_minute_fill_sell_cross_below_ref():
-    """卖出: 价格跌破参考线 → 开盘已低于则按开盘。"""
+def test_resolve_minute_close_fill_uses_last_valid_close():
     arr = _to_compact_arr(_sample_minute_df())
-    assert BacktestEngine._resolve_minute_fill(arr, 10.5, "sell") == 10.0
-
-
-def test_resolve_minute_fill_vwap():
-    """无参考线 → VWAP = 总成交额 / 总成交量。"""
-    arr = _to_compact_arr(_sample_minute_df())
-    total_amt = 1020.0 + 2120.0 + 1627.0 + 1278.0
-    total_vol = 100 + 200 + 150 + 120
-    assert BacktestEngine._resolve_minute_fill(arr, None, "buy") == total_amt / total_vol
+    arr[-1, 3] = np.nan
+    assert BacktestEngine._resolve_minute_fill(arr, "close") == 10.85
 
 
 def test_resolve_minute_fill_empty_returns_none():
     """空数组 → None (降级到日K口径)。"""
-    assert BacktestEngine._resolve_minute_fill(np.array([]).reshape(0, 6), None, "buy") is None
-    assert BacktestEngine._resolve_minute_fill(None, None, "buy") is None
+    assert BacktestEngine._resolve_minute_fill(np.array([]).reshape(0, 6), "open") is None
+    assert BacktestEngine._resolve_minute_fill(None, "open") is None
 
 
 def test_resolve_minute_exit_trigger_uses_next_minute_open():
@@ -152,7 +156,7 @@ def test_load_minute_for_fills_returns_compact_arrays():
     # 列顺序 = _MINUTE_NUMERIC_COLS (open=0, high=1, low=2, close=3, volume=4, amount=5)
     assert arr.shape == (4, 6)
     # 端到端: load → resolve 不抛异常
-    price = BacktestEngine._resolve_minute_fill(arr, None, "buy")
+    price = BacktestEngine._resolve_minute_fill(arr, "open")
     assert price is not None and price > 0
 
 

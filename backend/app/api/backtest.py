@@ -380,7 +380,10 @@ class StrategyBacktestRequest(BaseModel):
     mode: Literal["position", "full"] = "position"
     holding_days: int = 5
     asset_type: str = "stock"
+    # minute_fill 为旧客户端兼容字段。
     minute_fill: bool = False
+    minute_price_fill: bool | None = None
+    minute_exit_trigger: bool | None = None
     regime_filter: dict | None = None
 
 
@@ -393,7 +396,15 @@ def strategy_run(req: StrategyBacktestRequest, request: Request):
     end = req.end or date.today()
     start = _resolve_start(req, end, FACTOR_DEFAULT_DAYS)
     _guard_server_backtest_range(start, end)
-    if req.minute_fill:
+    uses_minute_data = (
+        (req.minute_price_fill if req.minute_price_fill is not None else req.minute_fill)
+        or (
+            req.minute_exit_trigger
+            if req.minute_exit_trigger is not None
+            else req.exit_fill == "signal_next_minute"
+        )
+    )
+    if uses_minute_data:
         preflight_error = _minute_backtest_preflight_error(
             request,
             start,
@@ -426,6 +437,8 @@ def strategy_run(req: StrategyBacktestRequest, request: Request):
         holding_days=req.holding_days,
         asset_type=req.asset_type,
         minute_fill=req.minute_fill,
+        minute_price_fill=req.minute_price_fill,
+        minute_exit_trigger=req.minute_exit_trigger,
         regime_filter=req.regime_filter,
     )
     task = make_worker_task("backtest", settings.data_dir, cfg)
@@ -500,9 +513,11 @@ def _make_job_key(
     commission_pct: float | None = None, stamp_tax_pct: float | None = None,
     asset_type: str = "stock",
     minute_fill: bool = False,
+    minute_price_fill: bool | None = None,
+    minute_exit_trigger: bool | None = None,
     regime_filter: str | None = None,
 ) -> str:
-    raw = f"{strategy_id}|{symbols}|{start}|{end}|{matching}|{entry_fill}|{exit_fill}|{fees_pct}|{slippage_bps}|{max_positions}|{max_exposure_pct}|{initial_capital}|{position_sizing}|{params}|{overrides}|{mode}|{holding_days}|{commission_pct}|{stamp_tax_pct}|{asset_type}|{minute_fill}|{regime_filter}"
+    raw = f"{strategy_id}|{symbols}|{start}|{end}|{matching}|{entry_fill}|{exit_fill}|{fees_pct}|{slippage_bps}|{max_positions}|{max_exposure_pct}|{initial_capital}|{position_sizing}|{params}|{overrides}|{mode}|{holding_days}|{commission_pct}|{stamp_tax_pct}|{asset_type}|{minute_fill}|{minute_price_fill}|{minute_exit_trigger}|{regime_filter}"
     return hashlib.md5(raw.encode()).hexdigest()[:12]
 
 
@@ -517,6 +532,10 @@ def _strategy_job_key_from_query(qs: str) -> str:
     def _get_opt_float(key: str) -> float | None:
         value = _get(key)
         return float(value) if value else None
+
+    def _get_opt_bool(key: str) -> bool | None:
+        value = _get(key)
+        return value.lower() == "true" if value else None
 
     return _make_job_key(
         _get("strategy_id"),
@@ -540,6 +559,8 @@ def _strategy_job_key_from_query(qs: str) -> str:
         stamp_tax_pct=_get_opt_float("stamp_tax_pct"),
         asset_type=_get("asset_type", "stock"),
         minute_fill=_get("minute_fill", "false").lower() == "true",
+        minute_price_fill=_get_opt_bool("minute_price_fill"),
+        minute_exit_trigger=_get_opt_bool("minute_exit_trigger"),
         regime_filter=_get("regime_filter") or None,
     )
 
@@ -568,6 +589,8 @@ async def strategy_stream(
     holding_days: int = 5,
     asset_type: str = "stock",
     minute_fill: bool = False,
+    minute_price_fill: bool | None = None,
+    minute_exit_trigger: bool | None = None,
     regime_filter: str | None = None,
 ):
     """SSE 流式策略回测: 实时推送进度, 完成后推送结果, 支持重连 (刷新/切页后恢复)。
@@ -600,7 +623,15 @@ async def strategy_stream(
             guard_violated = True
 
     preflight_error = BACKTEST_SERVER_GUARD_MESSAGE if guard_violated else None
-    if minute_fill and preflight_error is None:
+    uses_minute_data = (
+        (minute_price_fill if minute_price_fill is not None else minute_fill)
+        or (
+            minute_exit_trigger
+            if minute_exit_trigger is not None
+            else exit_fill == "signal_next_minute"
+        )
+    )
+    if uses_minute_data and preflight_error is None:
         preflight_error = _minute_backtest_preflight_error(
             request,
             start_date,
@@ -624,6 +655,8 @@ async def strategy_stream(
         commission_pct, stamp_tax_pct,
         asset_type=asset_type,
         minute_fill=minute_fill,
+        minute_price_fill=minute_price_fill,
+        minute_exit_trigger=minute_exit_trigger,
         regime_filter=regime_filter,
     )
 
@@ -672,6 +705,8 @@ async def strategy_stream(
                 holding_days=int(holding_days),
                 asset_type=asset_type,
                 minute_fill=minute_fill,
+                minute_price_fill=minute_price_fill,
+                minute_exit_trigger=minute_exit_trigger,
                 regime_filter=json.loads(regime_filter) if regime_filter else None,
             )
 

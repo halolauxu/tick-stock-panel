@@ -37,7 +37,6 @@ from app.backtest.matrix import (
     apply_time_masks,
     build_market_matrix,
     build_market_matrix_from_signals,
-    rolling_mean,
     slice_market_data_matrix,
     slice_signal_matrix,
 )
@@ -135,7 +134,7 @@ class StrategyDependencyResolver:
         entry_signals: list[str],
         exit_signals: list[str],
         overrides: dict | None = None,
-        minute_fill: bool = False,
+        minute_exit_trigger: bool = False,
         asset_type: str = "stock",
     ) -> ResolvedFeaturePlan:
         overrides = overrides or {}
@@ -200,7 +199,7 @@ class StrategyDependencyResolver:
         instrument_columns = frozenset(required_features & set(_INSTRUMENT_COLUMNS))
         instrument_columns = frozenset(set(instrument_columns) | {"name"})
         matrix_columns = set(_EXECUTION_COLUMNS) | required_signals
-        if minute_fill:
+        if minute_exit_trigger:
             indicator_columns = frozenset(set(indicator_columns) | {"ma5", "ma10", "ma20"})
             matrix_columns.update({"ma5", "ma10", "ma20"})
             base_columns = frozenset(set(base_columns) | {"close"})
@@ -339,7 +338,7 @@ def build_matrix_cache_profile(
             entry_signals=strategy.entry_signals,
             exit_signals=strategy.exit_signals,
             overrides={},
-            minute_fill=False,
+            minute_exit_trigger=False,
             asset_type=asset_type,
         ))
         forward_bars = max(forward_bars, int(strategy.max_hold_days or 0))
@@ -547,8 +546,10 @@ class StrategyBacktestConfig:
     mode: Literal["position", "full"] = "position"
     asset_type: str = "stock"
     holding_days: int = 5
-    # 分钟K精确成交: 开启后用当日分钟K确定穿越价/VWAP (需 Pro+ 分钟K能力)
+    # minute_fill 为旧请求兼容字段；新配置将分钟成交价和分钟触发卖出分开。
     minute_fill: bool = False
+    minute_price_fill: bool | None = None
+    minute_exit_trigger: bool | None = None
     # 市场环境过滤: {"states": ["strong",...], "min_score": 60}。
     # 强制 T-1: regime[T-1] 决定 entry[T](防未来函数)。None=不过滤。
     regime_filter: dict | None = None
@@ -562,6 +563,19 @@ class StrategyBacktestConfig:
             self.entry_fill = self.matching
         if self.exit_fill is None:
             self.exit_fill = self.matching
+        if self.minute_price_fill is None:
+            self.minute_price_fill = self.minute_fill
+        if self.minute_exit_trigger is None:
+            self.minute_exit_trigger = self.exit_fill == "signal_next_minute"
+
+    def minute_price_enabled(self) -> bool:
+        return bool(self.minute_price_fill)
+
+    def minute_exit_enabled(self) -> bool:
+        return bool(self.minute_exit_trigger)
+
+    def uses_minute_data(self) -> bool:
+        return self.minute_price_enabled() or self.minute_exit_enabled()
 
 
 @dataclass
@@ -679,7 +693,7 @@ class StrategyBacktestService:
             config.mode,
             config.asset_type,
             config.holding_days,
-            config.minute_fill,
+            config.minute_exit_enabled(),
             json.dumps(config.overrides or {}, sort_keys=True, ensure_ascii=False, default=str),
             json.dumps(config.regime_filter or {}, sort_keys=True, ensure_ascii=False, default=str),
         )
@@ -856,7 +870,7 @@ class StrategyBacktestService:
                 entry_signals=entry_signals,
                 exit_signals=exit_signals,
                 overrides=overrides,
-                minute_fill=config.minute_fill,
+                minute_exit_trigger=config.minute_exit_enabled(),
                 asset_type=config.asset_type,
             ))
         feature_plan = _merge_resolved_feature_plans(plans)
@@ -960,11 +974,7 @@ class StrategyBacktestService:
             raise ValueError("正式回测区间内无数据")
         start_id = int(time_ids[0])
         stop_id = int(time_ids[-1]) + 1
-        reference_price = (
-            rolling_mean(market_data.close, 5)[start_id:stop_id]
-            if first.minute_fill
-            else None
-        )
+        reference_price = None
         timing_ms["total"] = round((time.perf_counter() - prepare_started) * 1000, 1)
         compute_cache = MatrixComputeCache(max_bytes=matrix_cache_max_bytes)
         return PreparedMatrixBacktest(
@@ -1022,9 +1032,7 @@ class StrategyBacktestService:
         basic_filter = self._effective_basic_filter(s, overrides)
         entry_signals = self._effective_signals(overrides, "entry_signals", s.entry_signals)
         exit_signals = self._effective_signals(overrides, "exit_signals", s.exit_signals)
-        if config.exit_fill == "signal_next_minute":
-            if not config.minute_fill:
-                return _err("触发后下一分钟成交需要先开启分钟成交")
+        if config.minute_exit_enabled():
             if not exit_signals:
                 return _err("当前策略没有卖出信号，无法使用触发后下一分钟成交")
             unsupported = unsupported_minute_exit_signals(exit_signals)
@@ -1079,7 +1087,7 @@ class StrategyBacktestService:
                     entry_signals=entry_signals,
                     exit_signals=exit_signals,
                     overrides=overrides,
-                    minute_fill=config.minute_fill,
+                    minute_exit_trigger=config.minute_exit_enabled(),
                     asset_type=config.asset_type,
                 )
         except ValueError as e:
@@ -1232,8 +1240,10 @@ class StrategyBacktestService:
             initial_capital=config.initial_capital,
             position_sizing=config.position_sizing,
             minute_fill=config.minute_fill,
+            minute_price_fill=config.minute_price_fill,
+            minute_exit_trigger=config.minute_exit_trigger,
             asset_type=config.asset_type,
-            minute_fill_require_complete=config.minute_fill,
+            minute_fill_require_complete=config.uses_minute_data(),
             liquidate_on_end=config.liquidate_on_end,
             enforce_t_plus_one=config.enforce_t_plus_one,
         )
@@ -1281,11 +1291,7 @@ class StrategyBacktestService:
             stop_id = int(time_ids[-1]) + 1
             panel_rows = int(np.isfinite(market_data.close[start_id:stop_id]).sum())
             panel_columns = len(feature_plan.matrix_columns)
-            reference_price = (
-                rolling_mean(market_data.close, 5)[start_id:stop_id]
-                if matcher_config.minute_fill
-                else None
-            )
+            reference_price = None
 
             merge_mode = str(params.get("merge_mode") or "union")
             min_confirm = int(params.get("min_confirm") or 0)
@@ -1330,9 +1336,14 @@ class StrategyBacktestService:
                 sim_market_data,
                 sim_signal_matrix,
                 entry_delay_bars=1 if matcher_config.entry_fill == "open_t+1" else 0,
-                exit_delay_bars=1 if matcher_config.exit_fill == "open_t+1" else 0,
+                exit_delay_bars=(
+                    1
+                    if matcher_config.exit_fill == "open_t+1"
+                    and not matcher_config.minute_exit_enabled()
+                    else 0
+                ),
                 reference_price=reference_price,
-                minute_exit_trigger=matcher_config.exit_fill == "signal_next_minute",
+                minute_exit_trigger=matcher_config.minute_exit_enabled(),
             )
             timing_ms["matrix_build"] = round((time.perf_counter() - t_matrix) * 1000, 1)
             del sim_market_data, sim_signal_matrix
@@ -1387,11 +1398,7 @@ class StrategyBacktestService:
                 stop_id = int(time_ids[-1]) + 1
                 panel_rows = int(np.isfinite(market_data.close[start_id:stop_id]).sum())
                 panel_columns = len(feature_plan.matrix_columns)
-                reference_price = (
-                    rolling_mean(market_data.close, 5)[start_id:stop_id]
-                    if matcher_config.minute_fill
-                    else None
-                )
+                reference_price = None
 
             scoring = effective_scoring(s.meta.get("scoring"), overrides)
             try:
@@ -1448,9 +1455,14 @@ class StrategyBacktestService:
                 sim_market_data,
                 sim_signal_matrix,
                 entry_delay_bars=1 if matcher_config.entry_fill == "open_t+1" else 0,
-                exit_delay_bars=1 if matcher_config.exit_fill == "open_t+1" else 0,
+                exit_delay_bars=(
+                    1
+                    if matcher_config.exit_fill == "open_t+1"
+                    and not matcher_config.minute_exit_enabled()
+                    else 0
+                ),
                 reference_price=reference_price,
-                minute_exit_trigger=matcher_config.exit_fill == "signal_next_minute",
+                minute_exit_trigger=matcher_config.minute_exit_enabled(),
             )
             timing_ms["matrix_build"] = round((time.perf_counter() - t_matrix) * 1000, 1)
             del sim_market_data, sim_signal_matrix
@@ -1526,10 +1538,15 @@ class StrategyBacktestService:
                 sim_entry_mask,
                 sim_exit_mask,
                 entry_delay_bars=1 if matcher_config.entry_fill == "open_t+1" else 0,
-                exit_delay_bars=1 if matcher_config.exit_fill == "open_t+1" else 0,
+                exit_delay_bars=(
+                    1
+                    if matcher_config.exit_fill == "open_t+1"
+                    and not matcher_config.minute_exit_enabled()
+                    else 0
+                ),
                 entry_signal_ids=entry_signals,
                 exit_signal_ids=exit_signals,
-                minute_exit_trigger=matcher_config.exit_fill == "signal_next_minute",
+                minute_exit_trigger=matcher_config.minute_exit_enabled(),
             )
             timing_ms["matrix_build"] = round((time.perf_counter() - t_matrix) * 1000, 1)
             del panel, sim_panel, sim_entry_mask, sim_exit_mask
@@ -2132,6 +2149,8 @@ class StrategyBacktestService:
             "mode": c.mode,
             "holding_days": c.holding_days,
             "minute_fill": c.minute_fill,
+            "minute_price_fill": c.minute_price_enabled(),
+            "minute_exit_trigger": c.minute_exit_enabled(),
             "regime_filter": c.regime_filter,
         }
 

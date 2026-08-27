@@ -66,6 +66,8 @@ _CONFIG_FIELDS: dict[str, frozenset[str]] = {
             "holding_days",
             "asset_type",
             "minute_fill",
+            "minute_price_fill",
+            "minute_exit_trigger",
             "regime_filter",
             "factor_names",
             "directions",

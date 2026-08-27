@@ -146,7 +146,8 @@ function FillRuleHint() {
               <div className="space-y-1">
                 <div><b className="text-foreground">建仓口径</b>和<b className="text-foreground">清仓口径</b>分别控制买卖信号出现后的成交时点。</div>
                 <div><b className="text-foreground">信号日收盘</b>仅适用于收盘前可确认的信号；收盘后确认的信号应选择<b className="text-foreground">次日开盘</b>。</div>
-                <div><b className="text-foreground">信号触发卖出</b>仅在分钟成交开启且卖出信号支持分钟回放时可用；分钟收盘确认后按下一分钟开盘成交。</div>
+                <div><b className="text-foreground">分钟成交价格</b>只按成交口径读取首分钟开盘或末分钟收盘，不改变信号。</div>
+                <div><b className="text-foreground">分钟触发卖出</b>独立回放兼容的卖出信号；分钟收盘确认后按下一分钟开盘成交。</div>
                 <div>买卖信号由<b className="text-foreground">策略触发器</b>决定，这里只控制信号出现后的成交时点。</div>
               </div>
             </motion.div>
@@ -911,8 +912,10 @@ export function StrategyBacktest() {
   // 成交口径: 建仓/清仓可独立配置。向后兼容老 matching (派生为 entry=exit=matching)。
   const [matching] = useState<'close_t' | 'open_t+1'>(saved?.matching ?? 'open_t+1')
   const [entryFill, setEntryFill] = useState<'close_t' | 'open_t+1'>(saved?.entryFill ?? saved?.matching ?? 'open_t+1')
-  const [exitFill, setExitFill] = useState<'close_t' | 'open_t+1' | 'signal_next_minute'>(
-    saved ? (saved.exitFill ?? saved.matching ?? 'close_t') : 'open_t+1',
+  const [exitFill, setExitFill] = useState<'close_t' | 'open_t+1'>(
+    saved
+      ? (saved.exitFill === 'signal_next_minute' ? 'close_t' : (saved.exitFill ?? saved.matching ?? 'close_t'))
+      : 'open_t+1',
   )
   const [fees, setFees] = useState(saved?.fees ?? '2')
   const [stampTax, setStampTax] = useState(saved?.stampTax ?? '1')
@@ -923,7 +926,10 @@ export function StrategyBacktest() {
   const [positionSizing, setPositionSizing] = useState<'equal' | 'score_weight'>(saved?.positionSizing ?? 'equal')
   const [simMode, setSimMode] = useState<'position' | 'full'>(saved?.mode ?? 'position')
   const [holdingDays, setHoldingDays] = useState(saved?.holdingDays ?? '5')
-  const [highGranularity, setHighGranularity] = useState(saved?.minuteFill ?? false)
+  const [minutePriceFill, setMinutePriceFill] = useState(saved?.minutePriceFill ?? saved?.minuteFill ?? false)
+  const [minuteExitTrigger, setMinuteExitTrigger] = useState(
+    saved?.minuteExitTrigger ?? (saved?.exitFill === 'signal_next_minute'),
+  )
   // 市场环境过滤(空=不过滤)
   const [regimeStates, setRegimeStates] = useState<string[]>(saved?.regimeStates ?? [])
   const [regimeMinScore, setRegimeMinScore] = useState<number | ''>(saved?.regimeMinScore ?? '')
@@ -931,12 +937,13 @@ export function StrategyBacktest() {
   // 分钟K成交价细化: 不改变信号日或成交日, 依赖分钟K批量数据
   const { data: caps } = useCapabilities()
   const hasMinuteBatch = !!caps?.capabilities?.['kline.minute.batch']
-  const toggleMinuteFill = () => {
+  const toggleMinutePriceFill = () => {
     if (!hasMinuteBatch) return
-    if (highGranularity) {
-      if (exitFill === 'signal_next_minute') setExitFill('close_t')
-    }
-    setHighGranularity(value => !value)
+    setMinutePriceFill(value => !value)
+  }
+  const toggleMinuteExitTrigger = () => {
+    if (!hasMinuteBatch || !minuteExitTriggerSupported) return
+    setMinuteExitTrigger(value => !value)
   }
   const [rangeSettingsOpen, setRangeSettingsOpen] = useState(false)
   const [quickRanges, setQuickRanges] = useState(loadQuickRanges)
@@ -1085,7 +1092,9 @@ export function StrategyBacktest() {
         positionSizing,
         mode: simMode,
         holdingDays,
-        minuteFill: highGranularity,
+        minuteFill: minutePriceFill,
+        minutePriceFill,
+        minuteExitTrigger,
         regimeStates,
         regimeMinScore,
         params: strategyParams,
@@ -1123,7 +1132,8 @@ export function StrategyBacktest() {
       overrides: requestOverrides,
       mode: simMode,
       holding_days: Number(holdingDays) || 5,
-      minute_fill: highGranularity,
+      minute_price_fill: minutePriceFill,
+      minute_exit_trigger: minuteExitTrigger,
       regime_filter: regimeStates.length > 0 || regimeMinScore !== ''
         ? {
             ...(regimeStates.length > 0 ? { states: regimeStates } : {}),
@@ -1293,9 +1303,10 @@ export function StrategyBacktest() {
   const minuteExitTriggerSupported = effectiveExitSignals.length > 0 && unsupportedMinuteExitSignals.length === 0
 
   useEffect(() => {
-    if (highGranularity && minuteExitTriggerSupported) return
-    if (exitFill === 'signal_next_minute') setExitFill('close_t')
-  }, [exitFill, highGranularity, minuteExitTriggerSupported])
+    if (!caps || !detail) return
+    if (hasMinuteBatch && minuteExitTriggerSupported) return
+    if (minuteExitTrigger) setMinuteExitTrigger(false)
+  }, [caps, detail, hasMinuteBatch, minuteExitTrigger, minuteExitTriggerSupported])
 
   const scoring = useMemo(() => (overrides.scoring ?? {}) as Record<string, number>, [overrides.scoring])
   const scoringDirections = useMemo(
@@ -1400,39 +1411,57 @@ export function StrategyBacktest() {
         <div>
           <div className="flex items-center justify-between mb-1.5">
             <label className="text-xs font-medium text-secondary">选择策略</label>
-            {/* 分钟K成交 */}
-            <div className="flex items-center gap-1">
-              <Gauge className={`h-3 w-3 ${highGranularity ? 'text-amber-400' : 'text-muted/50'}`} />
-              <button
-                onClick={toggleMinuteFill}
-                disabled={!hasMinuteBatch}
-                title={!hasMinuteBatch
-                  ? '分钟K成交价：分钟K(批量)数据不可用'
-                  : '分钟K成交：细化成交价，并为兼容的卖出信号提供下一分钟成交。'
-                }
-                className={`group relative inline-flex h-3.5 w-6 items-center rounded-full shrink-0 transition-colors duration-200 ${
-                  !hasMinuteBatch ? 'bg-elevated opacity-50 cursor-not-allowed'
-                  : highGranularity ? 'bg-amber-500 cursor-pointer'
-                  : 'bg-elevated cursor-pointer'
-                }`}
-              >
-                <span className={`inline-block h-2.5 w-2.5 rounded-full bg-white shadow-sm transition-transform duration-200 ${
-                  highGranularity ? 'translate-x-[13px]' : 'translate-x-0.5'
-                }`} />
-              </button>
-              <span className={`text-[9px] font-medium ${highGranularity ? 'text-amber-400' : 'text-muted/50'}`}>分钟成交</span>
+            <div className="flex items-center gap-2">
+              <div className="flex items-center gap-1">
+                <Gauge className={`h-3 w-3 ${minutePriceFill ? 'text-amber-400' : 'text-muted/50'}`} />
+                <button
+                  type="button"
+                  onClick={toggleMinutePriceFill}
+                  disabled={!hasMinuteBatch}
+                  title={!hasMinuteBatch ? '分钟K(批量)数据不可用' : '用首分钟开盘或末分钟收盘作为成交价'}
+                  className={`group relative inline-flex h-3.5 w-6 items-center rounded-full shrink-0 transition-colors duration-200 ${
+                    !hasMinuteBatch ? 'bg-elevated opacity-50 cursor-not-allowed'
+                    : minutePriceFill ? 'bg-amber-500 cursor-pointer'
+                    : 'bg-elevated cursor-pointer'
+                  }`}
+                >
+                  <span className={`inline-block h-2.5 w-2.5 rounded-full bg-white shadow-sm transition-transform duration-200 ${
+                    minutePriceFill ? 'translate-x-[13px]' : 'translate-x-0.5'
+                  }`} />
+                </button>
+                <span className={`text-[9px] font-medium ${minutePriceFill ? 'text-amber-400' : 'text-muted/50'}`}>分钟价格</span>
+              </div>
+              <div className="flex items-center gap-1">
+                <Zap className={`h-3 w-3 ${minuteExitTrigger ? 'text-accent' : 'text-muted/50'}`} />
+                <button
+                  type="button"
+                  onClick={toggleMinuteExitTrigger}
+                  disabled={!hasMinuteBatch || !minuteExitTriggerSupported}
+                  title={!minuteExitTriggerSupported ? '当前卖出信号不支持分钟触发回放' : '分钟收盘确认卖点，下一分钟开盘卖出'}
+                  className={`group relative inline-flex h-3.5 w-6 items-center rounded-full shrink-0 transition-colors duration-200 ${
+                    !hasMinuteBatch || !minuteExitTriggerSupported ? 'bg-elevated opacity-50 cursor-not-allowed'
+                    : minuteExitTrigger ? 'bg-accent cursor-pointer'
+                    : 'bg-elevated cursor-pointer'
+                  }`}
+                >
+                  <span className={`inline-block h-2.5 w-2.5 rounded-full bg-white shadow-sm transition-transform duration-200 ${
+                    minuteExitTrigger ? 'translate-x-[13px]' : 'translate-x-0.5'
+                  }`} />
+                </button>
+                <span className={`text-[9px] font-medium ${minuteExitTrigger ? 'text-accent' : 'text-muted/50'}`}>分钟卖点</span>
+              </div>
               {!hasMinuteBatch && (
                 <span className="text-[8px] text-accent/70 font-medium bg-accent/10 px-1 py-px rounded">分钟K</span>
               )}
             </div>
           </div>
-          {/* 分钟K开启时的提示条 */}
-          {highGranularity && hasMinuteBatch && (
+          {(minutePriceFill || minuteExitTrigger) && hasMinuteBatch && (
             <div className="mb-2 flex items-start gap-1.5 rounded-btn border border-amber-400/30 bg-amber-400/5 px-2 py-1.5">
               <Zap className="h-3 w-3 text-amber-400 shrink-0 mt-px" />
               <div className="text-[10px] leading-snug text-amber-400/90">
-                <span className="font-medium">分钟K成交价</span>
-                ：默认在成交日细化穿越价/VWAP；选择“信号触发卖出”时，会对兼容的卖出信号做分钟回放。需本地有足够的分钟K历史。
+                {minutePriceFill && <span>分钟价格按成交口径读取；</span>}
+                {minuteExitTrigger && <span>分钟卖点按收盘确认、下一分钟开盘成交；</span>}
+                两项互不依赖，均要求目标区间分钟K完整。
               </div>
             </div>
           )}
@@ -1633,14 +1662,11 @@ export function StrategyBacktest() {
             <label className="mb-1.5 block text-xs font-medium text-secondary">清仓口径</label>
             <select
               value={exitFill}
-              onChange={e => setExitFill(e.target.value as 'close_t' | 'open_t+1' | 'signal_next_minute')}
+              onChange={e => setExitFill(e.target.value as 'close_t' | 'open_t+1')}
               className={INPUT_CLS}
             >
               <option value="close_t">信号日收盘（推荐）</option>
               <option value="open_t+1">次日开盘</option>
-              {highGranularity && minuteExitTriggerSupported && (
-                <option value="signal_next_minute">信号触发卖出 BETA</option>
-              )}
             </select>
           </div>
           {(entryFill === 'close_t' || exitFill === 'close_t') && (
@@ -1649,12 +1675,12 @@ export function StrategyBacktest() {
               <span>信号日收盘仅适合收盘前已确认的信号</span>
             </div>
           )}
-          {exitFill === 'signal_next_minute' && (
+          {minuteExitTrigger && (
             <div className="col-span-2 text-[10px] leading-4 text-accent">
               分钟收盘确认卖出信号后，按下一分钟开盘成交；尾盘或分钟数据缺失时顺延到下一交易日开盘
             </div>
           )}
-          {highGranularity && effectiveExitSignals.length > 0 && !minuteExitTriggerSupported && (
+          {effectiveExitSignals.length > 0 && !minuteExitTriggerSupported && (
             <div className="col-span-2 flex items-start gap-1 text-[10px] leading-4 text-muted">
               <AlertTriangle className="mt-0.5 h-3 w-3 shrink-0" />
               <span>当前卖出信号暂不支持分钟触发回放</span>

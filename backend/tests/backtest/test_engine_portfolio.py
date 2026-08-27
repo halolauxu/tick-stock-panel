@@ -476,7 +476,7 @@ def test_minute_fill_loads_only_actual_trade_pairs_and_releases_each_day():
         exits,
         MatcherConfig(
             matching="close_t",
-            minute_fill=True,
+            minute_price_fill=True,
             fees_pct=0,
             slippage_bps=0,
             max_positions=1,
@@ -506,7 +506,7 @@ def test_minute_fill_missing_actual_trade_pair_fails_closed():
             _mask(panel, set()),
             MatcherConfig(
                 matching="close_t",
-                minute_fill=True,
+                minute_price_fill=True,
                 minute_fill_require_complete=True,
                 fees_pct=0,
                 slippage_bps=0,
@@ -558,8 +558,9 @@ def test_minute_signal_exit_fills_at_next_minute_open():
         exits,
         MatcherConfig(
             entry_fill="open_t+1",
-            exit_fill="signal_next_minute",
-            minute_fill=True,
+            exit_fill="close_t",
+            minute_price_fill=False,
+            minute_exit_trigger=True,
             fees_pct=0,
             slippage_bps=0,
             max_positions=1,
@@ -572,6 +573,7 @@ def test_minute_signal_exit_fills_at_next_minute_open():
     assert result.trades[0].exit_date == "2024-01-03"
     assert result.trades[0].exit_price == 9.7
     assert result.trades[0].exit_signal_id == "signal_ma20_breakdown"
+    assert result.trades[0].entry_price == 10.0
 
 
 def test_minute_signal_exit_without_next_bar_falls_back_to_next_open():
@@ -593,8 +595,9 @@ def test_minute_signal_exit_without_next_bar_falls_back_to_next_open():
         exits,
         MatcherConfig(
             entry_fill="open_t+1",
-            exit_fill="signal_next_minute",
-            minute_fill=True,
+            exit_fill="close_t",
+            minute_price_fill=False,
+            minute_exit_trigger=True,
             fees_pct=0,
             slippage_bps=0,
             max_positions=1,
@@ -607,6 +610,197 @@ def test_minute_signal_exit_without_next_bar_falls_back_to_next_open():
     assert result.trades[0].exit_date == "2024-01-04"
     assert result.trades[0].exit_price == 8.8
     assert result.stats["execution"]["sell_minute_trigger_fallback"] == 1
+
+
+def test_minute_price_open_fill_is_independent_from_fill_day_close():
+    panel = _panel(
+        ["A"],
+        days=3,
+        overrides={
+            ("A", 1): {"open": 10.0, "high": 50.0, "low": 9.0, "close": 40.0},
+        },
+    )
+    minute = pl.DataFrame({
+        "symbol": ["A", "A"],
+        "datetime": [datetime(2024, 1, 2, 9, 30), datetime(2024, 1, 2, 15, 0)],
+        "open": [10.2, 40.0],
+        "high": [10.3, 50.0],
+        "low": [10.1, 39.0],
+        "close": [10.25, 40.0],
+        "volume": [100.0, 100.0],
+        "amount": [1025.0, 4000.0],
+    })
+
+    result = BacktestEngine(repo=_MinuteRepo(minute)).simulate_portfolio(
+        panel,
+        _mask(panel, {("A", 0)}),
+        _mask(panel, set()),
+        MatcherConfig(
+            entry_fill="open_t+1",
+            exit_fill="close_t",
+            minute_price_fill=True,
+            fees_pct=0,
+            slippage_bps=0,
+            max_positions=1,
+            initial_capital=100_000,
+        ),
+    )
+
+    assert result.trades[0].entry_price == 10.2
+
+
+def test_minute_signal_exit_precedes_later_stop_loss():
+    panel, entries, exits = _minute_trigger_panel()
+    minute = pl.DataFrame({
+        "symbol": ["A"] * 5,
+        "datetime": [
+            datetime(2024, 1, 2, 9, 30),
+            datetime(2024, 1, 3, 9, 30),
+            datetime(2024, 1, 3, 9, 31),
+            datetime(2024, 1, 3, 9, 32),
+            datetime(2024, 1, 3, 9, 33),
+        ],
+        "open": [10.0, 10.2, 9.8, 9.7, 9.2],
+        "high": [10.0, 10.3, 9.9, 9.8, 9.3],
+        "low": [10.0, 10.1, 9.7, 9.6, 8.5],
+        "close": [10.0, 9.9, 9.8, 9.7, 8.8],
+        "volume": [100.0] * 5,
+        "amount": [1000.0, 990.0, 980.0, 970.0, 880.0],
+    })
+
+    result = BacktestEngine(repo=_MinuteRepo(minute)).simulate_portfolio(
+        panel,
+        entries,
+        exits,
+        MatcherConfig(
+            entry_fill="open_t+1",
+            exit_fill="close_t",
+            minute_price_fill=False,
+            minute_exit_trigger=True,
+            stop_loss_pct=0.1,
+            fees_pct=0,
+            slippage_bps=0,
+            max_positions=1,
+            initial_capital=100_000,
+        ),
+        exit_signal_ids=["signal_ma20_breakdown"],
+    )
+
+    assert result.trades[0].exit_reason == "signal"
+    assert result.trades[0].exit_price == 9.8
+
+
+def test_independent_minute_signal_exit_precedes_later_stop_loss():
+    panel, entries, exits = _minute_trigger_panel()
+    minute = pl.DataFrame({
+        "symbol": ["A"] * 5,
+        "datetime": [
+            datetime(2024, 1, 2, 9, 30),
+            datetime(2024, 1, 3, 9, 30),
+            datetime(2024, 1, 3, 9, 31),
+            datetime(2024, 1, 3, 9, 32),
+            datetime(2024, 1, 3, 9, 33),
+        ],
+        "open": [10.0, 10.2, 9.8, 9.7, 9.2],
+        "high": [10.0, 10.3, 9.9, 9.8, 9.3],
+        "low": [10.0, 10.1, 9.7, 9.6, 8.5],
+        "close": [10.0, 9.9, 9.8, 9.7, 8.8],
+        "volume": [100.0] * 5,
+        "amount": [1000.0, 990.0, 980.0, 970.0, 880.0],
+    })
+
+    result = BacktestEngine(repo=_MinuteRepo(minute)).simulate_independent_candidates(
+        panel,
+        entries,
+        exits,
+        MatcherConfig(
+            entry_fill="open_t+1",
+            exit_fill="close_t",
+            minute_price_fill=False,
+            minute_exit_trigger=True,
+            stop_loss_pct=0.1,
+            fees_pct=0,
+            slippage_bps=0,
+        ),
+        exit_signal_ids=["signal_ma20_breakdown"],
+    )
+
+    assert result.trades[0].exit_reason == "signal"
+    assert result.trades[0].exit_price == 9.8
+
+
+def test_afternoon_minute_exit_cannot_fund_same_day_open_buy():
+    panel = _panel(["A", "B"], days=4).with_columns([
+        pl.when(pl.col("symbol") == "A")
+        .then(pl.lit(10.0))
+        .otherwise(pl.lit(None, dtype=pl.Float64))
+        .alias("ma20"),
+        pl.when((pl.col("symbol") == "A") & (pl.col("date") == date(2024, 1, 3)))
+        .then(pl.lit(True))
+        .otherwise(pl.lit(False))
+        .alias("signal_ma20_breakdown"),
+    ])
+    minute = pl.DataFrame({
+        "symbol": ["A", "A", "A"],
+        "datetime": [
+            datetime(2024, 1, 3, 14, 0),
+            datetime(2024, 1, 3, 14, 1),
+            datetime(2024, 1, 3, 14, 2),
+        ],
+        "open": [10.2, 10.1, 9.8],
+        "high": [10.3, 10.2, 9.9],
+        "low": [10.1, 9.8, 9.7],
+        "close": [10.2, 9.9, 9.8],
+        "volume": [100.0] * 3,
+        "amount": [1020.0, 990.0, 980.0],
+    })
+
+    result = BacktestEngine(repo=_MinuteRepo(minute)).simulate_portfolio(
+        panel,
+        _mask(panel, {("A", 0), ("B", 1)}),
+        _mask(panel, {("A", 2)}),
+        MatcherConfig(
+            entry_fill="open_t+1",
+            exit_fill="close_t",
+            minute_price_fill=False,
+            minute_exit_trigger=True,
+            fees_pct=0,
+            slippage_bps=0,
+            max_positions=1,
+            initial_capital=100_000,
+        ),
+        exit_signal_ids=["signal_ma20_breakdown"],
+    )
+
+    assert {trade.symbol for trade in result.trades} == {"A"}
+
+
+def test_close_entry_does_not_use_pre_entry_high_for_trailing_stop():
+    panel = _panel(
+        ["A"],
+        days=3,
+        overrides={
+            ("A", 0): {"open": 10.0, "high": 20.0, "low": 9.5, "close": 10.0},
+            ("A", 1): {"open": 10.0, "high": 10.0, "low": 9.5, "close": 10.0},
+        },
+    )
+
+    result = _engine().simulate_portfolio(
+        panel,
+        _mask(panel, {("A", 0)}),
+        _mask(panel, set()),
+        MatcherConfig(
+            entry_fill="close_t",
+            exit_fill="close_t",
+            trailing_stop_pct=0.1,
+            fees_pct=0,
+            slippage_bps=0,
+            max_positions=1,
+            initial_capital=100_000,
+        ),
+    )
+
+    assert result.trades[0].exit_reason == "end"
 
 
 def test_paper_mode_keeps_position_open_at_latest_complete_day():

@@ -125,6 +125,8 @@ export const storage = {
     mode: 'position' | 'full'
     holdingDays: string
     minuteFill?: boolean
+    minutePriceFill?: boolean
+    minuteExitTrigger?: boolean
     regimeStates?: string[]
     regimeMinScore?: number | ''
     params?: Record<string, any>

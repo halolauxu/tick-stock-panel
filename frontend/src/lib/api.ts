@@ -2598,6 +2598,8 @@ export const api = {
     position_sizing?: 'equal' | 'score_weight'
     asset_type?: 'stock' | 'etf' | 'index'
     minute_fill?: boolean
+    minute_price_fill?: boolean | null
+    minute_exit_trigger?: boolean | null
   }) =>
     request<StrategyBacktestResult>('/api/backtest/strategy/run', {
       method: 'POST',

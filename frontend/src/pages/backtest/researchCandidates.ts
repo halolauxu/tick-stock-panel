@@ -16,6 +16,7 @@ const STRATEGY_CONFIG_FIELDS = [
   'entry_fill', 'exit_fill', 'fees_pct', 'commission_pct', 'stamp_tax_pct',
   'slippage_bps', 'max_positions', 'max_exposure_pct', 'initial_capital',
   'position_sizing', 'mode', 'holding_days', 'asset_type', 'minute_fill',
+  'minute_price_fill', 'minute_exit_trigger',
   'regime_filter',
 ] as const
 
