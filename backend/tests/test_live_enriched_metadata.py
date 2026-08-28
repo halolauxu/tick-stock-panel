@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+import threading
 from datetime import timedelta
 from pathlib import Path
+from unittest.mock import MagicMock
 
 import polars as pl
 
 from app.market_time import cn_today
+from app.services.quote_service import QuoteService
 from app.strategy.engine import StrategyEngine
 from app.strategy.monitor import MonitorRuleEngine
 from app.tickflow.repository import DataStore, KlineRepository
@@ -59,6 +62,22 @@ def test_live_enriched_cache_keeps_instrument_metadata_without_persisting_it(tmp
     assert "name" not in persisted.columns
     assert "total_shares" not in persisted.columns
     assert "float_shares" not in persisted.columns
+
+
+def test_watchlist_partial_enriched_is_read_from_memory_without_replacing_repo_cache():
+    svc = QuoteService.__new__(QuoteService)
+    svc._lock = threading.Lock()
+    svc._repo = MagicMock()
+    partial = _live_row("600000.SH", 10.0)
+    full = pl.concat([partial, _live_row("000001.SZ", 12.0)])
+    svc._partial_enriched_cache = {"stock": (partial, cn_today())}
+    svc._repo.get_enriched_latest.return_value = (full, cn_today())
+
+    current, current_date = svc.get_enriched_today()
+
+    assert current_date == cn_today()
+    assert current["symbol"].to_list() == ["600000.SH"]
+    svc._repo.get_enriched_latest.assert_not_called()
 
 
 def test_history_strategy_monitor_keeps_live_row_with_exclude_st_enabled(tmp_path):

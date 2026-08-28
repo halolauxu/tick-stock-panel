@@ -1923,6 +1923,18 @@ class KlineRepository:
             return []
 
     def _latest_enriched_date_duckdb(self) -> date | None:
+        # 不能仅取 max(date)：少量自选实时行情可能留下当日局部快照，若把它
+        # 作为全市场最新日，行业/概念/连板都会只看到几只股票。
+        try:
+            from app.services.data_integrity import latest_complete_partition_date
+
+            complete = latest_complete_partition_date(
+                self.store.data_dir, "kline_daily_enriched",
+            )
+            if complete is not None:
+                return complete
+        except Exception as e:  # noqa: BLE001
+            logger.warning("latest complete enriched date detection failed: %s", e)
         try:
             with self._lock:
                 res = self.db.execute(

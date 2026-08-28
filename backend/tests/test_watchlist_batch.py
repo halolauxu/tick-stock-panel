@@ -1,5 +1,7 @@
 """回归测试: Free 档自选实时 symbols 超过 capability batch 上限时分批请求 (PR #46 问题 4)。"""
+import threading
 from contextlib import ExitStack
+from datetime import date
 from unittest.mock import MagicMock, patch
 
 import polars as pl
@@ -13,7 +15,8 @@ def _make_svc(engine_rules: dict) -> QuoteService:
     svc = QuoteService.__new__(QuoteService)
     svc._app_state = MagicMock()
     svc._repo = MagicMock()
-    svc._lock = MagicMock()
+    svc._lock = threading.Lock()
+    svc._partial_enriched_cache = {}
 
     engine = MagicMock()
     engine.rules = engine_rules
@@ -121,3 +124,56 @@ def test_watchlist_no_index_rules_no_extra_symbols():
     # 2 symbols / batch 5 → 1 批
     assert tf.quotes.get.call_count == 1
     assert tf.quotes.get.call_args_list[0][1]["symbols"] == ["600000.SH", "600001.SH"]
+
+
+def test_watchlist_quotes_remain_process_local_and_do_not_publish_market_partition():
+    """少量自选快照不能写入全市场 daily/enriched 分区。"""
+    svc = _make_svc({})
+    tf = MagicMock()
+    tf.quotes.get.return_value = [
+        {"symbol": "600000.SH", "last_price": 10.0, "prev_close": 9.9, "ext": {}},
+    ]
+    capset = CapabilitySet({Cap.QUOTE_BY_SYMBOL: CapabilityLimits(batch=5, rpm=60)})
+    daily = pl.DataFrame({
+        "symbol": ["600000.SH"],
+        "date": [date(2026, 8, 28)],
+        "open": [10.0],
+        "high": [10.0],
+        "low": [10.0],
+        "close": [10.0],
+        "volume": [100.0],
+        "amount": [1000.0],
+    })
+
+    with ExitStack() as stack:
+        stack.enter_context(patch(
+            "app.services.preferences.get_realtime_watchlist_symbols",
+            return_value=["600000.SH"],
+        ))
+        stack.enter_context(patch(
+            "app.tickflow.client.get_paid_realtime_client", return_value=tf,
+        ))
+        stack.enter_context(patch(
+            "app.tickflow.policy.detect_capabilities", return_value=capset,
+        ))
+        stack.enter_context(patch("app.tickflow.rate_limits.sleep_between_batches"))
+        stack.enter_context(patch.object(
+            QuoteService, "_build_daily",
+            side_effect=[daily, pl.DataFrame(), pl.DataFrame()],
+        ))
+        stack.enter_context(patch.object(
+            QuoteService, "_build_quote_extra", return_value=pl.DataFrame(),
+        ))
+        stack.enter_context(patch.object(
+            QuoteService, "_build_index_quotes", return_value=pl.DataFrame(),
+        ))
+        flush = stack.enter_context(patch.object(QuoteService, "_flush_live_enriched"))
+        stack.enter_context(patch.object(QuoteService, "_broadcast_quote_updated"))
+        stack.enter_context(patch.object(QuoteService, "_evaluate_monitors"))
+        stack.enter_context(patch("app.services.quote_service._persist_last_fetch"))
+        svc._fetch_watchlist_quotes()
+
+    svc._repo.merge_live_daily_asset.assert_not_called()
+    flush.assert_called_once()
+    assert flush.call_args.kwargs["asset_type"] == "stock"
+    assert flush.call_args.kwargs["persist"] is False

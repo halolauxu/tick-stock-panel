@@ -125,9 +125,9 @@ def _safe_aggregate(repo, view: str) -> dict | None:
 
 
 def _safe_aggregate_daily(repo, view: str = "kline_daily") -> dict | None:
-    """日K轻量统计 — 零数据扫描。
+    """日K轻量统计 — 仅窄读近期分区的 symbol 列校验覆盖度。
 
-    从分区目录名获取日期范围和交易日数，不读任何 parquet。
+    从分区目录名获取日期范围和交易日数；最新日需通过覆盖度门禁。
     标的数从 instruments 小表获取（~5000行，毫秒级）。
     """
     daily_dir = repo.store.data_dir / "kline_daily"
@@ -141,22 +141,27 @@ def _safe_aggregate_daily(repo, view: str = "kline_daily") -> dict | None:
         return None
     dates.sort()
 
+    from app.services.data_integrity import latest_complete_partition_date
+    latest_complete = latest_complete_partition_date(repo.store.data_dir, "kline_daily")
+    latest_date = latest_complete.isoformat() if latest_complete else dates[-1]
+    complete_dates = [day for day in dates if day <= latest_date]
+
     symbols = _count_instruments_symbols(repo)
 
     return {
         "rows": 0,
-        "earliest_date": dates[0],
-        "latest_date": dates[-1],
+        "earliest_date": complete_dates[0],
+        "latest_date": latest_date,
         "symbols_covered": symbols,
-        "trading_days": len(dates),
+        "trading_days": len(complete_dates),
     }
 
 
 def _safe_aggregate_enriched(repo) -> dict | None:
-    """Enriched 轻量统计 — 零数据扫描。
+    """Enriched 轻量统计 — 仅窄读近期分区的 symbol 列校验覆盖度。
 
     字段数从 DESCRIBE 读 schema（不碰数据），毫秒级。
-    日期范围从分区目录名获取（同 minute 策略），不读任何 parquet。
+    日期范围从分区目录名获取（同 minute 策略），最新日需通过覆盖度门禁。
     标的数从 instruments 小表取。
     """
     # 字段数：读 schema，不碰数据
@@ -179,15 +184,22 @@ def _safe_aggregate_enriched(repo) -> dict | None:
         return None
     dates.sort()
 
+    from app.services.data_integrity import latest_complete_partition_date
+    latest_complete = latest_complete_partition_date(
+        repo.store.data_dir, "kline_daily_enriched",
+    )
+    latest_date = latest_complete.isoformat() if latest_complete else dates[-1]
+    complete_dates = [day for day in dates if day <= latest_date]
+
     symbols = _count_instruments_symbols(repo)
 
     return {
         "rows": 0,
         "fields": fields,
-        "earliest_date": dates[0],
-        "latest_date": dates[-1],
+        "earliest_date": complete_dates[0],
+        "latest_date": latest_date,
         "symbols_covered": symbols,
-        "trading_days": len(dates),
+        "trading_days": len(complete_dates),
     }
 
 

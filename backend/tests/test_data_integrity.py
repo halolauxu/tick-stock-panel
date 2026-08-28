@@ -18,6 +18,7 @@ from app.services.data_integrity import (
     _is_snapshot,
     _quote_ts_max_ms,
     earliest_issue_day,
+    latest_complete_partition_date,
     prune_enriched_partitions,
     scan_recent_integrity,
     within_auto_repair_window,
@@ -112,6 +113,60 @@ def test_today_partition_is_never_flagged(tmp_path):
     _write_daily_partition(tmp_path, "kline_daily", FRIDAY, None)
     _write_daily_partition(tmp_path, "kline_daily", TODAY, _ts_ms(TODAY, time(9, 45)))
     assert scan_recent_integrity(tmp_path, today=TODAY) == []
+
+
+def test_low_coverage_today_is_flagged_for_post_close_pipeline(tmp_path):
+    full_symbols = tuple(f"{i:06d}.SH" for i in range(200))
+    partial_symbols = full_symbols[:5]
+    _write_daily_partition(tmp_path, "kline_daily", FRIDAY, None, full_symbols)
+    _write_daily_partition(tmp_path, "kline_daily", TODAY, None, partial_symbols)
+
+    # 盘中/开机门禁默认不检查今天，避免把尚未收盘的合法实时快照误报。
+    assert scan_recent_integrity(tmp_path, today=TODAY) == []
+
+    # 盘后管线必须检查今天，并把 5/200 的分区判为覆盖不足。
+    issues = scan_recent_integrity(tmp_path, today=TODAY, include_today=True)
+    assert [(i.day, i.table, i.kind) for i in issues] == [
+        (TODAY, "kline_daily", "coverage"),
+    ]
+    assert latest_complete_partition_date(tmp_path, "kline_daily") == FRIDAY
+
+
+def test_low_coverage_enriched_partition_falls_back_to_previous_complete_day(tmp_path):
+    full_symbols = tuple(f"{i:06d}.SH" for i in range(200))
+    partial_symbols = full_symbols[:5]
+    _write_daily_partition(
+        tmp_path, "kline_daily_enriched", FRIDAY, None, full_symbols,
+    )
+    _write_daily_partition(
+        tmp_path, "kline_daily_enriched", TODAY, None, partial_symbols,
+    )
+
+    issues = scan_recent_integrity(tmp_path, today=TODAY, include_today=True)
+    assert [(i.day, i.table, i.kind) for i in issues] == [
+        (TODAY, "kline_daily_enriched", "coverage"),
+    ]
+    assert latest_complete_partition_date(
+        tmp_path, "kline_daily_enriched",
+    ) == FRIDAY
+
+
+def test_data_card_excludes_trailing_low_coverage_partition_from_day_count(tmp_path):
+    from app.api.data import _safe_aggregate_daily
+
+    full_symbols = tuple(f"{i:06d}.SH" for i in range(200))
+    _write_daily_partition(tmp_path, "kline_daily", FRIDAY, None, full_symbols)
+    _write_daily_partition(tmp_path, "kline_daily", TODAY, None, full_symbols[:5])
+    repo = SimpleNamespace(
+        store=SimpleNamespace(data_dir=tmp_path),
+        execute_one=lambda sql: (len(full_symbols),),
+    )
+
+    stats = _safe_aggregate_daily(repo)
+
+    assert stats is not None
+    assert stats["latest_date"] == FRIDAY.isoformat()
+    assert stats["trading_days"] == 1
 
 
 def test_missing_tail_day_flagged(tmp_path):
@@ -278,6 +333,8 @@ def test_realtime_gate_blocks_on_snapshot_and_launches_repair(tmp_path, monkeypa
         data_integrity, "launch_integrity_repair",
         lambda state, day, reason: (launched.append((day, reason)) or ("job-x", True)),
     )
+    # 本用例验证门禁行为，不应随测试运行日推进而超出自动修复窗口。
+    monkeypatch.setattr(data_integrity, "within_auto_repair_window", lambda day: True)
     saved = {}
     monkeypatch.setattr(
         "app.services.preferences.save", lambda payload: saved.update(payload),
@@ -430,3 +487,51 @@ def test_pipeline_self_heals_snapshot_day(tmp_path, monkeypatch):
     )
     assert enriched_left == [f"date={yesterday.isoformat()}", f"date={today.isoformat()}"]
     assert result["enriched_days"] > 0
+
+
+def test_pipeline_rebuilds_enriched_when_only_latest_partition_has_low_coverage(
+    tmp_path, monkeypatch,
+):
+    """原始日K完整但 enriched 只有自选股时，也必须删除并全量重算当日。"""
+    from app.config import settings as app_settings
+    from app.jobs import daily_pipeline
+    from app.services import instrument_sync, kline_sync
+    from app.tickflow.repository import DataStore, KlineRepository
+
+    today = datetime.now(CN_TZ).date()
+    previous = today - timedelta(days=1)
+    while previous.weekday() >= 5:
+        previous -= timedelta(days=1)
+
+    full_symbols = tuple(f"{i:06d}.SH" for i in range(200))
+    _write_daily_partition(tmp_path, "kline_daily", previous, None, full_symbols)
+    _write_daily_partition(tmp_path, "kline_daily", today, None, full_symbols)
+    _write_daily_partition(
+        tmp_path, "kline_daily_enriched", previous, None, full_symbols,
+    )
+    _write_daily_partition(
+        tmp_path, "kline_daily_enriched", today, None, full_symbols[:5],
+    )
+
+    monkeypatch.setattr(instrument_sync, "sync_instruments", lambda data_dir: 0)
+    monkeypatch.setattr(app_settings, "data_dir", tmp_path)
+
+    batch_calls: list[date] = []
+
+    def _fake_batch(universe, repo, capset, start_date=None, end_date=None, on_chunk_done=None):
+        batch_calls.append(start_date.date())
+        return 0
+
+    monkeypatch.setattr(kline_sync, "sync_and_persist_daily_batch", _fake_batch)
+
+    repo = KlineRepository(DataStore(tmp_path))
+    capset = SimpleNamespace(has=lambda key: False)
+    result = daily_pipeline.run_now(repo, capset)  # type: ignore[arg-type]
+
+    assert batch_calls == [today]
+    assert result["integrity_repair_from"] == today.isoformat()
+    assert result["integrity_issues"] >= 1
+    rebuilt = pl.read_parquet(
+        tmp_path / "kline_daily_enriched" / f"date={today.isoformat()}" / "part.parquet"
+    )
+    assert rebuilt["symbol"].n_unique() == len(full_symbols)

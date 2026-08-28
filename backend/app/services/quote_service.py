@@ -213,6 +213,9 @@ class QuoteService:
         self._index_symbol_count: int = 0
         self._etf_symbol_count: int = 0
         self._index_quotes_cache: pl.DataFrame | None = None
+        # 自选实时是局部行情，只能存在于进程内，不能发布成全市场日分区。
+        # 按资产类型保存本轮计算后的 enriched，供自选、监控和模拟交易读取。
+        self._partial_enriched_cache: dict[str, tuple[pl.DataFrame, date]] = {}
         self._intraday_signal_evaluator = IntradaySignalEvaluator()
         self._intraday_signal_bucket: dict[str, str] = {}
         # 午休/收盘最终同步状态: 到边界后必须成功拉取一版行情, 再进入休盘态。
@@ -273,6 +276,8 @@ class QuoteService:
         if self._thread:
             self._thread.join(timeout=10)
             self._thread = None
+        with self._lock:
+            self._partial_enriched_cache.clear()
 
     def enable(self) -> bool:
         """开启自动行情 (不立即启动线程，等下一个交易时段)。
@@ -482,9 +487,29 @@ class QuoteService:
 
         所有页面统一通过此方法获取实时行情 + 技术指标。
         """
+        with self._lock:
+            partial = self._partial_enriched_cache.get("stock")
+            if partial is not None and partial[1] == cn_today():
+                return partial[0].clone(), partial[1]
         if not self._repo:
             return pl.DataFrame(), None
         return self._repo.get_enriched_latest()
+
+    def _get_enriched_asset_today(self, asset_type: str) -> tuple[pl.DataFrame, date | None]:
+        # 兼容最小化测试桩/旧调用方通过 __new__ 构造服务的场景；正式实例始终
+        # 在 __init__ 中拥有锁和局部缓存。
+        lock = getattr(self, "_lock", None)
+        partial_cache = getattr(self, "_partial_enriched_cache", {})
+        if lock is not None:
+            with lock:
+                partial = partial_cache.get(asset_type)
+        else:
+            partial = partial_cache.get(asset_type)
+        if partial is not None and partial[1] == cn_today():
+            return partial[0].clone(), partial[1]
+        if not self._repo:
+            return pl.DataFrame(), None
+        return self._repo.get_enriched_latest_asset(asset_type, refresh=False)
 
     def get_quotes_compat(self) -> pl.DataFrame:
         """兼容接口: 返回行情 DataFrame (用于盘中选股等需要 last_price/prev_close 的场景)。
@@ -992,27 +1017,23 @@ class QuoteService:
         daily_df = self._build_daily(stock_records)
         quote_extra = self._build_quote_extra(stock_records)
         if not daily_df.is_empty() and self._repo:
-            try:
-                self._repo.merge_live_daily_asset("stock", daily_df)
-            except Exception as e:  # noqa: BLE001
-                logger.warning("自选实时日K写盘失败: %s", e)
-            self._flush_live_enriched(daily_df, quote_extra, asset_type="stock", merge=True)
+            self._flush_live_enriched(
+                daily_df, quote_extra, asset_type="stock", merge=True, persist=False,
+            )
 
-        # ETF/指数进自选前5时按各自资产落盘, 不污染股票表
+        # ETF/指数进自选前5时同样只保存在进程内，不发布成资产族全量分区。
         etf_daily_df = self._build_daily(etf_records)
         if not etf_daily_df.is_empty() and self._repo:
-            try:
-                self._repo.merge_live_daily_asset("etf", etf_daily_df)
-            except Exception as e:  # noqa: BLE001
-                logger.warning("自选实时 ETF 日K写盘失败: %s", e)
-            self._flush_live_enriched(etf_daily_df, self._build_quote_extra(etf_records), asset_type="etf", merge=True)
+            self._flush_live_enriched(
+                etf_daily_df, self._build_quote_extra(etf_records),
+                asset_type="etf", merge=True, persist=False,
+            )
         index_daily_df = self._build_daily(index_records)
         if not index_daily_df.is_empty() and self._repo:
-            try:
-                self._repo.merge_live_daily_asset("index", index_daily_df)
-            except Exception as e:  # noqa: BLE001
-                logger.warning("自选实时指数日K写盘失败: %s", e)
-            self._flush_live_enriched(index_daily_df, self._build_quote_extra(index_records), asset_type="index", merge=True)
+            self._flush_live_enriched(
+                index_daily_df, self._build_quote_extra(index_records),
+                asset_type="index", merge=True, persist=False,
+            )
 
         self._broadcast_quote_updated()
         self._evaluate_monitors(daily_df, quote_extra)
@@ -1338,7 +1359,7 @@ class QuoteService:
                     # flush 焐热; 未焐热说明无 ETF 实时数据, 跳过本轮 ETF 评估)。
                     if engine.has_asset_rules("etf") and self._repo is not None:
                         try:
-                            etf_enriched, _ = self._repo.get_enriched_latest_asset("etf", refresh=False)
+                            etf_enriched, _ = self._get_enriched_asset_today("etf")
                             if not etf_enriched.is_empty():
                                 etf_enriched = self._inject_intraday_signals(etf_enriched, engine, "etf")
                                 rule_events = rule_events + engine.evaluate(
@@ -1351,7 +1372,7 @@ class QuoteService:
                     # (ETF 轮靠空表隐式跳过, 指数轮更显式, 行为等价)。
                     if engine.has_asset_rules("index") and self._repo is not None:
                         try:
-                            index_enriched, index_date = self._repo.get_enriched_latest_asset("index", refresh=False)
+                            index_enriched, index_date = self._get_enriched_asset_today("index")
                             if not index_enriched.is_empty() and index_date == cn_today():
                                 index_enriched = self._inject_intraday_signals(index_enriched, engine, "index")
                                 rule_events = rule_events + engine.evaluate(
@@ -1683,7 +1704,14 @@ class QuoteService:
     # enriched 增量计算
     # ================================================================
 
-    def _flush_live_enriched(self, daily_df: pl.DataFrame, quote_extra: pl.DataFrame = None, asset_type: str = "stock", merge: bool = False) -> None:
+    def _flush_live_enriched(
+        self,
+        daily_df: pl.DataFrame,
+        quote_extra: pl.DataFrame = None,
+        asset_type: str = "stock",
+        merge: bool = False,
+        persist: bool = True,
+    ) -> None:
         """增量计算今天的 enriched: 用昨天的递推状态 + 今天 OHLCV → 只算今天 5500 行。
 
         quote_extra: API 直接提供的补充字段 (prev_close, change_pct 等),
@@ -1804,10 +1832,20 @@ class QuoteService:
                 )
 
             # ---- 写盘 + 更新缓存 ----
-            if merge:
-                self._repo.merge_live_enriched_asset(asset_type, enriched_today)
+            if not persist:
+                with self._lock:
+                    self._partial_enriched_cache[asset_type] = (
+                        enriched_today.sort("symbol"), today,
+                    )
             else:
-                self._repo.flush_live_enriched_asset(asset_type, enriched_today)
+                # 已拿到全市场行情后，进程内的自选局部快照必须立即失效，
+                # 否则切换档位/模式后监控仍可能继续读旧的少量标的。
+                with self._lock:
+                    self._partial_enriched_cache.pop(asset_type, None)
+                if merge:
+                    self._repo.merge_live_enriched_asset(asset_type, enriched_today)
+                else:
+                    self._repo.flush_live_enriched_asset(asset_type, enriched_today)
 
             elapsed = time.perf_counter() - t0
             mode_label = "增量" if use_incremental else "全量"

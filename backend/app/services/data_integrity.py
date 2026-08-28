@@ -39,12 +39,21 @@ SCAN_WINDOW_DAYS = 7
 # 自动修复窗口: 最早坏日距今超过 N 个自然日 → 只报告不自动修 (更大缺口由用户手动 repair)
 AUTO_REPAIR_MAX_LAG_DAYS = 5
 
-# 参与检测的日K族表 (实时 flush 会写这三族的 daily/enriched)
-_DAILY_TABLES = ("kline_daily", "kline_etf_daily", "kline_index_daily")
+# 分区覆盖度低于近期正常分区的 98% 即视为不完整。A 股全市场日分区通常
+# 只有少量停牌/退市差异；这个阈值足以容忍正常变化，同时会拒绝把 5 只自选股
+# 快照误当成约 5500 只股票的全市场分区。
+MIN_PARTITION_COVERAGE_RATIO = 0.98
+MIN_COVERAGE_BASE_ROWS = 100
+
+# 参与检测的日K族表。股票 enriched 也必须单独检测：原始日K可能已被盘后
+# 管线修复，但 enriched 若只有少量自选股，按“日期已存在”仍会被错误跳过。
+_RAW_DAILY_TABLES = ("kline_daily", "kline_etf_daily", "kline_index_daily")
+_DAILY_TABLES = (*_RAW_DAILY_TABLES, "kline_daily_enriched")
 
 # 表 → 资产族 (用于管道/修复侧按族取起点)
 TABLE_FAMILY = {
     "kline_daily": "stock",
+    "kline_daily_enriched": "stock",
     "kline_etf_daily": "etf",
     "kline_index_daily": "index",
 }
@@ -54,7 +63,59 @@ TABLE_FAMILY = {
 class IntegrityIssue:
     day: date
     table: str
-    kind: str  # "snapshot"=盘中快照 | "missing"=分区缺失
+    kind: str  # "snapshot"=盘中快照 | "missing"=分区缺失 | "coverage"=覆盖不足
+
+
+def _partition_symbol_count(part_dir: Path) -> int:
+    """返回单日分区的唯一标的数；坏文件按 0 处理。"""
+    files = sorted(part_dir.glob("*.parquet"))
+    if not files:
+        return 0
+    try:
+        return int(
+            pl.scan_parquet([str(path) for path in files])
+            .select(pl.col("symbol").n_unique())
+            .collect()
+            .item()
+        )
+    except Exception as e:  # noqa: BLE001
+        logger.debug("partition coverage scan failed %s: %s", part_dir, e)
+        return 0
+
+
+def latest_complete_partition_date(
+    data_dir: Path,
+    table: str,
+    *,
+    lookback_partitions: int = 30,
+) -> date | None:
+    """返回最近一个达到近期正常覆盖度的分区日期。
+
+    只读取最近若干分区的 ``symbol`` 列。若数据集本身规模不足 100 行（例如
+    小型测试集或指数核心列表），不应用全市场覆盖阈值，保持原有最新日语义。
+    """
+    base = Path(data_dir) / table
+    if not base.exists():
+        return None
+    parts: list[tuple[date, Path]] = []
+    for part in base.glob("date=*"):
+        try:
+            parts.append((date.fromisoformat(part.name[5:]), part))
+        except ValueError:
+            continue
+    if not parts:
+        return None
+    parts.sort(key=lambda item: item[0])
+    recent = parts[-max(1, lookback_partitions):]
+    counts = {day: _partition_symbol_count(part) for day, part in recent}
+    baseline = max(counts.values(), default=0)
+    if baseline < MIN_COVERAGE_BASE_ROWS:
+        return recent[-1][0]
+    threshold = baseline * MIN_PARTITION_COVERAGE_RATIO
+    for day, _part in reversed(recent):
+        if counts.get(day, 0) >= threshold:
+            return day
+    return None
 
 
 def _quote_ts_max_ms(part_dir: Path) -> int | None:
@@ -108,10 +169,11 @@ def _is_snapshot(day: date, quote_ts_ms: int | None) -> bool:
     return ts.date() == day and ts.time() < CLOSE_CUTOFF
 
 
-def _candidate_days(today: date, lookback_days: int) -> list[date]:
-    """最近 lookback_days 自然日内、严格早于今天的工作日 (节假日近似, 误报无害)。"""
+def _candidate_days(today: date, lookback_days: int, *, include_today: bool = False) -> list[date]:
+    """最近自然日内的工作日；可让盘后管线同时检查当天覆盖度。"""
     days: list[date] = []
-    for offset in range(1, lookback_days + 1):
+    start = 0 if include_today else 1
+    for offset in range(start, lookback_days + 1):
         d = today - timedelta(days=offset)
         if d.weekday() < 5:
             days.append(d)
@@ -123,6 +185,7 @@ def scan_recent_integrity(
     *,
     today: date | None = None,
     lookback_days: int = SCAN_WINDOW_DAYS,
+    include_today: bool = False,
 ) -> list[IntegrityIssue]:
     """扫描最近交易日的数据完整性, 返回坏分区列表 (按日期升序)。
 
@@ -148,14 +211,31 @@ def scan_recent_integrity(
         if latest is None or latest < window_start:
             continue
 
-        for day in _candidate_days(today, lookback_days):
+        candidate_days = _candidate_days(today, lookback_days, include_today=include_today)
+        counts = {
+            day: _partition_symbol_count(base / f"date={day.isoformat()}")
+            for day in existing
+            if day >= window_start
+        }
+        coverage_baseline = max(counts.values(), default=0)
+        coverage_threshold = coverage_baseline * MIN_PARTITION_COVERAGE_RATIO
+
+        for day in candidate_days:
             if day not in existing:
                 # 只报"尾部缺口": 晚于本地最新分区的缺失日。
                 # 历史内部空洞是另一类问题(laggards), 已有独立告警, 不在此扩面。
-                if day > latest:
+                # enriched 的当天缺失是盘后计算前的正常状态，不单独报 missing；
+                # 它会在对应 raw daily 完成后由指标阶段生成。
+                if table in _RAW_DAILY_TABLES and day > latest:
                     issues.append(IntegrityIssue(day=day, table=table, kind="missing"))
                 continue
             part_dir = base / f"date={day.isoformat()}"
+            if (
+                coverage_baseline >= MIN_COVERAGE_BASE_ROWS
+                and counts.get(day, 0) < coverage_threshold
+            ):
+                issues.append(IntegrityIssue(day=day, table=table, kind="coverage"))
+                continue
             quote_ts = _quote_ts_max_ms(part_dir)
             if _is_snapshot(day, quote_ts):
                 issues.append(IntegrityIssue(day=day, table=table, kind="snapshot"))
@@ -219,7 +299,14 @@ def describe_issues(issues: list[IntegrityIssue]) -> str:
     days = sorted({i.day for i in issues})
     day_text = "、".join(d.isoformat() for d in days)
     kinds = {i.kind for i in issues}
-    reason = "停机前的盘中快照" if "snapshot" in kinds else "缺失"
+    reasons: list[str] = []
+    if "snapshot" in kinds:
+        reasons.append("停机前的盘中快照")
+    if "coverage" in kinds:
+        reasons.append("标的覆盖不足")
+    if "missing" in kinds:
+        reasons.append("缺失")
+    reason = "或".join(reasons) if reasons else "异常"
     return f"{day_text} 的数据为{reason}"
 
 

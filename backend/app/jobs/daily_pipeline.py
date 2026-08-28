@@ -161,16 +161,20 @@ def run_now(
     # 命中 → 本次管道放弃实时覆写分支, 降级为从最早坏日起的范围拉取。
     integrity_issues: list = []
     stale_day: _date | None = None
+    enriched_stale_day: _date | None = None
     etf_stale_day: _date | None = None
     index_stale_day: _date | None = None
     if override_start_date is None:
         try:
             from app.services import data_integrity
             integrity_issues = data_integrity.scan_recent_integrity(
-                repo.store.data_dir, today=today,
+                repo.store.data_dir, today=today, include_today=True,
             )
             if integrity_issues:
                 stale_day = data_integrity.earliest_issue_day(integrity_issues, ("kline_daily",))
+                enriched_stale_day = data_integrity.earliest_issue_day(
+                    integrity_issues, ("kline_daily_enriched",),
+                )
                 etf_stale_day = data_integrity.earliest_issue_day(integrity_issues, ("kline_etf_daily",))
                 index_stale_day = data_integrity.earliest_issue_day(integrity_issues, ("kline_index_daily",))
                 logger.warning(
@@ -275,7 +279,11 @@ def run_now(
     # 完整性修复时删除股票 enriched 的坏分区: 增量重算只算 enriched 里不存在
     # 的日期, 盘中快照日分区已存在(虽是错的), 不删永远不会被重算。删除后
     # Step 2 把这些日期当"新日期"重算 (剩余分区最近 60 天做历史前缀, 窗口 ≤5 天回看充足)。
-    repair_start = override_start_date if override_start_date is not None else stale_day
+    repair_candidates = [
+        day for day in (override_start_date, stale_day, enriched_stale_day)
+        if day is not None
+    ]
+    repair_start = min(repair_candidates) if repair_candidates else None
     if repair_start is not None:
         try:
             from app.services.data_integrity import prune_enriched_partitions
