@@ -91,7 +91,9 @@ const QUALITY_LABELS: Record<string, string> = {
 const EVENT_ICONS: Record<string, typeof Clock3> = {
   ACCOUNT_CREATED: WalletCards,
   SIGNAL_FROZEN: FileClock,
+  SIGNAL_SKIPPED: AlertTriangle,
   ORDER_PLANNED: ListChecks,
+  CAPITAL_CONTRIBUTION: WalletCards,
   PREFLIGHT_PASSED: ShieldCheck,
   FILLED: CheckCircle2,
   PARTIALLY_FILLED: CheckCircle2,
@@ -205,13 +207,9 @@ function Metric({ label, value, sub, tone }: { label: string; value: string; sub
 }
 
 function EventTimeline({ account, events }: { account: PaperTradingAccount; events: PaperTradingEvent[] }) {
-  if (!events.length) {
-    return <div className="py-10 text-center text-xs text-muted">今天还没有交易事件</div>
-  }
-
-  const today = events[0]?.occurred_at.slice(0, 10)
+  const today = account.system.beijing_time.slice(0, 10)
   const pendingOrders = account.orders.filter(order => (
-    ['PLANNED', 'PREFLIGHT_OK'].includes(order.status) && order.created_at.slice(0, 10) === today
+    ['PLANNED', 'PREFLIGHT_OK'].includes(order.status)
   ))
   const todayFills = account.fills.filter(fill => fill.executed_at.slice(0, 10) === today)
   const latestSettlement = events.find(event => (
@@ -224,6 +222,7 @@ function EventTimeline({ account, events }: { account: PaperTradingAccount; even
   const nextPlanDate = pendingOrders.map(order => order.scheduled_date).find(Boolean)
   const nextOpenOnly = pendingOrders.length > 0 && pendingOrders.every(order => order.planned_session === 'NEXT_OPEN')
   const fillFees = todayFills.reduce((sum, fill) => sum + fill.fee_amount, 0)
+  const skippedSignals = events.filter(event => event.event_type === 'SIGNAL_SKIPPED')
 
   const moments: {
     id: string
@@ -246,6 +245,19 @@ function EventTimeline({ account, events }: { account: PaperTradingAccount; even
       icon: ListChecks,
       tone: 'border-accent/35 bg-accent/10 text-accent',
       rows: pendingOrders.map(order => `${order.name || order.symbol} · ${order.side === 'BUY' ? '买入' : '卖出'} ${order.requested_qty.toLocaleString()} 股`),
+    })
+  }
+
+  if (skippedSignals.length) {
+    moments.push({
+      id: 'skipped-signals',
+      at: skippedSignals[0].occurred_at,
+      title: '策略有信号，但未形成订单',
+      detail: '候选信号已经冻结，风控未生成可执行数量',
+      badge: `${skippedSignals.length} 个`,
+      icon: AlertTriangle,
+      tone: 'border-amber-400/35 bg-amber-400/10 text-amber-400',
+      rows: skippedSignals.map(event => `${event.title.replace(' 信号未形成订单', '')} · ${event.detail}`),
     })
   }
 

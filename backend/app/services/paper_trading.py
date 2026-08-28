@@ -888,7 +888,8 @@ class PaperTradingService:
             for row in (context.current.to_dicts() if context.current is not None else [])
         }
         exit_hits = {str(item["symbol"]): item for item in result.exit_signal_hits}
-        created = 0
+        signals_created = 0
+        orders_created = 0
         positions = account["positions"]
         for position in positions:
             reason = "strategy_exit" if position["symbol"] in exit_hits else None
@@ -919,7 +920,8 @@ class PaperTradingService:
                     target_weight=0,
                     planned_session="NEXT_OPEN",
                 )
-                created += int(was_created)
+                signals_created += int(was_created)
+                orders_created += int(was_created)
         held = {item["symbol"] for item in positions}
         open_buy_orders = {
             item["symbol"] for item in account["orders"]
@@ -940,7 +942,7 @@ class PaperTradingService:
                 detail="当日没有新的可执行买入候选",
             )
             self.ledger.mark_signal_day(account_id, signal_date)
-            return {"signals": created, "orders": created}
+            return {"signals": signals_created, "orders": orders_created}
         equity = float(account["summary"]["equity"])
         cash = float(account["summary"]["cash"])
         max_exposure = float(config.get("max_exposure_pct", 1.0))
@@ -949,18 +951,65 @@ class PaperTradingService:
         scores = [max(float(row.get("score") or 0), 0) for row in candidates]
         if config.get("position_sizing") == "score_weight" and sum(scores) > 0:
             weights = [score / sum(scores) for score in scores]
+            allocations = [budget * weight for weight in weights]
+            target_weights = [max_exposure * weight for weight in weights]
         else:
-            weights = [1 / len(candidates)] * len(candidates)
+            per_position_target = equity * max_exposure / max(
+                int(config.get("max_positions", 10)), 1
+            )
+            remaining_budget = budget
+            allocations = []
+            for _row in candidates:
+                allocation = min(per_position_target, remaining_budget)
+                allocations.append(allocation)
+                remaining_budget = max(remaining_budget - allocation, 0)
+            target_weights = [
+                allocation / equity if equity > 0 else 0 for allocation in allocations
+            ]
         model = _account_cost_model(config)
-        for row, weight in zip(candidates, weights, strict=True):
+        for row, allocation, target_weight in zip(
+            candidates, allocations, target_weights, strict=True
+        ):
             price = row.get("raw_close") or row.get("close")
-            allocation = budget * weight
             quantity = round_lot_quantity(allocation, float(price or 0), model)
-            if quantity <= 0:
-                continue
             symbol = str(row["symbol"])
             hit = next((item for item in result.entry_signal_hits if item["symbol"] == symbol), {})
             signal_ref = (hit.get("signals") or [None])[0]
+            if quantity <= 0:
+                valid_price = _valid_price(price)
+                required_cash = (
+                    float(price) * 100 * (1 + model.buy_cost_pct()) if valid_price else None
+                )
+                skip_code = (
+                    "INSUFFICIENT_BUYING_POWER" if valid_price else "INVALID_REFERENCE_PRICE"
+                )
+                detail = (
+                    f"可分配 {allocation:.2f} 元, 按参考价 {float(price):.2f} 元不足买入一手"
+                    if valid_price
+                    else "缺少有效参考价, 无法计算可执行数量"
+                )
+                _, signal_created = self.ledger.record_skipped_signal(
+                    account_id=account_id,
+                    strategy_id=config["strategy_id"],
+                    symbol=symbol,
+                    name=str(row.get("name") or symbol),
+                    side="BUY",
+                    signal_date=signal_date,
+                    score=float(row.get("score") or 0),
+                    reason="strategy_entry",
+                    signal_ref=signal_ref,
+                    skip_code=skip_code,
+                    detail=detail,
+                    payload={
+                        "reference_close": float(price) if valid_price else None,
+                        "allocated_cash": allocation,
+                        "required_one_lot_cash": required_cash,
+                        "available_cash": cash,
+                        "remaining_capacity": capacity,
+                    },
+                )
+                signals_created += int(signal_created)
+                continue
             _, _, was_created = self.ledger.record_signal_and_order(
                 account_id=account_id,
                 strategy_id=config["strategy_id"],
@@ -973,13 +1022,14 @@ class PaperTradingService:
                 signal_ref=signal_ref,
                 requested_qty=quantity,
                 target_amount=allocation,
-                target_weight=max_exposure * weight,
+                target_weight=target_weight,
                 planned_session="NEXT_OPEN",
                 payload={"reference_close": float(price)},
             )
-            created += int(was_created)
+            signals_created += int(was_created)
+            orders_created += int(was_created)
         self.ledger.mark_signal_day(account_id, signal_date)
-        return {"signals": created, "orders": created}
+        return {"signals": signals_created, "orders": orders_created}
 
     def seal_daily_signals(self, signal_date: date | None = None) -> dict[str, int]:
         summary = {"processed": 0, "failed": 0, "orders": 0}

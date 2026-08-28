@@ -424,6 +424,78 @@ class PaperLedger:
             )
         return self.get_account(account_id)
 
+    def increase_capital(
+        self,
+        account_id: str,
+        amount: float,
+        *,
+        reference_id: str,
+        detail: str = "模拟资金追加",
+    ) -> dict[str, Any]:
+        """Increase an account budget with an idempotent cash-ledger entry."""
+        contribution = float(amount)
+        if contribution <= 0:
+            raise ValueError("追加资金必须大于 0")
+        reference = str(reference_id).strip()
+        if not reference:
+            raise ValueError("追加资金必须提供唯一业务参考号")
+
+        now = _now_text()
+        already_applied = False
+        with self.transaction() as conn:
+            account = conn.execute(
+                "SELECT * FROM accounts WHERE id=? AND status!='deleted'", (account_id,)
+            ).fetchone()
+            if account is None:
+                raise KeyError(account_id)
+            existing = conn.execute(
+                """SELECT amount FROM cash_entries
+                    WHERE account_id=? AND event_type='CAPITAL_CONTRIBUTION' AND reference_id=?""",
+                (account_id, reference),
+            ).fetchone()
+            if existing is not None:
+                if abs(float(existing["amount"]) - contribution) >= 0.01:
+                    raise ValueError("同一资金参考号的金额不一致")
+                already_applied = True
+            if not already_applied:
+                new_initial = float(account["initial_capital"]) + contribution
+                new_cash = float(account["cash_balance"]) + contribution
+                config = _loads(account["config_json"], {})
+                config["initial_capital"] = new_initial
+                conn.execute(
+                    """UPDATE accounts SET initial_capital=?,cash_balance=?,config_json=?,updated_at=?
+                        WHERE id=?""",
+                    (new_initial, new_cash, _json(config), now, account_id),
+                )
+                conn.execute(
+                    """INSERT INTO cash_entries(
+                        id,account_id,event_type,amount,balance_after,reference_id,occurred_at,detail
+                    ) VALUES(?,?,?,?,?,?,?,?)""",
+                    (
+                        stable_id(account_id, "CAPITAL_CONTRIBUTION", reference),
+                        account_id,
+                        "CAPITAL_CONTRIBUTION",
+                        contribution,
+                        new_cash,
+                        reference,
+                        now,
+                        detail,
+                    ),
+                )
+                self._event(
+                    conn,
+                    event_key=f"{account_id}:CAPITAL_CONTRIBUTION:{reference}",
+                    account_id=account_id,
+                    event_type="CAPITAL_CONTRIBUTION",
+                    occurred_at=now,
+                    entity_type="account",
+                    entity_id=account_id,
+                    title="模拟资金已追加",
+                    detail=f"追加 {contribution:.2f} 元, 资金基准调整为 {new_initial:.2f} 元",
+                    payload={"amount": contribution, "capital_budget": new_initial},
+                )
+        return self.get_account(account_id)
+
     def delete_account(self, account_id: str) -> dict[str, Any]:
         now = _now_text()
         with self.transaction() as conn:
@@ -535,6 +607,78 @@ class PaperLedger:
                 (signal_date.isoformat(), frozen, account_id),
             )
         return signal_id, order_id, created
+
+    def record_skipped_signal(
+        self,
+        *,
+        account_id: str,
+        strategy_id: str,
+        symbol: str,
+        name: str,
+        side: str,
+        signal_date: date,
+        score: float | None,
+        reason: str,
+        signal_ref: str | None,
+        skip_code: str,
+        detail: str,
+        payload: dict[str, Any] | None = None,
+        frozen_at: datetime | None = None,
+    ) -> tuple[str, bool]:
+        """Freeze a valid signal even when risk sizing cannot create an order."""
+        frozen = _now_text(frozen_at)
+        signal_id = stable_id(account_id, symbol, side, signal_date, reason)
+        event_payload = {
+            "score": score, "reason": reason, "skip_code": skip_code, **(payload or {})
+        }
+        with self.transaction() as conn:
+            account = conn.execute(
+                "SELECT status FROM accounts WHERE id=? AND status!='deleted'", (account_id,)
+            ).fetchone()
+            if account is None:
+                raise KeyError(account_id)
+            before = conn.total_changes
+            conn.execute(
+                """INSERT OR IGNORE INTO signal_intents(
+                    id,account_id,strategy_id,symbol,name,side,signal_date,score,reason,
+                    signal_ref,payload_json,frozen_at
+                ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (
+                    signal_id, account_id, strategy_id, symbol, name, side,
+                    signal_date.isoformat(), score, reason, signal_ref,
+                    _json(event_payload), frozen,
+                ),
+            )
+            created = conn.total_changes > before
+            if created:
+                self._event(
+                    conn,
+                    event_key=f"{signal_id}:SIGNAL_FROZEN",
+                    account_id=account_id,
+                    event_type="SIGNAL_FROZEN",
+                    occurred_at=frozen,
+                    trading_date=signal_date.isoformat(),
+                    entity_type="signal",
+                    entity_id=signal_id,
+                    title=f"{name or symbol} {side} 信号已冻结",
+                    detail="策略信号已保留, 等待风控生成订单",
+                    payload={"score": score, "reason": reason},
+                )
+                self._event(
+                    conn,
+                    event_key=f"{signal_id}:SIGNAL_SKIPPED:{skip_code}",
+                    account_id=account_id,
+                    event_type="SIGNAL_SKIPPED",
+                    occurred_at=frozen,
+                    trading_date=signal_date.isoformat(),
+                    entity_type="signal",
+                    entity_id=signal_id,
+                    severity="warning",
+                    title=f"{name or symbol} 信号未形成订单",
+                    detail=detail,
+                    payload=event_payload,
+                )
+        return signal_id, created
 
     def mark_signal_day(self, account_id: str, signal_date: date) -> None:
         """Record a sealed signal day even when it produced no order."""

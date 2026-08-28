@@ -174,6 +174,110 @@ def test_account_is_persisted_in_transactional_ledger(tmp_path):
     assert loaded["timeline"][0]["event_type"] == "ACCOUNT_CREATED"
 
 
+def test_capital_contribution_updates_budget_and_cash_ledger_idempotently(tmp_path):
+    ledger = PaperLedger(tmp_path)
+    account = ledger.create_account(
+        name="预算调整账户",
+        baseline_date=SIGNAL_DAY,
+        config=_config(),
+    )
+
+    updated = ledger.increase_capital(
+        account["id"],
+        100_000,
+        reference_id="budget-300000",
+        detail="用户将模拟预算调整为 30 万",
+    )
+    repeated = ledger.increase_capital(
+        account["id"],
+        100_000,
+        reference_id="budget-300000",
+        detail="用户将模拟预算调整为 30 万",
+    )
+
+    assert updated["config"]["initial_capital"] == 300_000
+    assert updated["summary"]["cash"] == 300_000
+    assert repeated["summary"]["cash"] == 300_000
+    contributions = [
+        row for row in repeated["cash_entries"]
+        if row["event_type"] == "CAPITAL_CONTRIBUTION"
+    ]
+    assert len(contributions) == 1
+    assert contributions[0]["amount"] == 100_000
+    assert ledger.reconcile(account["id"], open_incident=False)["ok"] is True
+
+
+def _stub_signal_seal(monkeypatch, service: PaperTradingService, rows: list[dict]) -> None:
+    class StubScreener:
+        def __init__(self, *_args, **_kwargs) -> None:
+            pass
+
+        @staticmethod
+        def build_strategy_context(*_args, **_kwargs):
+            return SimpleNamespace(current=pl.DataFrame(rows))
+
+    service.app_state.strategy_engine = SimpleNamespace(
+        run=lambda *_args, **_kwargs: SimpleNamespace(
+            rows=rows,
+            exit_signal_hits=[],
+            entry_signal_hits=[
+                {"symbol": row["symbol"], "signals": ["signal_n_day_low"]}
+                for row in rows
+            ],
+        )
+    )
+    monkeypatch.setattr("app.services.paper_trading.ScreenerService", StubScreener)
+
+
+def test_equal_position_sizing_uses_max_position_slot_budget(tmp_path, monkeypatch):
+    service = _service(tmp_path)
+    _stub_signal_seal(monkeypatch, service, [
+        {"symbol": "000001.SZ", "name": "平安银行", "score": 90.0, "raw_close": 10.0},
+        {"symbol": "600000.SH", "name": "浦发银行", "score": 80.0, "raw_close": 10.0},
+    ])
+    account = service.ledger.create_account(
+        name="按槽位等权账户",
+        baseline_date=SIGNAL_DAY,
+        config=_config(),
+    )
+
+    result = service.seal_account_signals(account["id"], SIGNAL_DAY)
+    current = service.account(account["id"])
+
+    assert result == {"signals": 2, "orders": 2}
+    assert len(current["orders"]) == 2
+    assert {row["requested_qty"] for row in current["orders"]} == {1_900}
+    assert {row["target_amount"] for row in current["orders"]} == {20_000}
+    assert {row["target_weight"] for row in current["orders"]} == {0.1}
+
+
+def test_zero_lot_candidate_is_frozen_and_explained_in_timeline(tmp_path, monkeypatch):
+    service = _service(tmp_path)
+    _stub_signal_seal(monkeypatch, service, [
+        {"symbol": "002028.SZ", "name": "思源电气", "score": 50.0, "raw_close": 143.18},
+    ])
+    account = service.ledger.create_account(
+        name="小额预算账户",
+        baseline_date=SIGNAL_DAY,
+        config=_config(initial_capital=10_000),
+    )
+
+    result = service.seal_account_signals(account["id"], SIGNAL_DAY)
+    current = service.account(account["id"])
+
+    assert result == {"signals": 1, "orders": 0}
+    assert current["orders"] == []
+    skipped = [row for row in current["timeline"] if row["event_type"] == "SIGNAL_SKIPPED"]
+    assert len(skipped) == 1
+    assert skipped[0]["payload"]["skip_code"] == "INSUFFICIENT_BUYING_POWER"
+    assert "不足买入一手" in skipped[0]["detail"]
+    with service.ledger._connect() as conn:  # verify immutable domain row
+        signal_count = conn.execute(
+            "SELECT count(*) FROM signal_intents WHERE account_id=?", (account["id"],)
+        ).fetchone()[0]
+    assert signal_count == 1
+
+
 def test_paper_service_has_no_backtest_replay_dependency():
     source = inspect.getsource(PaperTradingService)
 
