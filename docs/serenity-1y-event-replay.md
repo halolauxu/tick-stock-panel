@@ -18,6 +18,20 @@
 - 公司和概念成员来自当前快照，因此历史回溯存在存活偏差和成分漂移；
 - 该偏差未解决前，即使收益为正也不能升级为可投入资金的 Alpha。
 
+## 研究池与账户可交易池
+
+产业链研究保留全市场公司，因为科创板、创业板事件仍可能提供上游卡点和跨板块传导证据；
+账户执行口径与研究口径必须分离。当前账户未开通科创板、创业板，执行研究只允许沪深主板：
+
+- `研究池`：冻结的 100 家公司全部保留，用于证据、事件和产业链传播研究；
+- `可交易池`：只保留 Tushare `stock_basic.market=主板` 且当前上市状态正常的公司；
+- 双创板事件标记为 `BOARD_NOT_AUTHORIZED`，不得进入账户收益、候选组合或 Alpha 验收；
+- 科创板、创业板事件可以作为主板供应商、客户或替代公司的信息源，但必须有正式产业链证据；
+- 当前范围只用于研究回放，`capital_authority=false`，不会授权实盘或模拟盘下单。
+
+证券板块使用冻结的 Tushare 证券主表快照，不根据代码前缀推断。证券主表未完整覆盖 100 家公司时
+整个可交易口径失败关闭，不生成主板收益报告。
+
 ## 两层信号
 
 ### 慢变量：卡点先验
@@ -133,3 +147,18 @@ uv run python -m app.services.serenity_event_replay download \
 uv run python -m app.services.serenity_event_replay settle \
   --root /app/data/research/serenity_event/serenity-event-1y-v1
 ```
+
+完成 PDF64 证据评分后，先冻结当前账户的主板可执行范围，再单独生成主板收益报告：
+
+```bash
+uv run python -m app.services.serenity_execution_scope freeze \
+  --root /app/data/research/serenity_event/serenity-event-1y-v1
+
+uv run python -m app.services.serenity_execution_scope evaluate \
+  --root /app/data/research/serenity_event/serenity-event-1y-v1
+```
+
+结果同时落入 DuckDB 的 `serenity_security_execution_scope`、
+`serenity_execution_scope_trials`，并写出
+`optimization/<optimization-id>/round05-main-board-execution-report.json`。全市场研究结果不会被删除，
+但不能与主板可执行结果合并统计。
