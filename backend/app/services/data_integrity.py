@@ -292,6 +292,35 @@ def prune_enriched_partitions(
     return removed
 
 
+def prune_corrupt_raw_partitions(
+    data_dir: Path,
+    issues: Iterable[IntegrityIssue],
+) -> int:
+    """删除已确认损坏的原始日K分区，避免拉取无结果时旧脏分区继续残留。
+
+    只处理 ``snapshot`` / ``coverage`` 两类已存在但不完整的原始分区；
+    ``missing`` 本来就没有目录。每个问题仅删除对应日期，不扩大到后续完整日。
+    """
+    import shutil
+
+    removed = 0
+    seen: set[tuple[str, date]] = set()
+    for issue in issues:
+        key = (issue.table, issue.day)
+        if (
+            issue.table not in _RAW_DAILY_TABLES
+            or issue.kind not in {"snapshot", "coverage"}
+            or key in seen
+        ):
+            continue
+        seen.add(key)
+        part = Path(data_dir) / issue.table / f"date={issue.day.isoformat()}"
+        if part.exists():
+            shutil.rmtree(part, ignore_errors=True)
+            removed += 1
+    return removed
+
+
 def describe_issues(issues: list[IntegrityIssue]) -> str:
     """面向用户的一句话描述 (409 详情 / 日志用)。"""
     if not issues:

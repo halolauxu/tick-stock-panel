@@ -19,6 +19,7 @@ from app.services.data_integrity import (
     _quote_ts_max_ms,
     earliest_issue_day,
     latest_complete_partition_date,
+    prune_corrupt_raw_partitions,
     prune_enriched_partitions,
     scan_recent_integrity,
     within_auto_repair_window,
@@ -231,6 +232,23 @@ def test_prune_enriched_partitions_removes_only_range(tmp_path):
     assert (base / f"date={THURSDAY.isoformat()}").exists()
     assert not (base / f"date={FRIDAY.isoformat()}").exists()
     assert not (base / f"date={TODAY.isoformat()}").exists()
+
+
+def test_prune_corrupt_raw_partitions_removes_only_exact_existing_issues(tmp_path):
+    for day in (THURSDAY, FRIDAY, TODAY):
+        _write_daily_partition(tmp_path, "kline_daily", day, None)
+    issues = [
+        IntegrityIssue(day=FRIDAY, table="kline_daily", kind="coverage"),
+        IntegrityIssue(day=TODAY, table="kline_daily", kind="missing"),
+        IntegrityIssue(day=THURSDAY, table="kline_daily_enriched", kind="coverage"),
+    ]
+
+    removed = prune_corrupt_raw_partitions(tmp_path, issues)
+
+    assert removed == 1
+    assert (tmp_path / "kline_daily" / f"date={THURSDAY.isoformat()}").exists()
+    assert not (tmp_path / "kline_daily" / f"date={FRIDAY.isoformat()}").exists()
+    assert (tmp_path / "kline_daily" / f"date={TODAY.isoformat()}").exists()
 
 
 # ── 管道起点决策 (分支3降级后的起点) ────────────────────────────────
@@ -466,7 +484,10 @@ def test_pipeline_self_heals_snapshot_day(tmp_path, monkeypatch):
             "start": start_date.date() if hasattr(start_date, "date") else start_date,
             "end": end_date.date() if hasattr(end_date, "date") else end_date,
         })
-        return 0
+        # 模拟权威 batch 返回并重建被删除的坏原始分区。
+        _write_full_partition(tmp_path, "kline_daily", yesterday, None)
+        _write_full_partition(tmp_path, "kline_daily", today, None)
+        return 4
 
     monkeypatch.setattr(kline_sync, "sync_and_persist_daily_batch", _fake_batch)
     # run_pipeline() 不传 data_dir 时读 settings.data_dir — 同步指到 tmp
@@ -535,3 +556,46 @@ def test_pipeline_rebuilds_enriched_when_only_latest_partition_has_low_coverage(
         tmp_path / "kline_daily_enriched" / f"date={today.isoformat()}" / "part.parquet"
     )
     assert rebuilt["symbol"].n_unique() == len(full_symbols)
+
+
+def test_pipeline_removes_partial_today_when_provider_has_not_published(
+    tmp_path, monkeypatch,
+):
+    """当天源数据仍为空时，不保留旧的 5 只股票分区，也不误报当天完整。"""
+    from app.config import settings as app_settings
+    from app.jobs import daily_pipeline
+    from app.services import instrument_sync, kline_sync
+    from app.tickflow.repository import DataStore, KlineRepository
+
+    today = datetime.now(CN_TZ).date()
+    previous = today - timedelta(days=1)
+    while previous.weekday() >= 5:
+        previous -= timedelta(days=1)
+    full_symbols = tuple(f"{i:06d}.SH" for i in range(200))
+    _write_daily_partition(tmp_path, "kline_daily", previous, None, full_symbols)
+    _write_daily_partition(tmp_path, "kline_daily", today, None, full_symbols[:5])
+    _write_daily_partition(
+        tmp_path, "kline_daily_enriched", previous, None, full_symbols,
+    )
+    _write_daily_partition(
+        tmp_path, "kline_daily_enriched", today, None, full_symbols[:5],
+    )
+
+    monkeypatch.setattr(instrument_sync, "sync_instruments", lambda data_dir: 0)
+    monkeypatch.setattr(app_settings, "data_dir", tmp_path)
+    monkeypatch.setattr(
+        kline_sync, "sync_and_persist_daily_batch",
+        lambda *args, **kwargs: 0,
+    )
+
+    repo = KlineRepository(DataStore(tmp_path))
+    result = daily_pipeline.run_now(
+        repo, SimpleNamespace(has=lambda key: False), override_start_date=today,
+    )  # type: ignore[arg-type]
+
+    assert not (tmp_path / "kline_daily" / f"date={today.isoformat()}").exists()
+    assert not (
+        tmp_path / "kline_daily_enriched" / f"date={today.isoformat()}"
+    ).exists()
+    assert result["daily_latest_complete"] == previous.isoformat()
+    assert "sync_daily" in result["deferred_stages"]

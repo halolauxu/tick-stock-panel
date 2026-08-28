@@ -164,26 +164,32 @@ def run_now(
     enriched_stale_day: _date | None = None
     etf_stale_day: _date | None = None
     index_stale_day: _date | None = None
-    if override_start_date is None:
-        try:
-            from app.services import data_integrity
-            integrity_issues = data_integrity.scan_recent_integrity(
-                repo.store.data_dir, today=today, include_today=True,
+    try:
+        from app.services import data_integrity
+        integrity_issues = data_integrity.scan_recent_integrity(
+            repo.store.data_dir, today=today, include_today=True,
+        )
+        if integrity_issues:
+            stale_day = data_integrity.earliest_issue_day(integrity_issues, ("kline_daily",))
+            enriched_stale_day = data_integrity.earliest_issue_day(
+                integrity_issues, ("kline_daily_enriched",),
             )
-            if integrity_issues:
-                stale_day = data_integrity.earliest_issue_day(integrity_issues, ("kline_daily",))
-                enriched_stale_day = data_integrity.earliest_issue_day(
-                    integrity_issues, ("kline_daily_enriched",),
-                )
-                etf_stale_day = data_integrity.earliest_issue_day(integrity_issues, ("kline_etf_daily",))
-                index_stale_day = data_integrity.earliest_issue_day(integrity_issues, ("kline_index_daily",))
-                logger.warning(
-                    "integrity: 检测到 %d 个不完整分区(%s), 本次管道改走范围拉取修复",
-                    len(integrity_issues), data_integrity.describe_issues(integrity_issues),
-                )
-        except Exception as e:  # noqa: BLE001
-            logger.warning("integrity scan failed (soft, 按无坏数据处理): %s", e)
-            integrity_issues = []
+            etf_stale_day = data_integrity.earliest_issue_day(
+                integrity_issues, ("kline_etf_daily",),
+            )
+            index_stale_day = data_integrity.earliest_issue_day(
+                integrity_issues, ("kline_index_daily",),
+            )
+            removed_raw = data_integrity.prune_corrupt_raw_partitions(
+                repo.store.data_dir, integrity_issues,
+            )
+            logger.warning(
+                "integrity: 检测到 %d 个不完整分区(%s), 删除 %d 个原始脏分区后范围修复",
+                len(integrity_issues), data_integrity.describe_issues(integrity_issues), removed_raw,
+            )
+    except Exception as e:  # noqa: BLE001
+        logger.warning("integrity scan failed (soft, 按无坏数据处理): %s", e)
+        integrity_issues = []
     # 日K范围拉取的起点(分支3补缺口/分支4首次/数据修正); 实时增量/跳过时为 None。
     # 供 Step 1.5 除权因子回溯范围对齐: 范围拉取→用日K范围, 非范围→最近N天兜底。
     daily_range_start: _date | None = None
@@ -275,6 +281,18 @@ def run_now(
         emit("sync_daily", 45, "日K 完成")
         logger.info("sync_daily: [%s ~ %s] done", start_date, today)
     _invalidate("daily")
+
+    from app.services.data_integrity import latest_complete_partition_date
+    latest_complete_daily = latest_complete_partition_date(
+        repo.store.data_dir, "kline_daily",
+    )
+    if latest_complete_daily is None or latest_complete_daily < today:
+        deferred.append("sync_daily")
+        emit(
+            "sync_daily",
+            45,
+            f"日K延期:{today} 数据源尚未发布;最新完整日 {latest_complete_daily or '无'}",
+        )
 
     # 完整性修复时删除股票 enriched 的坏分区: 增量重算只算 enriched 里不存在
     # 的日期, 盘中快照日分区已存在(虽是错的), 不删永远不会被重算。删除后
@@ -799,6 +817,9 @@ def run_now(
     result = {
         "universe_size": len(universe),
         "daily_days": new_daily_days,
+        "daily_latest_complete": (
+            latest_complete_daily.isoformat() if latest_complete_daily else None
+        ),
         "adj_factor_symbols": len(affected_symbols),
         "enriched_days": written_enriched,
         "index_count": index_count,
