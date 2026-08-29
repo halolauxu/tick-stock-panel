@@ -7,6 +7,7 @@ from app.alpha_mining.contracts import (
     ENGINE_API_VERSION,
     AlphaEngineManifest,
     DataCatalogContext,
+    DataQualification,
     DatasetRequirement,
 )
 from app.alpha_mining.engines._shared import materialize, rank_univariate_candidates
@@ -38,7 +39,12 @@ class MarketSectorTimingEngine:
     def preflight(self, context: DataCatalogContext):
         from app.alpha_mining.contracts import qualify_manifest_datasets
 
-        return qualify_manifest_datasets(self.manifest, context.datasets)
+        data = qualify_manifest_datasets(self.manifest, context.datasets)
+        return DataQualification(
+            False,
+            (*data.reasons, "当前市场残差排序与普通日度截面排序数学等价; 尚未实现市场或行业状态条件"),
+            {**data.observations, "implementation_status": "prototype_not_independent"},
+        )
 
     def discover(self, context, budget):
         frame = context.frame

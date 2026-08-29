@@ -7,6 +7,7 @@ from app.alpha_mining.contracts import (
     ENGINE_API_VERSION,
     AlphaEngineManifest,
     DataCatalogContext,
+    DataQualification,
     DatasetRequirement,
     qualify_manifest_datasets,
 )
@@ -37,7 +38,12 @@ class PortfolioResidualEngine:
     )
 
     def preflight(self, context: DataCatalogContext):
-        return qualify_manifest_datasets(self.manifest, context.datasets)
+        data = qualify_manifest_datasets(self.manifest, context.datasets)
+        return DataQualification(
+            False,
+            (*data.reasons, "当前模块尚未实现策略残差、候选相关性惩罚或组合互补优化"),
+            {**data.observations, "implementation_status": "prototype_not_independent"},
+        )
 
     def discover(self, context, budget):
         frame = context.frame

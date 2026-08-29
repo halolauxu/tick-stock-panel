@@ -28,7 +28,7 @@ COVERAGE_ROADMAP: tuple[dict[str, Any], ...] = (
     {"id": "outcome_attribution", "name": "赢家/输家归因", "status": "ready", "slot": "engine"},
     {"id": "interaction", "name": "非线性交互", "status": "ready", "slot": "engine"},
     {"id": "market_sector_timing", "name": "市场/行业时序", "status": "planned", "slot": "engine"},
-    {"id": "market_residual_rank", "name": "市场残差截面排序", "status": "ready", "slot": "engine"},
+    {"id": "market_residual_rank", "name": "市场残差截面排序", "status": "prototype", "slot": "engine"},
     {"id": "event_sequence", "name": "事件序列", "status": "ready", "slot": "engine"},
     {"id": "network_diffusion", "name": "行业/概念扩散", "status": "ready", "slot": "engine"},
     {"id": "financial_revision", "name": "财务变化与预期差", "status": "ready", "slot": "engine"},
