@@ -273,6 +273,9 @@ class ExtConfigStore:
             json.dumps(config.to_dict(), ensure_ascii=False, indent=2),
             encoding="utf-8",
         )
+        # 不能只依赖 mtime/size 签名; 容器 bind mount 或部分文件系统上,
+        # 同尺寸的连续写入可能保留相同时间戳, 导致读到旧配置.
+        _load_all_cache.pop(str(self._base), None)
 
     def delete(self, config_id: str) -> bool:
         import shutil
@@ -283,6 +286,7 @@ class ExtConfigStore:
         if not cp.exists():
             return False
         shutil.rmtree(cp.parent, ignore_errors=True)
+        _load_all_cache.pop(str(self._base), None)
         return True
 
     def _migrate_legacy(self, old_path: Path) -> None:

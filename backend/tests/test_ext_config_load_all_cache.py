@@ -46,11 +46,17 @@ def test_second_load_all_hits_cache_without_disk_parse(tmp_path, monkeypatch):
 
 
 def test_upsert_edit_invalidates_cache(tmp_path):
+    import os
+
     store = ExtConfigStore(tmp_path)
     store.upsert(_config("cfg_a", "old"))
     assert store.load_all()[0].label == "old"
+    cp = tmp_path / "ext_data" / "cfg_a" / "config.json"
+    before = cp.stat()
 
     store.upsert(_config("cfg_a", "new"))
+    # Reproduce bind mounts/filesystems where same-size rapid writes retain the signature.
+    os.utime(cp, ns=(before.st_atime_ns, before.st_mtime_ns))
     assert store.load_all()[0].label == "new"
 
 
