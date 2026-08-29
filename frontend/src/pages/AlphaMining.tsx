@@ -427,6 +427,11 @@ export function AlphaMining() {
     if (preset === '1y') setProfile('exploratory')
   }
 
+  function applyResearchProfile(value: MiningBudgetProfile) {
+    setProfile(value)
+    applyDatePreset(value === 'exploratory' ? '1y' : 'all')
+  }
+
   function startResearch() {
     if (blockers.length) return toast(blockers[0], 'error')
     if (!selectedEngines.length || !factorNames.length) return toast('请至少选择一个可用的发现引擎', 'error')
@@ -523,7 +528,7 @@ export function AlphaMining() {
                     <button
                       key={value}
                       type="button"
-                      onClick={() => setProfile(value)}
+                      onClick={() => applyResearchProfile(value)}
                       className={cn(
                         'rounded-lg border px-2.5 py-2 text-left transition-colors',
                         profile === value
@@ -601,7 +606,7 @@ export function AlphaMining() {
                 requiredBars={availabilityQuery.data?.required_bars}
                 outerFolds={availabilityQuery.data?.outer_folds}
                 usableEngineCount={usableEngineCount}
-                onUseQuick={() => setProfile('exploratory')}
+                onUseQuick={() => applyResearchProfile('exploratory')}
                 onUseAll={() => applyDatePreset('all')}
                 showQuickAction={profile !== 'exploratory'}
                 profile={profile}
