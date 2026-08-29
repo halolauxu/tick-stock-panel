@@ -1,4 +1,5 @@
 """Independent job manager for the Alpha mining subsystem."""
+# ruff: noqa: RUF001
 from __future__ import annotations
 
 import hashlib
@@ -9,6 +10,8 @@ from typing import Any
 from app.alpha_mining.config_store import AlphaConfigStore
 from app.alpha_mining.contracts import CandidateSpec, FrozenSignalSpec
 from app.alpha_mining.evidence import AlphaEvidenceStore
+from app.alpha_mining.hypotheses import AlphaHypothesisStore
+from app.alpha_mining.lifecycle import is_strict_full_history_request
 from app.alpha_mining.policy import ALPHA_ALGORITHM_VERSION
 from app.alpha_mining.providers import DeclarativeCandidateRenderer
 from app.alpha_mining.registry import load_builtin_registry
@@ -38,6 +41,7 @@ class AlphaMiningJobManager(MiningJobManager):
             thread_name_prefix="alpha-mining",
         )
         self.evidence = AlphaEvidenceStore(data_dir)
+        self.hypotheses = AlphaHypothesisStore(data_dir)
         self.renderer = DeclarativeCandidateRenderer()
 
     def start(
@@ -89,19 +93,26 @@ class AlphaMiningJobManager(MiningJobManager):
                     "slippage_bps": request.get("slippage_bps"),
                 },
             })
-            return super().start(
+            manifest = super().start(
                 request,
                 data_fingerprint,
                 force=force,
                 source=source,
                 run_id=resolved_run_id,
             )
+            hypothesis_id = request.get("hypothesis_id")
+            if hypothesis_id:
+                self.hypotheses.attach_run(str(hypothesis_id), str(manifest["run_id"]))
+            return manifest
 
     def _finish_success(self, run_id, result, cancel_event) -> None:
         if cancel_event.is_set():
             super()._finish_success(run_id, result, cancel_event)
             return
         champion = dict(result.get("champion") or {})
+        experiment = self.evidence.read_experiment(run_id)
+        experiment_request = dict(experiment.get("contract", {}).get("request") or {})
+        strict_full_history = is_strict_full_history_request(self._data_dir, experiment_request)
         for row in result.get("candidates") or []:
             frozen_row = row.get("frozen_candidate")
             if not isinstance(frozen_row, dict):
@@ -131,7 +142,10 @@ class AlphaMiningJobManager(MiningJobManager):
                 candidate=candidate_evidence,
                 renderer=dict(rendered),
             )
-            target = "research_candidate" if row.get("state") == "research_candidate" else "rejected"
+            if row.get("state") == "research_candidate":
+                target = "research_candidate" if strict_full_history else "validation_candidate"
+            else:
+                target = "rejected"
             outer_evaluation = {
                 "metrics": row.get("metrics"),
                 "gates": row.get("gates"),
@@ -146,10 +160,73 @@ class AlphaMiningJobManager(MiningJobManager):
             )
             row["candidate_id"] = evidence["candidate_id"]
             row["state"] = evidence["state"]["state"]
+        candidate_states = {str(row.get("state") or "") for row in result.get("candidates") or []}
+        if "research_candidate" in candidate_states:
+            result["research_state"] = "research_candidate"
+        elif "validation_candidate" in candidate_states:
+            result["research_state"] = "validation_candidate"
+        progress = dict(result.get("progress") or {})
+        progress.update({
+            "phase": "completed",
+            "label": "研究计算与候选证据冻结完成",
+            "done": 1,
+            "total": 1,
+            "percent": 100.0,
+            "current_engine_id": None,
+        })
+        result["progress"] = progress
+        hypothesis_id = experiment_request.get("hypothesis_id")
+        if hypothesis_id:
+            hypothesis = self.hypotheses.get(str(hypothesis_id))
+            next_hypotheses = []
+            if not ({"research_candidate", "validation_candidate"} & candidate_states):
+                for suggestion in result.get("next_research_suggestions") or []:
+                    if not isinstance(suggestion, dict):
+                        continue
+                    next_hypotheses.append(self.hypotheses.create_from_failure(
+                        hypothesis,
+                        run_id,
+                        suggestion,
+                        experiment_request,
+                    ))
+            result["hypothesis"] = {
+                "hypothesis_id": hypothesis_id,
+                "title": hypothesis["title"],
+                "source_kind": hypothesis["source_kind"],
+                "verdict": (
+                    "supported"
+                    if {"research_candidate", "validation_candidate"} & candidate_states
+                    else "rejected"
+                ),
+            }
+            result["next_hypotheses"] = next_hypotheses
+            self.hypotheses.record_result(
+                str(hypothesis_id),
+                run_id,
+                verdict=(
+                    "supported"
+                    if {"research_candidate", "validation_candidate"} & candidate_states
+                    else "rejected"
+                ),
+                conclusion=str(
+                    (result.get("failure_analysis") or {}).get("conclusion")
+                    or "本轮假设产生了通过历史门槛的候选"
+                ),
+                next_hypothesis_ids=[str(row["hypothesis_id"]) for row in next_hypotheses],
+            )
         self.evidence.record_experiment_result(run_id, result)
         super()._finish_success(run_id, result, cancel_event)
 
     def _finish_failed(self, run_id: str, exc: Exception) -> None:
+        experiment = self.evidence.read_experiment(run_id)
+        request = dict(experiment.get("contract", {}).get("request") or {})
+        if request.get("hypothesis_id"):
+            self.hypotheses.record_result(
+                str(request["hypothesis_id"]),
+                run_id,
+                verdict="blocked",
+                conclusion=f"执行链路失败，尚不能判断假设真伪：{str(exc)[:500]}",
+            )
         self.evidence.record_experiment_result(run_id, {
             "status": "failed",
             "error": str(exc)[:2000],
@@ -158,6 +235,15 @@ class AlphaMiningJobManager(MiningJobManager):
         super()._finish_failed(run_id, exc)
 
     def _finish_cancelled_locked(self, run_id: str) -> None:
+        experiment = self.evidence.read_experiment(run_id)
+        request = dict(experiment.get("contract", {}).get("request") or {})
+        if request.get("hypothesis_id"):
+            self.hypotheses.record_result(
+                str(request["hypothesis_id"]),
+                run_id,
+                verdict="cancelled",
+                conclusion="研究被人工取消，假设未被支持或证伪。",
+            )
         self.evidence.record_experiment_result(run_id, {
             "status": "cancelled",
             "trial_ledger": [],

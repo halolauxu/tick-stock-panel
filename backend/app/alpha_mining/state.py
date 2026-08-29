@@ -11,11 +11,13 @@ class AlphaExperimentState(StrEnum):
     DISCOVERY = "discovery"
     FROZEN = "frozen"
     OUTER_EVALUATED = "outer_evaluated"
+    VALIDATION_CANDIDATE = "validation_candidate"
     REJECTED = "rejected"
     RESEARCH_CANDIDATE = "research_candidate"
     SHADOW = "shadow"
     CHALLENGER = "challenger"
     CHAMPION = "champion"
+    RETIRED = "retired"
 
 
 class InvalidAlphaStateTransitionError(ValueError):
@@ -30,8 +32,12 @@ _ALLOWED: dict[AlphaExperimentState, frozenset[AlphaExperimentState]] = {
     AlphaExperimentState.FROZEN: frozenset({AlphaExperimentState.OUTER_EVALUATED}),
     AlphaExperimentState.OUTER_EVALUATED: frozenset({
         AlphaExperimentState.REJECTED,
+        AlphaExperimentState.VALIDATION_CANDIDATE,
         AlphaExperimentState.RESEARCH_CANDIDATE,
     }),
+    # A candidate found by a quick or standard run is immutable.  Strict
+    # validation always creates a new run/candidate instead of mutating it.
+    AlphaExperimentState.VALIDATION_CANDIDATE: frozenset(),
     AlphaExperimentState.RESEARCH_CANDIDATE: frozenset({AlphaExperimentState.SHADOW}),
     AlphaExperimentState.SHADOW: frozenset({
         AlphaExperimentState.REJECTED,
@@ -42,7 +48,8 @@ _ALLOWED: dict[AlphaExperimentState, frozenset[AlphaExperimentState]] = {
         AlphaExperimentState.CHAMPION,
     }),
     AlphaExperimentState.REJECTED: frozenset(),
-    AlphaExperimentState.CHAMPION: frozenset(),
+    AlphaExperimentState.CHAMPION: frozenset({AlphaExperimentState.RETIRED}),
+    AlphaExperimentState.RETIRED: frozenset(),
 }
 
 

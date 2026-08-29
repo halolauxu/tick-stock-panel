@@ -59,6 +59,8 @@ export const QK = {
   miningConfig:         ['backtest-mining-config'] as const,
   alphaCharter:         ['alpha-mining-charter'] as const,
   alphaEngines:         ['alpha-mining-engines'] as const,
+  alphaHypotheses:      (assetType: string, start: string, end: string) =>
+                         ['alpha-mining-hypotheses', assetType, start, end] as const,
   alphaConfig:          ['alpha-mining-config'] as const,
   alphaCatalog:         (assetType: string, start: string, end: string) =>
                          ['alpha-mining-catalog', assetType, start, end] as const,

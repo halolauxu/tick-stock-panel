@@ -89,6 +89,13 @@
 | AM-S4-009 | 冻结候选不可修改 | write-once 候选与冲突拒绝测试 | PASS |
 | AM-S4-010 | 同指纹可复现，变更生成新实验 | 内容寻址及冲突测试 | PASS |
 | AM-S4-011 | 股票/日期/数据/代码链路追溯 | 候选研究描述、实验哈希、逐折和交易证据 | PASS |
+| AM-S4-012 | Alpha 假设为可持久化一等对象 | `hypotheses.py`、`test_hypotheses.py` | PASS |
+| AM-S4-013 | DeepSeek、内置先验、人工和失败证据四类假设来源 | `/hypotheses/ai-proposals`、`/hypotheses` API、假设工作台与真实失败运行 | PASS |
+| AM-S4-014 | 因子方向和权重在看外测前预注册 | `cross_sectional.py`、恶意方向回看测试 | PASS |
+| AM-S4-015 | Run 冻结完整假设快照且拒绝合同漂移 | `_attach_hypothesis_contract`、API 测试 | PASS |
+| AM-S4-016 | 失败裁决生成新的不可变假设而非只给文案 | `AlphaHypothesisStore.create_from_failure`、manager 测试 | PASS |
+| AM-S4-017 | AI 提案不得读取样本外答案且必须可追溯 | `ai_hypothesis_proposer.py`、不可变提案凭证、模型/提示/响应/上下文哈希、`outcome_data_exposed=false` | PASS |
+| AM-S4-018 | AI 输出只能使用当前可执行因子与合同 | 未知因子拒绝、方向/权重/期限/数据需求确定性校验测试 | PASS |
 
 ## Stage 5：首批发现引擎
 
@@ -185,12 +192,31 @@
 | AM-GOV-005 | 每阶段固定五项证据 | `stage-acceptance.md` | PASS |
 | AM-GOV-006 | 阶段只用 PASS/FAIL | 本矩阵及 `stage-acceptance.md` | PASS |
 
+## Stage 7R：Alpha 工作台重构
+
+旧八区页面不能证明产品可用。用户已冻结 `AM-WORKBENCH-v1.0`，后续工作以
+`product-workbench.md` 和 `workbench-acceptance.md` 的 P0-P6 二元门禁为准。
+在 P1-P6 全部通过前，Stage 7R 结论保持 `FAIL`，不得沿用旧 Stage 7 的区块存在性验收。
+
+| ID | 需求 | 当前证据 | 结论 |
+|---|---|---|---|
+| AM-S7R-001 | 冻结工作台产品契约 | `product-workbench.md`、`workbench-acceptance.md` P0 | PASS |
+| AM-S7R-002 | 固定配置栏、状态工作区和 URL 恢复 | `workbench-acceptance.md` P1 | PASS |
+| AM-S7R-003 | 真实逐引擎运行进度与重连 | `workbench-acceptance.md` P2；真实 worker 与浏览器刷新验收 | PASS |
+| AM-S7R-004 | 发现、样本外、市场归因和稳健性视图 | `workbench-acceptance.md` P3；真实运行与浏览器逐页验收 | PASS |
+| AM-S7R-005 | 候选主从详情与完整证据 | 因子定义、交易规则、OOS 覆盖、裁决和不可变标识浏览器验收 | PASS |
+| AM-S7R-006 | 零候选失败归因与下一轮研究 | `workbench-acceptance.md` P4；失败分类、差异草稿、新运行血缘及来源哈希不变 | PASS |
+| AM-S7R-007 | 前向、挑战者和动态冠军产品闭环 | `workbench-acceptance.md` P5；严格新运行、真实前向账户、两步发布、动态冠军复核与浏览器验收 | PASS |
+| AM-S7R-008 | 加载、空、错、禁用、刷新和窄屏 | `workbench-acceptance.md` P1 | PASS |
+| AM-S7R-009 | 旧 `/mining` 浏览器无回归 | 本地浏览器复验 | PASS |
+| AM-S7R-010 | 假设来源、机制、方向、阻断和裁决可直接操作 | `workbench-acceptance.md` P6；DeepSeek 批次 `ahp-ee083220061045f3a86e9551` 与真实运行 `alpha-51b0f3b6b61e4588bf6069d5` 浏览器验收 | PASS |
+
 ## 当前数据与研究结果状态
 
 | 状态 | 证据 | 结论 |
 |---|---|---|
 | 工程系统能力（Stage 0-8） | 专项测试、全量回归、构建和浏览器验收 | PASS |
-| 本地正式数据准入 | 245 日分区；历史股票池、股本、财务、行业和事件历史缺失 | FAIL |
-| 正式研究候选 | 近一年快速研究冻结 6 个候选并全部证伪；无候选通过正式准入 | FAIL |
+| 本地正式数据准入 | 245 日分区；历史股票池与名称时点已就绪，股本、财务、行业和事件历史仍缺失，且不足2013至当前 | FAIL |
+| 正式研究候选 | DeepSeek 假设运行 `alpha-51b0f3b6b61e4588bf6069d5` 在训练阶段证伪；另有先验假设运行完成样本外并证伪；无候选通过 | FAIL |
 | 前向通过 | 无正式研究候选 | FAIL |
 | 找到稳定优于当前冠军的 Alpha | 无真实证据 | FAIL |

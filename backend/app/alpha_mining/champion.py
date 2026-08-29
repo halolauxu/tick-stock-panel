@@ -5,6 +5,7 @@ import json
 import os
 import threading
 import uuid
+from contextlib import contextmanager
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -13,6 +14,13 @@ from app.alpha_mining.evidence import AlphaEvidenceStore
 from app.alpha_mining.policy import HARD_GATES
 
 _LOCK = threading.RLock()
+
+
+@contextmanager
+def promotion_lock():
+    """Serialize validation, create-only publication and champion ledger updates."""
+    with _LOCK:
+        yield
 
 
 class AlphaChampionStore:
@@ -57,9 +65,14 @@ class AlphaChampionStore:
                 "gates_pending": sum(gate.get("status") == "pending" for gate in gates),
             })
         candidates.sort(key=lambda item: _return_key(item.get("return")), reverse=True)
-        return {"champion": self.get()["current"], "challengers": candidates}
+        ledger = self.get()
+        return {
+            "champion": ledger["current"],
+            "history": list(ledger.get("history") or []),
+            "challengers": candidates,
+        }
 
-    def promote(self, candidate_id: str, strategy_id: str) -> dict[str, Any]:
+    def validate_promotion(self, candidate_id: str) -> dict[str, Any]:
         with _LOCK:
             candidate = self.evidence.get_candidate(candidate_id)
             if candidate["state"]["state"] != "challenger":
@@ -77,6 +90,17 @@ class AlphaChampionStore:
                 or forward.get("verdict") != "passed"
             ):
                 raise ValueError("候选仍有未通过或待验证门槛")
+            compared = evaluation.get("champion") or {}
+            compared_strategy_id = compared.get("strategy_id") if isinstance(compared, dict) else None
+            current = self.get()["current"]
+            if compared_strategy_id != current.get("strategy_id"):
+                raise ValueError("动态冠军已变化; 候选必须按当前冠军重新完成严格验证")
+            return candidate
+
+    def promote(self, candidate_id: str, strategy_id: str) -> dict[str, Any]:
+        with _LOCK:
+            candidate = self.validate_promotion(candidate_id)
+            evaluation = (candidate.get("outer_evaluation") or {}).get("evaluation") or {}
             current = self.get()
             history = list(current.get("history") or [])
             history.append(dict(current["current"]))
@@ -87,13 +111,23 @@ class AlphaChampionStore:
                     "strategy_id": strategy_id,
                     "candidate_id": candidate_id,
                     "effective_at": datetime.now(UTC).isoformat(),
-                    "reason": "all historical, stress and forward gates passed",
+                    "reason": "全部历史、压力、前向及动态冠军一致性门槛通过",
+                    "metrics": dict(evaluation.get("metrics") or {}),
                 },
                 "history": history,
             }
             self.path.parent.mkdir(parents=True, exist_ok=True)
             _atomic_json(self.path, next_value)
             self.evidence.transition(candidate_id, "champion", {"strategy_id": strategy_id})
+            previous_candidate_id = current["current"].get("candidate_id")
+            if previous_candidate_id and previous_candidate_id != candidate_id:
+                previous = self.evidence.get_state(str(previous_candidate_id))
+                if previous["state"] == "champion":
+                    self.evidence.transition(
+                        str(previous_candidate_id),
+                        "retired",
+                        {"replaced_by": candidate_id, "strategy_id": strategy_id},
+                    )
             return next_value
 
 

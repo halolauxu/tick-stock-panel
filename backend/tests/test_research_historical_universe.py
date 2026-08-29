@@ -96,13 +96,15 @@ def test_instrument_frame_uses_last_point_in_time_share_record():
     assert result["float_shares"][0] == 850_000.0
 
 
-def test_main_board_and_listing_overlap_are_explicit():
+def test_a_share_boards_and_listing_overlap_are_explicit():
     module = _module()
 
-    assert module._is_main_board("600001.SH")
-    assert module._is_main_board("002001.SZ")
-    assert not module._is_main_board("300001.SZ")
-    assert not module._is_main_board("688001.SH")
+    assert module._is_a_share_equity("600001.SH")
+    assert module._is_a_share_equity("002001.SZ")
+    assert module._is_a_share_equity("300001.SZ")
+    assert module._is_a_share_equity("688001.SH")
+    assert module._is_a_share_equity("920001.BJ")
+    assert not module._is_a_share_equity("000001.HK")
     assert module._overlaps(
         {"list_date": "20100101", "delist_date": "20150101"},
         date(2013, 1, 1),
@@ -113,3 +115,28 @@ def test_main_board_and_listing_overlap_are_explicit():
         date(2013, 1, 1),
         date(2020, 1, 1),
     )
+
+
+def test_name_history_adds_safe_interval_for_stock_without_renaming():
+    module = _module()
+    universe = pl.DataFrame({
+        "symbol": ["600001.SH", "300001.SZ"],
+        "name": ["历史更名", "从未更名"],
+        "list_date": [date(2000, 1, 1), date(2010, 1, 1)],
+        "delist_date": [None, None],
+    })
+    names = pl.DataFrame({
+        "symbol": ["600001.SH"],
+        "name": ["历史更名"],
+        "start_date": [date(2000, 1, 1)],
+        "end_date": [None],
+        "announce_date": [None],
+        "change_reason": ["更名"],
+    })
+
+    result = module._complete_name_history(universe, names)
+
+    assert set(result["symbol"].to_list()) == {"600001.SH", "300001.SZ"}
+    baseline = result.filter(pl.col("symbol") == "300001.SZ").row(0, named=True)
+    assert baseline["start_date"] == date(2010, 1, 1)
+    assert baseline["change_reason"] == "stock_basic未发生更名"

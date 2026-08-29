@@ -89,6 +89,67 @@ def test_champion_ledger_starts_empty_instead_of_using_an_existing_strategy(tmp_
     assert current["candidate_id"] is None
 
 
+def _make_challenger(
+    store: AlphaEvidenceStore,
+    run_id: str,
+    *,
+    compared_strategy_id: str | None,
+) -> str:
+    store.create_experiment(run_id, {"request": {"forward_horizon": 5}})
+    frozen = _candidate()
+    candidate = store.freeze_candidate(
+        run_id=run_id,
+        engine_id="test_engine",
+        candidate=frozen.to_dict(),
+        renderer=dict(DeclarativeCandidateRenderer().render(frozen)),
+    )
+    gates = [
+        {"id": gate["id"], "status": "passed"}
+        for gate in HARD_GATES
+        if gate["id"] != "forward_shadow"
+    ]
+    evaluation = {
+        "metrics": {
+            "stitched_oos_return": 0.20,
+            "stitched_oos_sharpe": 1.20,
+            "max_drawdown": -0.10,
+        },
+        "gates": gates,
+    }
+    if compared_strategy_id is not None:
+        evaluation["champion"] = {"strategy_id": compared_strategy_id}
+    candidate_id = candidate["candidate_id"]
+    store.record_outer_evaluation(candidate_id, evaluation, "research_candidate")
+    store.transition(candidate_id, "shadow", {})
+    store.write_forward_evaluation(candidate_id, {"verdict": "passed"})
+    store.transition(candidate_id, "challenger", {})
+    return candidate_id
+
+
+def test_dynamic_champion_rejects_stale_comparison_and_retires_previous(tmp_path) -> None:
+    store = AlphaEvidenceStore(tmp_path)
+    champions = AlphaChampionStore(tmp_path, store)
+    first = _make_challenger(store, "alpha-first", compared_strategy_id=None)
+    champions.promote(first, "alpha_factor_first")
+
+    stale = _make_challenger(store, "alpha-stale", compared_strategy_id=None)
+    with pytest.raises(ValueError, match="动态冠军已变化"):
+        champions.promote(stale, "alpha_factor_stale")
+
+    second = _make_challenger(
+        store,
+        "alpha-second",
+        compared_strategy_id="alpha_factor_first",
+    )
+    ledger = champions.promote(second, "alpha_factor_second")
+
+    assert ledger["current"]["candidate_id"] == second
+    assert ledger["current"]["metrics"]["stitched_oos_return"] == 0.20
+    assert store.get_state(first)["state"] == "retired"
+    assert store.get_state(second)["state"] == "champion"
+    assert champions.leaderboard()["history"][-1]["candidate_id"] == first
+
+
 def test_experiment_result_is_write_once_and_lists_failed_trials(tmp_path) -> None:
     store = AlphaEvidenceStore(tmp_path)
     store.create_experiment("alpha-ledger", {"budget": 3})

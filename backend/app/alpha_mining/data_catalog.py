@@ -63,6 +63,7 @@ class AlphaResearchDataCatalog:
             },
         )
         universe = self._historical_universe(start, end)
+        share_history = self._share_history_qualification()
         financial = self._financials()
         industry = self._historical_industry(start, end)
         events = self._events()
@@ -74,6 +75,7 @@ class AlphaResearchDataCatalog:
         datasets = {
             "daily_enriched": daily,
             "historical_universe": universe,
+            "share_history_pit": share_history,
             "financial_pit": financial,
             "industry_pit": industry,
             "event_history": events,
@@ -97,14 +99,21 @@ class AlphaResearchDataCatalog:
             last_date=partition_dates[-1].isoformat() if partition_dates else None,
         )
 
-    def apply_formal_pit_context(self, panel: pl.DataFrame) -> tuple[pl.DataFrame, dict[str, Any]]:
+    def apply_formal_pit_context(
+        self,
+        panel: pl.DataFrame,
+        *,
+        require_share_history: bool = True,
+    ) -> tuple[pl.DataFrame, dict[str, Any]]:
         if panel.is_empty():
             return panel, {"eligible_rows": 0, "input_rows": 0}
         universe_path = self.data_dir / "research" / "historical_stock_universe.parquet"
         names_path = self.data_dir / "research" / "historical_stock_names.parquet"
         shares = _share_history(self.data_dir)
-        if not universe_path.is_file() or not names_path.is_file() or shares.is_empty():
-            raise ValueError("正式Alpha研究缺少历史股票池、名称或点时股本")
+        if not universe_path.is_file() or not names_path.is_file():
+            raise ValueError("正式Alpha研究缺少历史股票池或名称")
+        if require_share_history and shares.is_empty():
+            raise ValueError("所选换手率因子缺少点时股本")
         work = panel.with_columns(pl.col("date").cast(pl.Date)).sort(["symbol", "date"])
         universe = pl.read_parquet(universe_path).with_columns(
             pl.col("list_date").cast(pl.Date, strict=False),
@@ -131,36 +140,48 @@ class AlphaResearchDataCatalog:
             & (pl.col("end_date").is_null() | (pl.col("date") <= pl.col("end_date")))
             & ~pl.col("name").str.to_uppercase().str.contains(r"(?:\*?ST|退)")
         )
-        shares = shares.with_columns(
-            pl.coalesce(
-                pl.col("announce_date").cast(pl.Date, strict=False),
-                pl.col("period_end").cast(pl.Date, strict=False),
-            ).alias("available_date")
-        ).drop_nulls("available_date").sort(["symbol", "available_date"])
-        work = work.sort(["symbol", "date"]).join_asof(
-            shares.select("symbol", "available_date", "total_shares", "float_shares"),
-            left_on="date",
-            right_on="available_date",
-            by="symbol",
-            strategy="backward",
-            check_sortedness=False,
-        ).filter(
-            pl.col("total_shares").is_not_null()
-            & (pl.col("total_shares") > 0)
-            & pl.col("float_shares").is_not_null()
-            & (pl.col("float_shares") > 0)
-            & (pl.col("float_shares") <= pl.col("total_shares"))
-        )
+        if require_share_history:
+            shares = shares.with_columns(
+                pl.coalesce(
+                    pl.col("announce_date").cast(pl.Date, strict=False),
+                    pl.col("period_end").cast(pl.Date, strict=False),
+                ).alias("available_date")
+            ).drop_nulls("available_date").sort(["symbol", "available_date"])
+            work = work.sort(["symbol", "date"]).join_asof(
+                shares.select("symbol", "available_date", "total_shares", "float_shares"),
+                left_on="date",
+                right_on="available_date",
+                by="symbol",
+                strategy="backward",
+                check_sortedness=False,
+            ).filter(
+                pl.col("total_shares").is_not_null()
+                & (pl.col("total_shares") > 0)
+                & pl.col("float_shares").is_not_null()
+                & (pl.col("float_shares") > 0)
+                & (pl.col("float_shares") <= pl.col("total_shares"))
+            )
         audit = {
             "input_rows": panel.height,
             "eligible_rows": work.height,
             "eligible_symbols": work.get_column("symbol").n_unique() if work.height else 0,
             "coverage": work.height / panel.height if panel.height else 0.0,
             "pit_verified": True,
+            "share_history_required": require_share_history,
+            "share_history_applied": require_share_history,
         }
-        return work.drop(
-            "list_date", "delist_date", "start_date", "end_date", "available_date"
-        ), audit
+        helper_columns = [
+            name
+            for name in (
+                "list_date",
+                "delist_date",
+                "start_date",
+                "end_date",
+                "available_date",
+            )
+            if name in work.columns
+        ]
+        return work.drop(*helper_columns), audit
 
     def attach_industry_context(self, panel: pl.DataFrame) -> tuple[pl.DataFrame, dict[str, Any]]:
         membership_path = self.data_dir / "research" / "sw_l1_membership.parquet"
@@ -339,10 +360,7 @@ class AlphaResearchDataCatalog:
             "universe": root / "historical_stock_universe.parquet",
             "names": root / "historical_stock_names.parquet",
         }
-        shares = _share_history(self.data_dir)
         missing = [name for name, path in paths.items() if not path.is_file()]
-        if shares.is_empty():
-            missing.append("shares")
         if missing:
             return DataQualification(
                 False,
@@ -366,6 +384,20 @@ class AlphaResearchDataCatalog:
                 "symbols": universe.get_column("symbol").n_unique() if ready else 0,
                 "start": start.isoformat(),
                 "end": end.isoformat(),
+            },
+        )
+
+    def _share_history_qualification(self) -> DataQualification:
+        shares = _share_history(self.data_dir)
+        ready = not shares.is_empty()
+        return DataQualification(
+            ready,
+            () if ready else ("缺少点时股本",),
+            {
+                "coverage": 1.0 if ready else 0.0,
+                "pit_verified": ready,
+                "rows": shares.height,
+                "symbols": shares.get_column("symbol").n_unique() if ready else 0,
             },
         )
 

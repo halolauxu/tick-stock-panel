@@ -1,4 +1,5 @@
 """Independent Alpha mining API. The legacy ``/api/backtest/mining`` API is untouched."""
+# ruff: noqa: RUF001
 from __future__ import annotations
 
 import asyncio
@@ -12,11 +13,13 @@ from fastapi import APIRouter, Header, HTTPException, Query, Request
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 from sse_starlette.sse import EventSourceResponse
 
-from app.alpha_mining.champion import AlphaChampionStore
+from app.alpha_mining.ai_hypothesis_proposer import AlphaAIHypothesisProposer
+from app.alpha_mining.champion import AlphaChampionStore, promotion_lock
 from app.alpha_mining.config_store import AlphaConfigStore
 from app.alpha_mining.contracts import DataCatalogContext, qualify_manifest_datasets
 from app.alpha_mining.data_catalog import AlphaResearchDataCatalog
 from app.alpha_mining.evidence import AlphaEvidenceError, AlphaEvidenceStore
+from app.alpha_mining.hypotheses import AlphaHypothesisStore
 from app.alpha_mining.policy import charter
 from app.alpha_mining.publication import AlphaPublicationService
 from app.alpha_mining.registry import AlphaEngineRegistryError, load_builtin_registry
@@ -37,6 +40,12 @@ from app.services.mining_preflight import enriched_partition_dates
 router = APIRouter(prefix="/api/alpha-mining/v1", tags=["alpha-mining"])
 _REGISTRY, _ENGINE_LOAD_FAILURES = load_builtin_registry()
 _FACTOR_IDS = frozenset(str(item["id"]) for item in FACTOR_COLUMNS)
+_FINANCIAL_FACTOR_IDS = frozenset(
+    str(item["id"]) for item in FACTOR_COLUMNS if item.get("group") == "财务"
+)
+_SHARE_HISTORY_FACTOR_IDS = frozenset(
+    {"turnover_rate", "turnover_ratio_5d", "turnover_z_60d"}
+)
 _DEFAULT_FACTORS = [str(item["id"]) for item in FACTOR_COLUMNS]
 _SUCCESS = frozenset(SUCCESS_RUN_STATUSES)
 
@@ -59,6 +68,10 @@ class AlphaMiningStartRequest(BaseModel):
     max_positions: int = Field(10, ge=1, le=50)
     max_candidates_per_engine: int = Field(4, ge=1, le=12)
     max_trials_per_engine: int = Field(64, ge=4, le=256)
+    source_run_id: str | None = Field(None, min_length=1, max_length=80)
+    source_suggestion_id: str | None = Field(None, min_length=1, max_length=120)
+    source_candidate_id: str | None = Field(None, min_length=1, max_length=80)
+    hypothesis_id: str | None = Field(None, min_length=3, max_length=120)
     force: bool = False
 
     @field_validator("start", "end", mode="before")
@@ -97,6 +110,9 @@ class AlphaMiningStartRequest(BaseModel):
     def _range(self):
         if self.start is not None and self.end is not None and self.start > self.end:
             raise ValueError("start must not be after end")
+        source_kind_count = int(bool(self.source_suggestion_id)) + int(bool(self.source_candidate_id))
+        if bool(self.source_run_id) != (source_kind_count == 1):
+            raise ValueError("source_run_id and exactly one lineage source must be provided together")
         return self
 
 
@@ -118,6 +134,67 @@ class AlphaShadowStartRequest(BaseModel):
     baseline_date: date | None = None
 
 
+class AlphaHypothesisCreateRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    source_kind: Literal["manual"] = "manual"
+    title: str = Field(min_length=3, max_length=120)
+    thesis: str = Field(min_length=10, max_length=1000)
+    mechanism: str = Field(min_length=10, max_length=1000)
+    prediction_object: Literal["forward_net_return", "market_residual_return"] = "forward_net_return"
+    asset_type: Literal["stock", "etf"] = "stock"
+    forward_horizon: Literal[1, 3, 5, 10, 20, 60] = 5
+    information_domains: list[str] = Field(min_length=1, max_length=12)
+    test_spec: dict[str, Any]
+    falsification: list[str] = Field(min_length=1, max_length=12)
+    data_requirements: list[str] = Field(min_length=1, max_length=12)
+
+
+class AlphaHypothesisRunRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    start: date | None = None
+    end: date | None = None
+    budget_profile: Literal["exploratory", "balanced", "strict"] = "exploratory"
+    commission_pct: float = Field(0.0002, ge=0.0, le=0.05, allow_inf_nan=False)
+    stamp_tax_pct: float = Field(0.0005, ge=0.0, le=0.05, allow_inf_nan=False)
+    slippage_bps: float = Field(5.0, ge=0.0, le=1000.0, allow_inf_nan=False)
+    max_positions: int = Field(10, ge=1, le=50)
+    force: bool = False
+
+    @field_validator("start", "end", mode="before")
+    @classmethod
+    def _dates(cls, value: Any) -> Any:
+        return date.fromisoformat(value) if isinstance(value, str) else value
+
+    @model_validator(mode="after")
+    def _range(self):
+        if self.start is not None and self.end is not None and self.start > self.end:
+            raise ValueError("start must not be after end")
+        return self
+
+
+class AlphaAIHypothesisProposalRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    asset_type: Literal["stock", "etf"] = "stock"
+    start: date
+    end: date
+    count: int = Field(3, ge=1, le=6)
+    research_focus: str = Field("", max_length=500)
+
+    @field_validator("start", "end", mode="before")
+    @classmethod
+    def _dates(cls, value: Any) -> Any:
+        return date.fromisoformat(value) if isinstance(value, str) else value
+
+    @model_validator(mode="after")
+    def _range(self):
+        if self.start > self.end:
+            raise ValueError("start must not be after end")
+        return self
+
+
 @router.get("/charter")
 def get_charter() -> dict[str, Any]:
     return charter()
@@ -133,6 +210,137 @@ def get_engines() -> dict[str, Any]:
         "taxonomy": coverage_matrix([engine.manifest for engine in engines]),
         "load_failures": list(_ENGINE_LOAD_FAILURES),
     }
+
+
+@router.get("/hypotheses")
+def list_hypotheses(
+    request: Request,
+    asset_type: Annotated[Literal["stock", "etf"], Query()] = "stock",
+    start: Annotated[date | None, Query()] = None,
+    end: Annotated[date | None, Query()] = None,
+) -> dict[str, Any]:
+    store = AlphaHypothesisStore(_data_dir(request))
+    dates = enriched_partition_dates(_data_dir(request), asset_type, start, end)
+    catalog = None
+    engine_rows: dict[str, dict[str, Any]] = {}
+    if dates:
+        catalog = AlphaResearchDataCatalog(_data_dir(request)).snapshot(dates[0], dates[-1], asset_type)
+        for horizon in (1, 3, 5, 10, 20, 60):
+            for row in _engine_availability(asset_type, dates[0], dates[-1], horizon, catalog):
+                engine_rows[f"{horizon}:{row['engine_id']}"] = row
+    items = []
+    for hypothesis in store.list_all():
+        row = dict(hypothesis)
+        reasons: list[str] = []
+        if row["asset_type"] != asset_type:
+            reasons.append("该假设不适用于当前资产类型")
+        if not dates or catalog is None:
+            reasons.append("所选区间没有可用的enriched交易日")
+        else:
+            for dataset_id in row.get("data_requirements") or []:
+                qualification = catalog.datasets.get(str(dataset_id))
+                if qualification is None or not qualification.ready:
+                    reasons.extend(
+                        list(qualification.reasons)
+                        if qualification is not None else [f"缺少数据集: {dataset_id}"]
+                    )
+            for engine_id in (row.get("test_spec") or {}).get("engine_ids") or []:
+                engine_row = engine_rows.get(f"{row['forward_horizon']}:{engine_id}")
+                if engine_row is None or not engine_row["ready"]:
+                    reasons.extend(
+                        list(engine_row.get("reasons") or [])
+                        if engine_row is not None else [f"发现引擎不可用: {engine_id}"]
+                    )
+            try:
+                _validate_factor_datasets(
+                    list((row.get("test_spec") or {}).get("factor_names") or []),
+                    catalog,
+                )
+            except ValueError as exc:
+                reasons.append(str(exc))
+        row["readiness"] = {"ready": not reasons, "reasons": list(dict.fromkeys(reasons))}
+        items.append(row)
+    return {"items": items}
+
+
+@router.post("/hypotheses")
+def create_hypothesis(payload: AlphaHypothesisCreateRequest, request: Request) -> dict[str, Any]:
+    try:
+        return AlphaHypothesisStore(_data_dir(request)).create(payload.model_dump(mode="json"))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.post("/hypotheses/ai-proposals")
+async def propose_ai_hypotheses(
+    payload: AlphaAIHypothesisProposalRequest,
+    request: Request,
+) -> dict[str, Any]:
+    try:
+        return await AlphaAIHypothesisProposer(_data_dir(request)).propose(
+            asset_type=payload.asset_type,
+            start=payload.start,
+            end=payload.end,
+            count=payload.count,
+            research_focus=payload.research_focus,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail="DeepSeek假设生成失败，请检查AI服务后重试") from exc
+
+
+@router.get("/hypotheses/{hypothesis_id}")
+def get_hypothesis(hypothesis_id: str, request: Request) -> dict[str, Any]:
+    try:
+        return AlphaHypothesisStore(_data_dir(request)).get(hypothesis_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="Alpha假设不存在") from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.post("/hypotheses/{hypothesis_id}/runs")
+def start_hypothesis_run(
+    hypothesis_id: str,
+    payload: AlphaHypothesisRunRequest,
+    request: Request,
+) -> dict[str, Any]:
+    try:
+        hypothesis = AlphaHypothesisStore(_data_dir(request)).get(hypothesis_id)
+        spec = dict(hypothesis["test_spec"])
+        profile_budget = {
+            "exploratory": (2, 24),
+            "balanced": (4, 64),
+            "strict": (8, 128),
+        }[payload.budget_profile]
+        request_payload = {
+            "engine_ids": list(spec["engine_ids"]),
+            "factor_names": list(spec["factor_names"]),
+            "asset_type": hypothesis["asset_type"],
+            "start": payload.start,
+            "end": payload.end,
+            "budget_profile": payload.budget_profile,
+            "forward_horizon": hypothesis["forward_horizon"],
+            "commission_pct": payload.commission_pct,
+            "stamp_tax_pct": payload.stamp_tax_pct,
+            "slippage_bps": payload.slippage_bps,
+            "max_positions": payload.max_positions,
+            "max_candidates_per_engine": profile_budget[0],
+            "max_trials_per_engine": profile_budget[1],
+            "hypothesis_id": hypothesis_id,
+            "force": payload.force,
+        }
+        if hypothesis.get("source_run_id") and hypothesis.get("source_suggestion_id"):
+            request_payload.update({
+                "source_run_id": hypothesis["source_run_id"],
+                "source_suggestion_id": hypothesis["source_suggestion_id"],
+            })
+        return start_run(AlphaMiningStartRequest.model_validate(request_payload), request)
+    except HTTPException:
+        raise
+    except (KeyError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 @router.get("/config")
@@ -259,6 +467,8 @@ def start_run(payload: AlphaMiningStartRequest, request: Request) -> dict[str, A
             request.app.state.strategy_engine.get(champion_strategy_id)
         worker_request = payload.model_dump(mode="json", exclude={"force"})
         worker_request["champion_strategy_id"] = champion_strategy_id
+        _attach_hypothesis_contract(manager, worker_request)
+        _attach_failure_lineage(manager, worker_request)
         dates = enriched_partition_dates(
             request.app.state.repo.store.data_dir,
             payload.asset_type,
@@ -268,6 +478,12 @@ def start_run(payload: AlphaMiningStartRequest, request: Request) -> dict[str, A
         validation = _validation_config(payload.budget_profile, payload.forward_horizon)
         if len(dates) < required_trading_bars(validation, 1):
             raise ValueError("所选区间不足以形成一个隔离的外层样本外窗口")
+        catalog = AlphaResearchDataCatalog(_data_dir(request)).snapshot(
+            dates[0],
+            dates[-1],
+            payload.asset_type,
+        )
+        _validate_factor_datasets(payload.factor_names, catalog)
         _validate_engines(
             payload.engine_ids,
             payload.asset_type,
@@ -372,6 +588,47 @@ def start_shadow(
         raise HTTPException(status_code=409, detail=str(exc)) from exc
 
 
+@router.post("/candidates/{candidate_id}/strict-validation")
+def start_strict_validation(candidate_id: str, request: Request) -> dict[str, Any]:
+    """Create a new full-history strict run for one immutable discovery path."""
+    try:
+        evidence = AlphaEvidenceStore(_data_dir(request))
+        candidate = evidence.get_candidate(candidate_id)
+        if candidate["state"]["state"] != "validation_candidate":
+            raise ValueError("只有待严格验证的候选可以创建全历史严格运行")
+        source = evidence.read_experiment(str(candidate["run_id"]))
+        source_request = dict(source.get("contract", {}).get("request") or {})
+        asset_type = str(source_request.get("asset_type") or "stock")
+        dates = enriched_partition_dates(_data_dir(request), asset_type)
+        if not dates:
+            raise ValueError("没有可用于严格验证的完整历史交易日")
+        base = {
+            field: source_request[field]
+            for field in AlphaMiningStartRequest.model_fields
+            if field in source_request
+        }
+        payload = AlphaMiningStartRequest.model_validate({
+            **base,
+            "engine_ids": [candidate["engine_id"]],
+            "asset_type": asset_type,
+            "start": dates[0],
+            "end": dates[-1],
+            "budget_profile": "strict",
+            "max_candidates_per_engine": 8,
+            "max_trials_per_engine": 128,
+            "champion_strategy_id": None,
+            "source_run_id": candidate["run_id"],
+            "source_suggestion_id": None,
+            "source_candidate_id": candidate_id,
+            "force": True,
+        })
+        return start_run(payload, request)
+    except HTTPException:
+        raise
+    except (AlphaEvidenceError, KeyError, ValueError) as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
 @router.get("/candidates/{candidate_id}/shadow")
 def get_shadow(candidate_id: str, request: Request) -> dict[str, Any]:
     try:
@@ -401,14 +658,14 @@ def evaluate_shadow(candidate_id: str, request: Request) -> dict[str, Any]:
 @router.post("/candidates/{candidate_id}/promote")
 def promote_candidate(candidate_id: str, request: Request) -> dict[str, Any]:
     try:
-        publication = AlphaPublicationService(
-            _data_dir(request),
-            request.app.state.strategy_engine,
-        ).publish(candidate_id)
-        champion = AlphaChampionStore(_data_dir(request)).promote(
-            candidate_id,
-            publication["strategy_id"],
-        )
+        champion_store = AlphaChampionStore(_data_dir(request))
+        with promotion_lock():
+            champion_store.validate_promotion(candidate_id)
+            publication = AlphaPublicationService(
+                _data_dir(request),
+                request.app.state.strategy_engine,
+            ).publish(candidate_id)
+            champion = champion_store.promote(candidate_id, publication["strategy_id"])
         return {"publication": publication, "champion": champion}
     except (KeyError, ValueError, RuntimeError) as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
@@ -479,6 +736,128 @@ def _project_run(store, manifest: Mapping[str, Any]) -> dict[str, Any]:
     }
 
 
+def _attach_failure_lineage(manager, worker_request: dict[str, Any]) -> None:
+    source_run_id = worker_request.get("source_run_id")
+    suggestion_id = worker_request.get("source_suggestion_id")
+    source_candidate_id = worker_request.get("source_candidate_id")
+    if source_run_id is None and suggestion_id is None and source_candidate_id is None:
+        worker_request.pop("source_run_id", None)
+        worker_request.pop("source_suggestion_id", None)
+        worker_request.pop("source_candidate_id", None)
+        return
+    source = manager.store.get(str(source_run_id))
+    if source is None or source.get("status") not in _SUCCESS:
+        raise ValueError("研究来源不存在或尚未完成")
+    source_result = manager.store.read_summary(str(source_run_id))
+    if source_candidate_id is not None:
+        _validate_strict_candidate_lineage(
+            manager,
+            worker_request,
+            candidate_id=str(source_candidate_id),
+        )
+        return
+    suggestions = source_result.get("next_research_suggestions")
+    suggestion = next(
+        (
+            row for row in suggestions
+            if isinstance(row, Mapping) and row.get("suggestion_id") == suggestion_id
+        ),
+        None,
+    ) if isinstance(suggestions, list) else None
+    if suggestion is None:
+        raise ValueError("失败研究建议不存在，不能建立新实验血缘")
+    patch = suggestion.get("request_patch")
+    if not isinstance(patch, Mapping) or not patch:
+        raise ValueError("失败研究建议没有可执行差异")
+    for field, expected in patch.items():
+        if worker_request.get(field) != expected:
+            raise ValueError(f"新实验没有采用建议中的字段差异: {field}")
+    source_request = source.get("request")
+    if not isinstance(source_request, Mapping):
+        raise ValueError("失败研究来源缺少冻结请求")
+    ignored = {
+        "champion_strategy_id", "source_run_id", "source_suggestion_id",
+        "source_candidate_id", "source_diff",
+    }
+    fields = sorted((set(source_request) | set(worker_request)) - ignored)
+    diff = {
+        field: {"before": source_request.get(field), "after": worker_request.get(field)}
+        for field in fields
+        if source_request.get(field) != worker_request.get(field)
+    }
+    if not diff:
+        raise ValueError("新实验与失败研究来源没有任何差异")
+    worker_request["source_diff"] = diff
+
+
+def _attach_hypothesis_contract(manager, worker_request: dict[str, Any]) -> None:
+    hypothesis_id = worker_request.get("hypothesis_id")
+    if not hypothesis_id:
+        worker_request.pop("hypothesis_id", None)
+        return
+    try:
+        hypothesis = AlphaHypothesisStore(manager._data_dir).get(str(hypothesis_id))
+    except KeyError as exc:
+        raise ValueError("Alpha假设不存在") from exc
+    spec = hypothesis["test_spec"]
+    expected = {
+        "asset_type": hypothesis["asset_type"],
+        "forward_horizon": hypothesis["forward_horizon"],
+        "engine_ids": spec["engine_ids"],
+        "factor_names": spec["factor_names"],
+    }
+    for field, value in expected.items():
+        if worker_request.get(field) != value:
+            raise ValueError(f"研究请求偏离冻结Alpha假设: {field}")
+    worker_request["hypothesis_contract"] = hypothesis
+
+
+def _validate_strict_candidate_lineage(
+    manager,
+    worker_request: dict[str, Any],
+    *,
+    candidate_id: str,
+) -> None:
+    evidence = manager.evidence.get_candidate(candidate_id)
+    if evidence["state"]["state"] != "validation_candidate":
+        raise ValueError("严格验证来源候选不处于待严格验证状态")
+    if evidence["run_id"] != worker_request.get("source_run_id"):
+        raise ValueError("严格验证来源候选与来源运行不一致")
+    source = manager.store.get(str(evidence["run_id"]))
+    source_request = source.get("request") if isinstance(source, Mapping) else None
+    if not isinstance(source_request, Mapping):
+        raise ValueError("严格验证来源缺少冻结请求")
+    dates = enriched_partition_dates(
+        manager._data_dir,
+        str(source_request.get("asset_type") or "stock"),
+    )
+    expected = {
+        "engine_ids": [evidence["engine_id"]],
+        "factor_names": source_request.get("factor_names"),
+        "budget_profile": "strict",
+        "start": dates[0].isoformat() if dates else None,
+        "end": dates[-1].isoformat() if dates else None,
+        "max_candidates_per_engine": 8,
+        "max_trials_per_engine": 128,
+    }
+    for field, value in expected.items():
+        if worker_request.get(field) != value:
+            raise ValueError(f"严格验证合同字段不符合冻结升级规则: {field}")
+    ignored = {
+        "champion_strategy_id", "source_run_id", "source_suggestion_id",
+        "source_candidate_id", "source_diff",
+    }
+    fields = sorted((set(source_request) | set(worker_request)) - ignored)
+    diff = {
+        field: {"before": source_request.get(field), "after": worker_request.get(field)}
+        for field in fields
+        if source_request.get(field) != worker_request.get(field)
+    }
+    if not diff:
+        raise ValueError("严格验证运行与来源合同没有差异")
+    worker_request["source_diff"] = diff
+
+
 def _validate_engines(
     engine_ids: list[str],
     asset_type: str,
@@ -510,6 +889,31 @@ def _validate_engines(
             raise ValueError(
                 f"Alpha engine {engine_id} data gate failed: "
                 + "; ".join(row["reasons"])
+            )
+
+
+def _validate_factor_datasets(factor_names: list[str], catalog: Any) -> None:
+    selected_financial = sorted(set(factor_names) & _FINANCIAL_FACTOR_IDS)
+    if selected_financial:
+        qualification = catalog.datasets["financial_pit"]
+        if not qualification.ready:
+            reasons = "; ".join(qualification.reasons) or "公告时点财务数据未就绪"
+            raise ValueError(
+                "所选财务因子不能进入正式历史研究: "
+                + ", ".join(selected_financial)
+                + "; "
+                + reasons
+            )
+    selected_share = sorted(set(factor_names) & _SHARE_HISTORY_FACTOR_IDS)
+    if selected_share:
+        qualification = catalog.datasets["share_history_pit"]
+        if not qualification.ready:
+            reasons = "; ".join(qualification.reasons) or "点时股本数据未就绪"
+            raise ValueError(
+                "所选换手率因子不能进入正式历史研究: "
+                + ", ".join(selected_share)
+                + "; "
+                + reasons
             )
 
 

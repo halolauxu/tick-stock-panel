@@ -63,6 +63,35 @@ def test_catalog_applies_historical_universe_name_st_and_share_pit(tmp_path) -> 
     assert audit["eligible_symbols"] == 1
 
 
+def test_non_turnover_research_does_not_require_share_history(tmp_path) -> None:
+    research = tmp_path / "research"
+    _write(research / "historical_stock_universe.parquet", pl.DataFrame({
+        "symbol": ["000001.SZ"],
+        "list_date": [date(2020, 1, 1)],
+        "delist_date": [None],
+    }))
+    _write(research / "historical_stock_names.parquet", pl.DataFrame({
+        "symbol": ["000001.SZ"],
+        "name": ["正常公司"],
+        "start_date": [date(2020, 1, 1)],
+        "end_date": [None],
+    }))
+    day = date(2026, 1, 5)
+    enriched = tmp_path / "kline_daily_enriched" / f"date={day.isoformat()}"
+    _write(enriched / "part.parquet", pl.DataFrame({"symbol": ["000001.SZ"], "date": [day]}))
+    catalog = AlphaResearchDataCatalog(tmp_path)
+    snapshot = catalog.snapshot(day, day)
+    assert snapshot.datasets["historical_universe"].ready is True
+    assert snapshot.datasets["share_history_pit"].ready is False
+    panel = pl.DataFrame({"symbol": ["000001.SZ"], "date": [day], "close": [10.0]})
+    eligible, audit = catalog.apply_formal_pit_context(
+        panel,
+        require_share_history=False,
+    )
+    assert eligible.height == 1
+    assert audit["share_history_required"] is False
+
+
 def test_financial_context_is_invisible_before_announcement(tmp_path) -> None:
     _write(tmp_path / "financials" / "metrics" / "part.parquet", pl.DataFrame({
         "symbol": ["000001.SZ", "000001.SZ"],

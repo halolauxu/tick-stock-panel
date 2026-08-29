@@ -9,6 +9,7 @@ from typing import Any
 
 from app.alpha_mining.config_store import AlphaConfigStore
 from app.alpha_mining.evidence import AlphaEvidenceStore
+from app.alpha_mining.lifecycle import is_strict_full_history_request
 
 
 class AlphaShadowService:
@@ -23,6 +24,8 @@ class AlphaShadowService:
             raise ValueError("只有通过全部历史与压力门槛的研究候选可以进入前向模拟")
         experiment = self.evidence.read_experiment(candidate["run_id"])
         request = dict(experiment["contract"].get("request") or {})
+        if not is_strict_full_history_request(self.data_dir, request):
+            raise ValueError("候选没有完成全部可用历史的严格验证; 不能进入前向模拟")
         frozen = dict(candidate["candidate"])
         definition = dict(frozen.get("definition") or {})
         if definition.get("kind") != "factor_rank":

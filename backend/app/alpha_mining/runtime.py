@@ -1,5 +1,6 @@
 """Spawn-only Alpha discovery runtime with train-only engines and central OOS execution."""
 # Requirements: AM-S5-001 through AM-S6-012.
+# ruff: noqa: RUF001
 from __future__ import annotations
 
 import math
@@ -42,6 +43,9 @@ from app.strategy.engine import StrategyEngine
 ProgressCallback = Any
 CancelCheck = Any
 _FACTOR_IDS = frozenset(str(item["id"]) for item in FACTOR_COLUMNS)
+_SHARE_HISTORY_FACTOR_IDS = frozenset(
+    {"turnover_rate", "turnover_ratio_5d", "turnover_z_60d"}
+)
 _PROFILES = frozenset({"exploratory", "balanced", "strict"})
 _HORIZONS = frozenset({1, 3, 5, 10, 20, 60})
 
@@ -69,6 +73,12 @@ class AlphaRuntimeRequest:
     max_positions: int
     max_candidates_per_engine: int
     max_trials_per_engine: int
+    source_run_id: str | None = None
+    source_suggestion_id: str | None = None
+    source_candidate_id: str | None = None
+    source_diff: Mapping[str, Any] | None = None
+    hypothesis_id: str | None = None
+    hypothesis_contract: Mapping[str, Any] | None = None
 
 
 def run_alpha_mining_runtime(
@@ -121,6 +131,17 @@ def run_alpha_mining_runtime(
     )
     if source_panel.is_empty():
         raise ValueError("Alpha date range contains no enriched data")
+    # Market attribution is descriptive evidence calculated after the OOS run.
+    # Keep it on the same adjusted-close panel and derive each stock's
+    # contemporaneous daily return here; never substitute a present-day market
+    # snapshot or a future label for historical breadth/regime attribution.
+    source_panel = source_panel.with_columns(
+        (
+            pl.col("close")
+            / pl.col("close").shift(1).over("symbol")
+            - 1.0
+        ).cast(pl.Float32).alias("change_pct")
+    )
     trading_dates = enriched_partition_dates(
         data_dir,
         request.asset_type,
@@ -132,7 +153,18 @@ def run_alpha_mining_runtime(
     universe_qualification = catalog_snapshot.datasets["historical_universe"]
     if not universe_qualification.ready:
         raise ValueError("正式Alpha研究数据门禁失败: " + "; ".join(universe_qualification.reasons))
-    source_panel, universe_audit = catalog.apply_formal_pit_context(source_panel)
+    require_share_history = bool(
+        set(request.factor_names) & _SHARE_HISTORY_FACTOR_IDS
+    )
+    share_qualification = catalog_snapshot.datasets["share_history_pit"]
+    if require_share_history and not share_qualification.ready:
+        raise ValueError(
+            "所选换手率因子缺少点时股本: " + "; ".join(share_qualification.reasons)
+        )
+    source_panel, universe_audit = catalog.apply_formal_pit_context(
+        source_panel,
+        require_share_history=require_share_history,
+    )
     requested_manifests = [registry.get(engine_id).manifest for engine_id in request.engine_ids]
     required_dataset_ids = {
         requirement.dataset_id
@@ -144,7 +176,7 @@ def run_alpha_mining_runtime(
         source_panel, context_audits["financial_pit"] = catalog.attach_financial_context(
             source_panel
         )
-    if "industry_pit" in required_dataset_ids and catalog_snapshot.datasets["industry_pit"].ready:
+    if catalog_snapshot.datasets["industry_pit"].ready:
         source_panel, context_audits["industry_pit"] = catalog.attach_industry_context(source_panel)
     if "event_history" in required_dataset_ids and catalog_snapshot.datasets["event_history"].ready:
         source_panel, context_audits["event_history"] = catalog.attach_event_context(
@@ -152,7 +184,7 @@ def run_alpha_mining_runtime(
             start=request.start,
             end=request.end,
         )
-    for dataset_id in ("financial_pit", "industry_pit", "event_history"):
+    for dataset_id in required_dataset_ids & {"financial_pit", "industry_pit", "event_history"}:
         if dataset_id not in context_audits:
             continue
         required_coverage = max(
@@ -272,8 +304,30 @@ def run_alpha_mining_runtime(
     trial_ledger: list[dict[str, Any]] = []
 
     search_started = time.perf_counter()
-    total_steps = len(nested_folds)
-    emit({"phase": "validation", "label": "滚动发现与外层样本外验证", "done": 0, "total": total_steps})
+    engine_progress = {
+        engine_id: {
+            "engine_id": engine_id,
+            "status": "waiting",
+            "folds_done": 0,
+            "folds_total": len(nested_folds),
+            "trials": 0,
+            "selected": 0,
+            "backtests": 0,
+            "errors": 0,
+            "message": None,
+        }
+        for engine_id in request.engine_ids
+    }
+    total_steps = len(nested_folds) * len(request.engine_ids)
+    progress_done = 0
+    emit(_alpha_progress(
+        phase="validation",
+        label="滚动发现与外层样本外验证",
+        done=0,
+        total=total_steps,
+        request=request,
+        engines=engine_progress,
+    ))
     for fold_number, nested in enumerate(nested_folds, start=1):
         _raise_if_cancelled(cancel_check)
         outer = nested.outer
@@ -299,6 +353,7 @@ def run_alpha_mining_runtime(
                 "outer_index": outer.outer_index,
                 "selection_dates_hidden": len(selection_labels),
                 "outer_test_dates_hidden": len(outer.test_labels),
+                "hypothesis_contract": request.hypothesis_contract,
             },
         )
         if request.champion_strategy_id is not None:
@@ -311,6 +366,18 @@ def run_alpha_mining_runtime(
 
         for engine_id in request.engine_ids:
             engine = registry.get(engine_id)
+            progress_row = engine_progress[engine_id]
+            progress_row["status"] = "running"
+            progress_row["message"] = f"正在处理外层窗口 {fold_number}/{len(nested_folds)}"
+            emit(_alpha_progress(
+                phase="validation",
+                label=f"{engine.manifest.name} · 外层窗口 {fold_number}/{len(nested_folds)}",
+                done=progress_done,
+                total=total_steps,
+                request=request,
+                engines=engine_progress,
+                current_engine_id=engine_id,
+            ))
             engine_trials: list[dict[str, Any]] = []
             engine_context = replace(
                 context,
@@ -338,12 +405,14 @@ def run_alpha_mining_runtime(
                 if not qualification.ready:
                     raise ValueError("; ".join(qualification.reasons))
                 candidates = engine.discover(engine_context, budget)[: budget.max_candidates]
+                discovery_trial_count = len(engine_trials)
                 trial_ledger.extend({
                     "outer_index": outer.outer_index,
                     "engine_id": engine_id,
                     "stage": "discovery",
                     **row,
                 } for row in engine_trials)
+                progress_row["trials"] += discovery_trial_count
                 engine_trials.clear()
                 selected, selection_evidence = _select_on_hidden_inner_window(
                     candidates,
@@ -359,6 +428,7 @@ def run_alpha_mining_runtime(
                     }
                     for row in selection_evidence
                 )
+                progress_row["trials"] += len(selection_evidence)
                 if selected is None:
                     engine_folds[engine_id].append({
                         "outer_index": outer.outer_index,
@@ -366,9 +436,10 @@ def run_alpha_mining_runtime(
                         "train_end": outer.train_end,
                         "test_start": outer.test_start,
                         "test_end": outer.test_end,
-                        "error": "inner selection produced no finite candidate",
+                        "selection_rejection": "inner selection produced no finite candidate",
                     })
                     continue
+                progress_row["selected"] += 1
                 frozen = engine.materialize(selected, engine_context)
                 evaluation = evaluator.evaluate_candidate_labels(
                     outer.train_labels,
@@ -378,13 +449,18 @@ def run_alpha_mining_runtime(
                 engine_folds[engine_id].append(
                     _evaluation_row(outer, selected, evaluation, "candidate")
                 )
+                progress_row["backtests"] += 1
             except Exception as exc:
+                discovery_trial_count = len(engine_trials)
                 trial_ledger.extend({
                     "outer_index": outer.outer_index,
                     "engine_id": engine_id,
                     "stage": "discovery",
                     **row,
                 } for row in engine_trials)
+                progress_row["trials"] += discovery_trial_count
+                progress_row["errors"] += 1
+                progress_row["message"] = str(exc)[:160]
                 discovery_failures.append({
                     "engine_id": engine_id,
                     "stage": f"outer_{outer.outer_index}",
@@ -398,17 +474,41 @@ def run_alpha_mining_runtime(
                     "test_end": outer.test_end,
                     "error": str(exc)[:500],
                 })
-        emit({
-            "phase": "validation",
-            "label": f"完成外层窗口 {fold_number}/{total_steps}",
-            "done": fold_number,
-            "total": total_steps,
-        })
+            finally:
+                progress_done += 1
+                progress_row["folds_done"] = fold_number
+                if (
+                    fold_number == len(nested_folds)
+                    and progress_row["errors"] >= progress_row["folds_total"]
+                ):
+                    progress_row["status"] = "failed"
+                else:
+                    progress_row["status"] = (
+                        "completed" if fold_number == len(nested_folds) else "waiting"
+                    )
+                if not progress_row["errors"]:
+                    progress_row["message"] = (
+                        "外层验证完成" if fold_number == len(nested_folds)
+                        else f"等待外层窗口 {fold_number + 1}/{len(nested_folds)}"
+                    )
+                emit(_alpha_progress(
+                    phase="validation",
+                    label=f"完成 {engine.manifest.name} · 窗口 {fold_number}/{len(nested_folds)}",
+                    done=progress_done,
+                    total=total_steps,
+                    request=request,
+                    engines=engine_progress,
+                    current_engine_id=None,
+                ))
     phase_ms["validation"] = round((time.perf_counter() - search_started) * 1000, 1)
 
     champion_metrics = _aggregate_fold_metrics(benchmark_folds)
     candidates_summary: list[dict[str, Any]] = []
     stress_backtest_count = 0
+    stress_total = sum(
+        1 for folds in engine_folds.values() if _representative_candidate(folds) is not None
+    )
+    stress_done = 0
     for engine_id, folds in engine_folds.items():
         metrics = _aggregate_fold_metrics(folds, champion_folds=benchmark_folds)
         frozen_candidate = _representative_candidate(folds)
@@ -424,6 +524,17 @@ def run_alpha_mining_runtime(
                 "evidence_reason": "inner_selection_no_finite_candidate",
             })
             continue
+        engine_progress[engine_id]["status"] = "stress"
+        engine_progress[engine_id]["message"] = "正在执行统一压力测试"
+        emit(_alpha_progress(
+            phase="stress",
+            label=f"{registry.get(engine_id).manifest.name} · 压力测试",
+            done=stress_done,
+            total=max(stress_total, 1),
+            request=request,
+            engines=engine_progress,
+            current_engine_id=engine_id,
+        ))
         stress_metrics, stress_count = _run_stress_suite(
             folds=folds,
             request=request,
@@ -436,6 +547,18 @@ def run_alpha_mining_runtime(
         )
         metrics.update(stress_metrics)
         stress_backtest_count += stress_count
+        engine_progress[engine_id]["backtests"] += stress_count
+        engine_progress[engine_id]["status"] = "completed"
+        engine_progress[engine_id]["message"] = "样本外与压力测试完成"
+        stress_done += 1
+        emit(_alpha_progress(
+            phase="stress",
+            label=f"完成 {registry.get(engine_id).manifest.name} · 压力测试",
+            done=stress_done,
+            total=max(stress_total, 1),
+            request=request,
+            engines=engine_progress,
+        ))
         gates = evaluate_historical_gates(metrics, champion_metrics)
         historical = [gate for gate in gates if gate["id"] != "forward_shadow"]
         failed = any(gate["status"] == "failed" for gate in historical)
@@ -454,10 +577,39 @@ def run_alpha_mining_runtime(
         key=lambda item: _sortable_return(item.get("metrics", {}).get("stitched_oos_return")),
         reverse=True,
     )
+    discovery_summary = _build_discovery_summary(
+        request.engine_ids,
+        trial_ledger,
+        engine_folds,
+        registry,
+    )
+    market_attribution = {
+        candidate["engine_id"]: _build_market_attribution(candidate, panel)
+        for candidate in candidates_summary
+    }
+    candidate_correlations = _build_candidate_correlations(candidates_summary)
+    failure_analysis, next_research_suggestions = _build_failure_closure(
+        request=request,
+        candidates=candidates_summary,
+        market_attribution=market_attribution,
+        candidate_correlations=candidate_correlations,
+        engine_failures=discovery_failures,
+        registry=registry,
+        catalog_datasets=catalog_snapshot.datasets,
+        available_features=feature_names,
+    )
 
     elapsed_ms = round((time.perf_counter() - started) * 1000, 1)
     phase_ms["total"] = elapsed_ms
-    return {
+    final_progress = _alpha_progress(
+        phase="evidence",
+        label="研究计算完成 正在冻结候选证据",
+        done=1,
+        total=1,
+        request=request,
+        engines=engine_progress,
+    )
+    return _sanitize_non_finite({
         "status": "succeeded",
         "research_state": "outer_evaluated",
         "algorithm_version": ALPHA_ALGORITHM_VERSION,
@@ -475,6 +627,15 @@ def run_alpha_mining_runtime(
             "commission_pct": request.commission_pct,
             "stamp_tax_pct": request.stamp_tax_pct,
             "slippage_bps": request.slippage_bps,
+            "source_run_id": request.source_run_id,
+            "source_suggestion_id": request.source_suggestion_id,
+            "source_candidate_id": request.source_candidate_id,
+            "source_diff": dict(request.source_diff or {}),
+            "hypothesis_id": request.hypothesis_id,
+            "hypothesis_title": (
+                request.hypothesis_contract.get("title")
+                if request.hypothesis_contract else None
+            ),
         },
         "summary": {
             "outer_fold_count": len(nested_folds),
@@ -495,11 +656,54 @@ def run_alpha_mining_runtime(
             "folds": benchmark_folds,
         },
         "candidates": candidates_summary,
+        "discovery_summary": discovery_summary,
+        "market_attribution": market_attribution,
+        "candidate_correlations": candidate_correlations,
+        "failure_analysis": failure_analysis,
+        "next_research_suggestions": next_research_suggestions,
         "trial_ledger": trial_ledger,
         "engine_failures": discovery_failures,
+        "progress": final_progress,
         "worker_phase_peak_rss_bytes": (
             rss_sampler.phase_peak_rss_bytes() if rss_sampler is not None else None
         ),
+    })
+
+
+def _alpha_progress(
+    *,
+    phase: str,
+    label: str,
+    done: int,
+    total: int,
+    request: AlphaRuntimeRequest,
+    engines: Mapping[str, Mapping[str, Any]],
+    current_engine_id: str | None = None,
+) -> dict[str, Any]:
+    rows = [dict(engines[engine_id]) for engine_id in request.engine_ids]
+    safe_total = max(total, 1)
+    return {
+        "phase": phase,
+        "label": label,
+        "done": done,
+        "total": total,
+        "percent": round(min(max(done / safe_total * 100.0, 0.0), 100.0), 1),
+        "current_engine_id": current_engine_id,
+        "trials_used": sum(int(row.get("trials") or 0) for row in rows),
+        "trial_limit": (
+            request.max_trials_per_engine
+            * len(request.engine_ids)
+            * max((int(row.get("folds_total") or 0) for row in rows), default=0)
+        ),
+        "frozen_candidates": sum(int(row.get("selected") or 0) for row in rows),
+        "candidate_limit": (
+            request.max_candidates_per_engine
+            * len(request.engine_ids)
+            * max((int(row.get("folds_total") or 0) for row in rows), default=0)
+        ),
+        "backtests": sum(int(row.get("backtests") or 0) for row in rows),
+        "engine_errors": sum(int(row.get("errors") or 0) for row in rows),
+        "engines": rows,
     }
 
 
@@ -571,6 +775,24 @@ def _decode_request(
         ),
         max_trials_per_engine=_bounded_int(
             values.get("max_trials_per_engine", 64), "max_trials_per_engine", 4, 256
+        ),
+        source_run_id=(str(values["source_run_id"]) if values.get("source_run_id") else None),
+        source_suggestion_id=(
+            str(values["source_suggestion_id"])
+            if values.get("source_suggestion_id") else None
+        ),
+        source_candidate_id=(
+            str(values["source_candidate_id"])
+            if values.get("source_candidate_id") else None
+        ),
+        source_diff=(
+            dict(values["source_diff"])
+            if isinstance(values.get("source_diff"), Mapping) else None
+        ),
+        hypothesis_id=(str(values["hypothesis_id"]) if values.get("hypothesis_id") else None),
+        hypothesis_contract=(
+            dict(values["hypothesis_contract"])
+            if isinstance(values.get("hypothesis_contract"), Mapping) else None
         ),
     )
 
@@ -726,6 +948,13 @@ def _aggregate_fold_metrics(
     returns = _stitch_fold_returns(folds)
     champion_returns = _stitch_fold_returns(champion_folds or ())
     coverage_start, coverage_end = _fold_coverage_bounds(folds)
+    trade_count = sum(
+        len(trades)
+        for row in folds
+        for metrics in [row.get("metrics")]
+        for trades in [metrics.get("trades") if isinstance(metrics, Mapping) else None]
+        if isinstance(trades, list)
+    )
     if not returns:
         return {
             "stitched_oos_return": None,
@@ -744,6 +973,7 @@ def _aggregate_fold_metrics(
                 if coverage_start and coverage_end else 0
             ),
             "oos_days": 0,
+            "n_trades": trade_count,
         }
     values = [value for _, value in returns]
     total_return = _compound(values)
@@ -786,8 +1016,793 @@ def _aggregate_fold_metrics(
         "oos_calendar_days": (end - start).days + 1,
         "half_year_windows": len(half_years),
         "oos_days": len(returns),
+        "n_trades": trade_count,
         "equity_curve": _equity_curve(returns),
     }
+
+
+def _build_discovery_summary(
+    engine_ids: Sequence[str],
+    trial_ledger: Sequence[Mapping[str, Any]],
+    engine_folds: Mapping[str, Sequence[Mapping[str, Any]]],
+    registry: Any,
+) -> list[dict[str, Any]]:
+    """Project internal trial rows into stable, user-facing discovery evidence."""
+    output: list[dict[str, Any]] = []
+    for engine_id in engine_ids:
+        rows = [row for row in trial_ledger if row.get("engine_id") == engine_id]
+        discovery_rows = [row for row in rows if row.get("stage") == "discovery"]
+        selection_rows = [row for row in rows if "penalized_score" in row]
+        finite_scores = [
+            float(row["penalized_score"])
+            for row in selection_rows
+            if _is_finite(row.get("penalized_score"))
+        ]
+        fold_rows = list(engine_folds.get(engine_id, ()))
+        selected_rows = [row for row in fold_rows if isinstance(row.get("candidate"), Mapping)]
+        recipe_counts: dict[str, int] = {}
+        for row in selected_rows:
+            recipe_id = str(row.get("recipe_id") or "")
+            if recipe_id:
+                recipe_counts[recipe_id] = recipe_counts.get(recipe_id, 0) + 1
+        representative = _representative_candidate(fold_rows)
+        output.append({
+            "engine_id": engine_id,
+            "engine_name": registry.get(engine_id).manifest.name,
+            "discovery_trials": len(discovery_rows),
+            "selection_trials": len(selection_rows),
+            "finite_selection_trials": len(finite_scores),
+            "selected_folds": len(selected_rows),
+            "outer_folds": len(fold_rows),
+            "selection_stability": (
+                len(selected_rows) / len(fold_rows) if fold_rows else None
+            ),
+            "best_penalized_score": max(finite_scores) if finite_scores else None,
+            "recipes_considered": len({
+                str(row.get("recipe_id"))
+                for row in rows
+                if row.get("recipe_id")
+            }),
+            "selected_recipe_id": (
+                representative.get("recipe_id") if representative else None
+            ),
+            "selected_recipe_fold_count": (
+                recipe_counts.get(str(representative.get("recipe_id")), 0)
+                if representative else 0
+            ),
+            "errors": sum(bool(row.get("error")) for row in fold_rows),
+        })
+    return output
+
+
+def _curve_daily_returns(curve: Any) -> list[tuple[date, float]]:
+    if not isinstance(curve, list):
+        return []
+    output: list[tuple[date, float]] = []
+    previous = 1.0
+    for row in curve:
+        if not isinstance(row, Mapping):
+            continue
+        try:
+            day = date.fromisoformat(str(row.get("date"))[:10])
+            value = float(row.get("value"))
+        except (TypeError, ValueError):
+            continue
+        if previous > 0:
+            daily_return = value / previous - 1.0
+            if math.isfinite(daily_return):
+                output.append((day, daily_return))
+        previous = value
+    return output
+
+
+def _market_state(market_return: float, breadth: float) -> str:
+    if (market_return >= 0.01 and breadth >= 0.55) or breadth >= 0.70:
+        return "strong_up"
+    if (market_return <= -0.01 and breadth <= 0.45) or breadth <= 0.30:
+        return "strong_down"
+    return "weak_up" if market_return >= 0 else "weak_down"
+
+
+def _build_market_attribution(
+    candidate: Mapping[str, Any],
+    panel: pl.DataFrame,
+) -> dict[str, Any]:
+    """Explain frozen OOS returns by actual contemporaneous market and PIT contexts."""
+    metrics = candidate.get("metrics")
+    curve = metrics.get("equity_curve") if isinstance(metrics, Mapping) else None
+    candidate_returns = dict(_curve_daily_returns(curve))
+    if not candidate_returns:
+        return {
+            "available": False,
+            "reason": "候选没有形成可归因的样本外日收益序列",
+            "regimes": [],
+            "years": [],
+            "industries": {"available": False, "reason": "没有可归因交易", "rows": []},
+            "concepts": {
+                "available": False,
+                "reason": "当前只有概念成员快照。禁止倒填历史归因",
+                "rows": [],
+            },
+        }
+
+    market_column = "change_pct" if "change_pct" in panel.columns else None
+    if market_column is None:
+        return {
+            "available": False,
+            "reason": "研究面板缺少可复核的全市场日收益",
+            "regimes": [],
+            "years": [],
+            "industries": {"available": False, "reason": "市场归因前置数据缺失", "rows": []},
+            "concepts": {
+                "available": False,
+                "reason": "当前只有概念成员快照。禁止倒填历史归因",
+                "rows": [],
+            },
+        }
+
+    market_rows = (
+        panel.select("date", market_column)
+        .drop_nulls()
+        .filter(pl.col("date").is_in(list(candidate_returns)))
+        .group_by("date")
+        .agg(
+            pl.col(market_column).mean().alias("market_return"),
+            (pl.col(market_column) > 0).mean().alias("breadth"),
+            pl.len().alias("stock_count"),
+        )
+        .sort("date")
+    )
+    daily: list[dict[str, Any]] = []
+    grouped: dict[str, list[float]] = {
+        "strong_up": [], "weak_up": [], "weak_down": [], "strong_down": [],
+    }
+    for row in market_rows.iter_rows(named=True):
+        day = row["date"]
+        candidate_return = candidate_returns.get(day)
+        if candidate_return is None:
+            continue
+        market_return = float(row["market_return"])
+        breadth = float(row["breadth"])
+        state = _market_state(market_return, breadth)
+        grouped[state].append(candidate_return)
+        daily.append({
+            "date": day.isoformat(),
+            "state": state,
+            "candidate_return": candidate_return,
+            "market_return": market_return,
+            "breadth": breadth,
+            "stock_count": int(row["stock_count"]),
+        })
+
+    state_labels = {
+        "strong_up": "强势上涨", "weak_up": "温和上涨",
+        "weak_down": "温和下跌", "strong_down": "强势下跌",
+    }
+    regimes = [
+        {
+            "state": state,
+            "label": state_labels[state],
+            "days": len(values),
+            "return": _compound(values) if values else None,
+            "positive_day_ratio": (
+                sum(value > 0 for value in values) / len(values) if values else None
+            ),
+            "contribution": sum(values),
+        }
+        for state, values in grouped.items()
+    ]
+    years = [
+        {"year": year, "days": len(values), "return": _compound(values)}
+        for year, values in sorted(_group_returns_by_year(candidate_returns).items())
+    ]
+    industries = _industry_attribution(candidate, panel)
+    return {
+        "available": bool(daily),
+        "reason": None if daily else "样本外日收益与市场横截面没有重合日期",
+        "regimes": regimes,
+        "years": years,
+        "daily": daily,
+        "industries": industries,
+        "concepts": {
+            "available": False,
+            "reason": "当前只有概念成员快照。禁止倒填历史归因",
+            "rows": [],
+        },
+    }
+
+
+def _group_returns_by_year(returns: Mapping[date, float]) -> dict[str, list[float]]:
+    output: dict[str, list[float]] = {}
+    for day, value in sorted(returns.items()):
+        output.setdefault(str(day.year), []).append(value)
+    return output
+
+
+def _industry_attribution(
+    candidate: Mapping[str, Any],
+    panel: pl.DataFrame,
+) -> dict[str, Any]:
+    industry_column = next(
+        (name for name in ("l1_name", "l1_code", "industry_name", "industry_code") if name in panel.columns),
+        None,
+    )
+    if industry_column is None:
+        return {
+            "available": False,
+            "reason": "缺少历史时点行业归属。未进行行业贡献推断",
+            "rows": [],
+        }
+    folds = candidate.get("folds") or []
+    trades = [
+        trade
+        for fold in folds
+        if isinstance(fold, Mapping)
+        for trade in ((fold.get("metrics") or {}).get("trades") or [])
+        if isinstance(trade, Mapping)
+    ]
+    if not trades:
+        return {"available": False, "reason": "候选没有已完成交易", "rows": []}
+    lookup = {
+        (str(row["symbol"]), str(row["date"])[:10]): str(row[industry_column] or "未分类")
+        for row in panel.select("symbol", "date", industry_column).iter_rows(named=True)
+    }
+    grouped: dict[str, dict[str, Any]] = {}
+    for trade in trades:
+        key = lookup.get(
+            (str(trade.get("symbol")), str(trade.get("entry_date"))[:10]),
+            "未分类",
+        )
+        row = grouped.setdefault(key, {"industry": key, "trades": 0, "pnl": 0.0, "wins": 0})
+        pnl = float(trade.get("pnl_amount") or 0.0)
+        row["trades"] += 1
+        row["pnl"] += pnl
+        row["wins"] += int(pnl > 0)
+    rows = sorted(grouped.values(), key=lambda row: abs(float(row["pnl"])), reverse=True)
+    for row in rows:
+        row["win_rate"] = row.pop("wins") / row["trades"] if row["trades"] else None
+    return {"available": True, "reason": None, "rows": rows[:20]}
+
+
+def _build_candidate_correlations(
+    candidates: Sequence[Mapping[str, Any]],
+) -> list[dict[str, Any]]:
+    returns = {
+        str(candidate.get("engine_id")): dict(_curve_daily_returns(
+            (candidate.get("metrics") or {}).get("equity_curve")
+        ))
+        for candidate in candidates
+    }
+    output: list[dict[str, Any]] = []
+    ids = list(returns)
+    for left_index, left_id in enumerate(ids):
+        for right_id in ids[left_index + 1:]:
+            common = sorted(set(returns[left_id]) & set(returns[right_id]))
+            correlation = None
+            if len(common) >= 5:
+                value = float(np.corrcoef(
+                    [returns[left_id][day] for day in common],
+                    [returns[right_id][day] for day in common],
+                )[0, 1])
+                correlation = value if math.isfinite(value) else None
+            output.append({
+                "left_engine_id": left_id,
+                "right_engine_id": right_id,
+                "overlap_days": len(common),
+                "correlation": correlation,
+            })
+    return output
+
+
+_CONTINUING_ALPHA_STATES = frozenset({"validation_candidate", "research_candidate", "shadow", "challenger", "champion"})
+_OOS_DECAY_GATES = frozenset({
+    "return_vs_champion",
+    "sharpe",
+    "drawdown",
+    "positive_half_years",
+    "beat_champion_windows",
+    "recent_year",
+    "recent_quarter",
+    "parameter_perturbation",
+})
+_EXECUTION_GATES = frozenset({"double_cost", "delay"})
+_CONCENTRATION_GATES = frozenset({"capacity", "concentration"})
+_FAILURE_GATE_LABELS = {
+    "return_vs_champion": "拼接样本外净收益",
+    "sharpe": "样本外夏普",
+    "drawdown": "最大回撤",
+    "positive_half_years": "正收益半年窗口",
+    "beat_champion_windows": "半年窗口稳定性",
+    "recent_year": "最近一年收益",
+    "recent_quarter": "最近三个月收益",
+    "double_cost": "双倍成本",
+    "delay": "延迟成交",
+    "parameter_perturbation": "参数扰动",
+    "capacity": "持仓容量",
+    "concentration": "收益集中度",
+}
+
+
+def _failure_gate_names(values: Sequence[str]) -> str:
+    return "、".join(_FAILURE_GATE_LABELS.get(value, value) for value in sorted(values))
+
+
+def _build_failure_closure(
+    *,
+    request: AlphaRuntimeRequest,
+    candidates: Sequence[Mapping[str, Any]],
+    market_attribution: Mapping[str, Mapping[str, Any]],
+    candidate_correlations: Sequence[Mapping[str, Any]],
+    engine_failures: Sequence[Mapping[str, Any]],
+    registry: Any,
+    catalog_datasets: Mapping[str, Any],
+    available_features: Sequence[str],
+) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    """Freeze a deterministic failure diagnosis and user-confirmed next-run recipes.
+
+    This is deliberately descriptive, not an auto-tuner.  Every suggestion changes the
+    frozen request, remains unstarted, and can therefore only become a new experiment
+    after an explicit user action.
+    """
+    continuing = [row for row in candidates if row.get("state") in _CONTINUING_ALPHA_STATES]
+    frozen = [row for row in candidates if isinstance(row.get("frozen_candidate"), Mapping)]
+    zero_pass = not continuing
+    funnel = {
+        "selected_engines": len(request.engine_ids),
+        "frozen_candidates": len(frozen),
+        "outer_evaluated": sum(
+            int(_finite_number((row.get("metrics") or {}).get("oos_days")) or 0) > 0
+            for row in candidates
+            if isinstance(row.get("metrics"), Mapping)
+        ),
+        "historical_gate_passed": len(continuing),
+    }
+    if not zero_pass:
+        return ({
+            "zero_pass": False,
+            "conclusion": f"本轮有{len(continuing)}个候选通过历史硬门槛，失败闭环未触发。",
+            "funnel": funnel,
+            "best_failed_candidate": None,
+            "primary_category_id": None,
+            "categories": [],
+            "excluded_recipe_ids": [],
+        }, [])
+
+    candidate_by_engine = {str(row.get("engine_id")): row for row in candidates}
+    failed_gates: dict[str, set[str]] = {}
+    pending_gates: dict[str, set[str]] = {}
+    for row in candidates:
+        engine_id = str(row.get("engine_id") or "")
+        gates = row.get("gates") if isinstance(row.get("gates"), list) else []
+        failed_gates[engine_id] = {
+            str(gate.get("id")) for gate in gates
+            if isinstance(gate, Mapping) and gate.get("status") == "failed"
+        }
+        pending_gates[engine_id] = {
+            str(gate.get("id")) for gate in gates
+            if isinstance(gate, Mapping) and gate.get("status") == "pending"
+        }
+
+    categories: list[dict[str, Any]] = []
+
+    def add_category(
+        category_id: str,
+        label: str,
+        count: int,
+        evidence: Sequence[str],
+        keep: Sequence[str],
+        change: Sequence[str],
+        why: str,
+        severity: str = "high",
+    ) -> None:
+        if count <= 0:
+            return
+        categories.append({
+            "id": category_id,
+            "label": label,
+            "count": count,
+            "severity": severity,
+            "evidence": list(dict.fromkeys(evidence)),
+            "keep": list(keep),
+            "change": list(change),
+            "why": why,
+        })
+
+    invalid = [row for row in candidates if not isinstance(row.get("frozen_candidate"), Mapping)]
+    add_category(
+        "signal_invalid",
+        "训练或内选未形成有效信号",
+        len(invalid),
+        [f"{row.get('engine_name') or row.get('engine_id')}：没有有限分的冻结方案" for row in invalid],
+        ["保持原始研究区间、预测周期与成交成本口径"],
+        ["扩大训练内选预算，或更换无法形成信号的发现路径"],
+        "当前失败发生在外测之前，不能通过修改回测结果或门槛来补救。",
+    )
+
+    oos_failed = [engine_id for engine_id, gates in failed_gates.items() if gates & _OOS_DECAY_GATES]
+    add_category(
+        "oos_decay",
+        "样本外收益或稳定性衰减",
+        len(oos_failed),
+        [
+            f"{candidate_by_engine[engine_id].get('engine_name') or engine_id}：失败门槛 "
+            + _failure_gate_names(failed_gates[engine_id] & _OOS_DECAY_GATES)
+            for engine_id in oos_failed
+        ],
+        ["保留点时股票池、外层样本隔离和统一撮合"],
+        ["引入不同机制的发现引擎，不修改本轮冻结公式"],
+        "训练期规律没有稳定迁移到从未见过的外层窗口，需要改变发现路径而不是回看外测调参。",
+    )
+
+    execution_failed = [engine_id for engine_id, gates in failed_gates.items() if gates & _EXECUTION_GATES]
+    add_category(
+        "execution_cost",
+        "交易成本或成交延迟吞噬收益",
+        len(execution_failed),
+        [
+            f"{candidate_by_engine[engine_id].get('engine_name') or engine_id}："
+            + _failure_gate_names(failed_gates[engine_id] & _EXECUTION_GATES)
+            for engine_id in execution_failed
+        ],
+        ["保持次日开盘成交和真实费用模型"],
+        ["补充流动性与换手特征，重新发现可交易信号"],
+        "放宽成本假设会制造虚假收益；下一轮只能提高信号对成本与延迟的容忍度。",
+    )
+
+    concentration_failed = [
+        engine_id for engine_id, gates in failed_gates.items() if gates & _CONCENTRATION_GATES
+    ]
+    highly_correlated = [
+        row for row in candidate_correlations
+        if _finite_number(row.get("correlation")) is not None
+        and abs(float(row["correlation"])) >= 0.90
+    ]
+    concentration_evidence = [
+        f"{candidate_by_engine[engine_id].get('engine_name') or engine_id}："
+        + _failure_gate_names(failed_gates[engine_id] & _CONCENTRATION_GATES)
+        for engine_id in concentration_failed
+    ]
+    concentration_evidence.extend(
+        f"{candidate_by_engine.get(str(row.get('left_engine_id')), {}).get('engine_name') or row.get('left_engine_id')} 与 "
+        f"{candidate_by_engine.get(str(row.get('right_engine_id')), {}).get('engine_name') or row.get('right_engine_id')} 的样本外相关性为"
+        f"{float(row['correlation']):.2f}"
+        for row in highly_correlated
+    )
+    add_category(
+        "capacity_concentration",
+        "容量或收益集中度不合格",
+        max(len(concentration_failed), len(highly_correlated)),
+        concentration_evidence,
+        ["保持统一成交、费用和外测窗口"],
+        ["剔除高度重复的发现路径，补充不同信息域的引擎"],
+        "多个候选若共享相同风险暴露，数量增加也不会形成可分散的Alpha。",
+    )
+
+    regime_evidence: list[str] = []
+    regime_engines: list[str] = []
+    for engine_id, evidence in market_attribution.items():
+        regimes = evidence.get("regimes") if isinstance(evidence, Mapping) else None
+        if not isinstance(regimes, list):
+            continue
+        total_days = sum(int(row.get("days") or 0) for row in regimes if isinstance(row, Mapping))
+        top = max(
+            (row for row in regimes if isinstance(row, Mapping)),
+            key=lambda row: int(row.get("days") or 0),
+            default=None,
+        )
+        if total_days < 20 or top is None:
+            continue
+        top_days = int(top.get("days") or 0)
+        if top_days / total_days < 0.75:
+            continue
+        regime_engines.append(engine_id)
+        regime_evidence.append(
+            f"{candidate_by_engine.get(engine_id, {}).get('engine_name') or engine_id}："
+            f"{top.get('label') or top.get('state')}覆盖{top_days}/{total_days}个样本外交易日"
+        )
+    add_category(
+        "regime_dependency",
+        "市场状态覆盖单一或收益依赖特定行情",
+        len(regime_engines),
+        regime_evidence,
+        ["保持原候选的冻结证据，不把当前市场状态外推为长期规律"],
+        ["加入市场/行业时序或网络扩散发现路径"],
+        "样本外大多落在同一市场状态时，无法证明信号跨行情有效。",
+        severity="medium",
+    )
+
+    coverage_engines = [
+        engine_id for engine_id, gates in pending_gates.items()
+        if gates & {"recent_year", "recent_quarter"}
+    ]
+    add_category(
+        "insufficient_coverage",
+        "近期或分段证据覆盖不足",
+        len(coverage_engines),
+        [
+            f"{candidate_by_engine[engine_id].get('engine_name') or engine_id}："
+            + _failure_gate_names(pending_gates[engine_id] & {"recent_year", "recent_quarter"})
+            + "尚未形成完整窗口"
+            for engine_id in coverage_engines
+        ],
+        ["保留缺失值，不把不完整窗口伪装成零收益或通过"],
+        ["仅在历史长度足够时升级研究档位并重新形成外层窗口"],
+        "覆盖不足是证据缺口，不代表收益为零，也不能靠前端填值。",
+        severity="medium",
+    )
+
+    fold_errors = sum(
+        bool(fold.get("error"))
+        for row in candidates
+        for fold in (row.get("folds") if isinstance(row.get("folds"), list) else [])
+        if isinstance(fold, Mapping)
+    )
+    error_evidence = [
+        f"{row.get('engine_id')} · {row.get('stage')}：{str(row.get('error') or '')[:160]}"
+        for row in engine_failures
+    ]
+    if fold_errors:
+        error_evidence.append(f"另有{fold_errors}个外层窗口执行失败")
+    add_category(
+        "engine_or_data_error",
+        "发现引擎或数据链路异常",
+        len(engine_failures) + fold_errors,
+        error_evidence,
+        ["保留已成功引擎和所有已完成外测证据"],
+        ["移除失败引擎或修复数据门禁后创建新运行"],
+        "执行异常与策略证伪是两类问题，必须先恢复可复核链路再研究收益。",
+    )
+
+    severity_rank = {"high": 0, "medium": 1, "low": 2}
+    categories.sort(key=lambda row: (severity_rank.get(str(row["severity"]), 9), -int(row["count"]), str(row["id"])))
+    best = frozen[0] if frozen else None
+    best_failed = None
+    if best is not None:
+        metrics = best.get("metrics") if isinstance(best.get("metrics"), Mapping) else {}
+        best_failed = {
+            "engine_id": best.get("engine_id"),
+            "engine_name": best.get("engine_name"),
+            "recipe_id": (best.get("frozen_candidate") or {}).get("recipe_id"),
+            "stitched_oos_return": metrics.get("stitched_oos_return"),
+            "stitched_oos_sharpe": metrics.get("stitched_oos_sharpe"),
+            "max_drawdown": metrics.get("max_drawdown"),
+            "failed_gate_ids": sorted(failed_gates.get(str(best.get("engine_id")), set())),
+            "pending_gate_ids": sorted(pending_gates.get(str(best.get("engine_id")), set())),
+        }
+
+    ready_engine_ids = _ready_followup_engines(
+        request=request,
+        registry=registry,
+        catalog_datasets=catalog_datasets,
+        available_features=available_features,
+    )
+    suggestions = _build_followup_suggestions(
+        request=request,
+        categories=categories,
+        candidates=candidate_by_engine,
+        correlations=highly_correlated,
+        engine_failures=engine_failures,
+        ready_engine_ids=ready_engine_ids,
+    )
+    return ({
+        "zero_pass": True,
+        "conclusion": (
+            f"本轮{len(candidates)}条发现路径均未通过全部历史硬门槛；"
+            f"失败已归入{len(categories)}类，旧方案保持冻结。"
+        ),
+        "funnel": funnel,
+        "best_failed_candidate": best_failed,
+        "primary_category_id": categories[0]["id"] if categories else None,
+        "categories": categories,
+        "excluded_recipe_ids": [
+            str(row["frozen_candidate"]["recipe_id"])
+            for row in frozen
+            if row.get("state") == "rejected" and row["frozen_candidate"].get("recipe_id")
+        ],
+    }, suggestions)
+
+
+def _ready_followup_engines(
+    *,
+    request: AlphaRuntimeRequest,
+    registry: Any,
+    catalog_datasets: Mapping[str, Any],
+    available_features: Sequence[str],
+) -> list[str]:
+    features = set(available_features)
+    output: list[str] = []
+    for engine in registry.list():
+        manifest = engine.manifest
+        if manifest.readiness != "ready":
+            continue
+        if request.asset_type not in manifest.asset_types:
+            continue
+        if request.forward_horizon not in manifest.forecast_horizons:
+            continue
+        if not set(manifest.required_features).issubset(features):
+            continue
+        context = DataCatalogContext(
+            asset_type=request.asset_type,
+            start=request.start.isoformat(),
+            end=request.end.isoformat(),
+            available_features=tuple(available_features),
+            datasets=catalog_datasets,
+        )
+        if not qualify_manifest_datasets(manifest, catalog_datasets).ready:
+            continue
+        if not engine.preflight(context).ready:
+            continue
+        output.append(manifest.engine_id)
+    return output
+
+
+def _build_followup_suggestions(
+    *,
+    request: AlphaRuntimeRequest,
+    categories: Sequence[Mapping[str, Any]],
+    candidates: Mapping[str, Mapping[str, Any]],
+    correlations: Sequence[Mapping[str, Any]],
+    engine_failures: Sequence[Mapping[str, Any]],
+    ready_engine_ids: Sequence[str],
+) -> list[dict[str, Any]]:
+    category_ids = {str(row.get("id")) for row in categories}
+    selected = list(request.engine_ids)
+    factors = list(request.factor_names)
+    ready_alternatives = [engine_id for engine_id in ready_engine_ids if engine_id not in selected]
+    suggestions: list[dict[str, Any]] = []
+    seen_patches: set[str] = set()
+
+    def add(
+        category_id: str,
+        title: str,
+        why: str,
+        keep: Sequence[str],
+        patch: Mapping[str, Any],
+        changes: Sequence[Mapping[str, Any]],
+    ) -> None:
+        if category_id not in category_ids or not patch or not changes:
+            return
+        fingerprint = repr(sorted((key, repr(value)) for key, value in patch.items()))
+        if fingerprint in seen_patches:
+            return
+        seen_patches.add(fingerprint)
+        suggestions.append({
+            "suggestion_id": f"next-{category_id}-{len(suggestions) + 1}",
+            "category_id": category_id,
+            "title": title,
+            "why": why,
+            "keep": list(keep),
+            "changes": [dict(row) for row in changes],
+            "request_patch": dict(patch),
+        })
+
+    common_keep = [
+        f"研究区间 {request.start.isoformat()} 至 {request.end.isoformat()}",
+        f"未来{request.forward_horizon}日净收益标签",
+        "点时股票池、次日开盘成交与原始费用口径",
+    ]
+
+    if "capacity_concentration" in category_ids:
+        replacement = list(selected)
+        removed: str | None = None
+        if correlations:
+            pair = correlations[0]
+            left = str(pair.get("left_engine_id") or "")
+            right = str(pair.get("right_engine_id") or "")
+            left_return = _sortable_return((candidates.get(left, {}).get("metrics") or {}).get("stitched_oos_return"))
+            right_return = _sortable_return((candidates.get(right, {}).get("metrics") or {}).get("stitched_oos_return"))
+            removed = right if left_return >= right_return else left
+        elif len(replacement) > 1:
+            removed = min(
+                replacement,
+                key=lambda engine_id: _sortable_return(
+                    (candidates.get(engine_id, {}).get("metrics") or {}).get("stitched_oos_return")
+                ),
+            )
+        if removed in replacement and len(replacement) > 1:
+            replacement.remove(removed)
+        preferred = next(
+            (engine_id for engine_id in ("market_sector_timing", "network_diffusion", "portfolio_residual") if engine_id in ready_alternatives),
+            ready_alternatives[0] if ready_alternatives else None,
+        )
+        if preferred and preferred not in replacement:
+            replacement.append(preferred)
+        if replacement != selected:
+            add(
+                "capacity_concentration",
+                "去掉重复暴露，补充不同信息域",
+                "优先减少样本外高度相关的路径；若数据允许，再加入机制不同的引擎。",
+                common_keep,
+                {"engine_ids": replacement},
+                [{
+                    "field": "engine_ids",
+                    "label": "发现引擎",
+                    "before": selected,
+                    "after": replacement,
+                    "reason": "减少重复风险暴露并扩大机制差异",
+                }],
+            )
+
+    if "regime_dependency" in category_ids:
+        preferred = next(
+            (engine_id for engine_id in ("market_sector_timing", "network_diffusion") if engine_id in ready_alternatives),
+            None,
+        )
+        if preferred:
+            after = [*selected, preferred]
+            add(
+                "regime_dependency",
+                "加入市场状态或扩散路径",
+                "当前外测市场状态覆盖单一，下一轮增加能够显式研究状态切换的信息域。",
+                common_keep,
+                {"engine_ids": after},
+                [{"field": "engine_ids", "label": "发现引擎", "before": selected, "after": after, "reason": "补充跨市场状态的发现路径"}],
+            )
+
+    if "execution_cost" in category_ids:
+        additions = [name for name in ("turnover_rate", "amihud_20d", "log_amount") if name in _FACTOR_IDS and name not in factors]
+        if additions:
+            after = [*factors, *additions]
+            add(
+                "execution_cost",
+                "补充流动性与换手约束特征",
+                "保持真实成本不变，让发现引擎直接识别更可成交、对摩擦更不敏感的信号。",
+                common_keep,
+                {"factor_names": after},
+                [{"field": "factor_names", "label": "研究因子", "before": factors, "after": after, "reason": "显式纳入流动性和换手成本代理"}],
+            )
+
+    if "signal_invalid" in category_ids:
+        if request.profile == "exploratory":
+            add(
+                "signal_invalid",
+                "扩大训练内选预算",
+                "当前引擎在快速档没有形成有限分方案；扩大训练预算，但仍保持外层测试不可见。",
+                common_keep,
+                {"budget_profile": "balanced", "max_trials_per_engine": 64, "max_candidates_per_engine": 4},
+                [
+                    {"field": "budget_profile", "label": "研究强度", "before": request.profile, "after": "balanced", "reason": "增加训练内选覆盖"},
+                    {"field": "max_trials_per_engine", "label": "每引擎尝试上限", "before": request.max_trials_per_engine, "after": 64, "reason": "只扩大训练预算，不读取外测"},
+                ],
+            )
+        elif ready_alternatives:
+            after = [*selected, ready_alternatives[0]]
+            add(
+                "signal_invalid",
+                "加入另一条可运行发现路径",
+                "原路径未形成信号，保留其失败证据并增加不同引擎，而不是改写旧方案。",
+                common_keep,
+                {"engine_ids": after},
+                [{"field": "engine_ids", "label": "发现引擎", "before": selected, "after": after, "reason": "扩大独立发现路径"}],
+            )
+
+    if "oos_decay" in category_ids and ready_alternatives:
+        preferred = ready_alternatives[0]
+        after = [*selected, preferred]
+        add(
+            "oos_decay",
+            "增加不同机制的独立发现路径",
+            "旧冻结公式保留为失败证据；新一轮只扩大机制覆盖，不针对外测收益微调旧公式。",
+            common_keep,
+            {"engine_ids": after},
+            [{"field": "engine_ids", "label": "发现引擎", "before": selected, "after": after, "reason": "降低单一发现机制的样本外衰减风险"}],
+        )
+
+    if "engine_or_data_error" in category_ids:
+        failed_ids = {str(row.get("engine_id") or "") for row in engine_failures}
+        after = [engine_id for engine_id in selected if engine_id not in failed_ids]
+        if not after and ready_alternatives:
+            after = [ready_alternatives[0]]
+        if after and after != selected:
+            add(
+                "engine_or_data_error",
+                "隔离执行失败的引擎",
+                "保留成功路径，移除本轮明确发生执行异常的路径；旧异常日志不删除。",
+                common_keep,
+                {"engine_ids": after},
+                [{"field": "engine_ids", "label": "发现引擎", "before": selected, "after": after, "reason": "先恢复可复核运行链路"}],
+            )
+    return suggestions
 
 
 def _fold_coverage_bounds(
@@ -1101,6 +2116,29 @@ def _is_finite(value: Any) -> bool:
         return math.isfinite(float(value))
     except (TypeError, ValueError):
         return False
+
+
+def _finite_number(value: Any) -> float | None:
+    if isinstance(value, bool):
+        return None
+    try:
+        result = float(value)
+    except (TypeError, ValueError):
+        return None
+    return result if math.isfinite(result) else None
+
+
+def _sanitize_non_finite(value: Any) -> Any:
+    """Keep compact worker results strict-JSON serializable without inventing metrics."""
+    if isinstance(value, Mapping):
+        return {str(key): _sanitize_non_finite(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_sanitize_non_finite(item) for item in value]
+    if isinstance(value, np.generic):
+        return _sanitize_non_finite(value.item())
+    if isinstance(value, float) and not math.isfinite(value):
+        return None
+    return value
 
 
 def _augment_market_fields(base_market, panel: pl.DataFrame, feature_names: Sequence[str]):

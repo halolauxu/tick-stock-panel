@@ -139,6 +139,32 @@ def _write_mining_market_data(
     }).write_parquet(instruments_dir / "part.parquet")
 
 
+def _write_alpha_pit_context(data_dir, start: date, assets: int) -> None:
+    symbols = [f"60000{asset}.SH" for asset in range(assets)]
+    research_dir = data_dir / "research"
+    research_dir.mkdir(parents=True, exist_ok=True)
+    pl.DataFrame({
+        "symbol": symbols,
+        "list_date": [start - timedelta(days=365)] * assets,
+        "delist_date": [None] * assets,
+    }).write_parquet(research_dir / "historical_stock_universe.parquet")
+    pl.DataFrame({
+        "symbol": symbols,
+        "name": [f"测试股份{asset}" for asset in range(assets)],
+        "start_date": [start - timedelta(days=365)] * assets,
+        "end_date": [None] * assets,
+    }).write_parquet(research_dir / "historical_stock_names.parquet")
+    shares_dir = data_dir / "financials" / "shares"
+    shares_dir.mkdir(parents=True, exist_ok=True)
+    pl.DataFrame({
+        "symbol": symbols,
+        "announce_date": [start - timedelta(days=30)] * assets,
+        "period_end": [start - timedelta(days=60)] * assets,
+        "total_shares": [1_000_000_000.0] * assets,
+        "float_shares": [800_000_000.0] * assets,
+    }).write_parquet(shares_dir / "part.parquet")
+
+
 def test_spawn_worker_returns_compact_result_and_memory_metrics(tmp_path):
     start = date(2024, 1, 1)
     data_dir = tmp_path / "data"
@@ -392,6 +418,55 @@ def test_spawn_mining_rejects_generation_change_after_queue(tmp_path):
         run_worker_task(make_worker_task("mining", data_dir, payload))
 
     assert store.get("stale_generation_mining")["artifacts"] == {}  # type: ignore[index]
+
+
+def test_spawn_alpha_worker_emits_real_per_engine_progress(tmp_path):
+    start = date(2025, 1, 2)
+    data_dir = tmp_path / "data"
+    assets = 24
+    days = 230
+    _write_mining_market_data(data_dir, start, days=days, assets=assets)
+    _write_alpha_pit_context(data_dir, start, assets)
+    generation = get_enriched_generation(data_dir, "stock")
+    payload = {
+        "run_id": "spawn_alpha_progress",
+        "request": {
+            "engine_ids": ["cross_sectional_rank"],
+            "factor_names": ["turnover_rate"],
+            "symbols": None,
+            "asset_type": "stock",
+            "start": start.isoformat(),
+            "end": (start + timedelta(days=days - 1)).isoformat(),
+            "budget_profile": "exploratory",
+            "forward_horizon": 1,
+            "commission_pct": 0.0002,
+            "stamp_tax_pct": 0.0005,
+            "slippage_bps": 5.0,
+            "max_positions": 10,
+            "max_candidates_per_engine": 2,
+            "max_trials_per_engine": 4,
+        },
+        "data_fingerprint": {"generation": generation},
+        "source": "manual",
+    }
+    progress_events = []
+
+    result = run_worker_task(
+        make_worker_task("alpha_mining", data_dir, payload),
+        progress_cb=progress_events.append,
+    )
+
+    assert result["status"] == "succeeded"
+    assert result["progress"]["phase"] == "evidence"
+    engine_events = [event for event in progress_events if event.get("engines")]
+    assert engine_events
+    assert any(event["current_engine_id"] == "cross_sectional_rank" for event in engine_events)
+    final_engine = engine_events[-1]["engines"][0]
+    assert final_engine["folds_done"] >= 1
+    assert final_engine["trials"] >= 1
+    assert final_engine["status"] in {"completed", "failed"}
+    assert engine_events[-1]["trial_limit"] == 4
+    assert engine_events[-1]["candidate_limit"] == 2
 
 
 def test_worker_terminates_child_after_cancel_grace(monkeypatch, tmp_path):

@@ -72,12 +72,13 @@ def _number(value: object, *, scale: float = 1.0) -> float | None:
     return parsed if math.isfinite(parsed) else None
 
 
-def _is_main_board(symbol: str) -> bool:
+def _is_a_share_equity(symbol: str) -> bool:
     return (
         symbol.endswith(".SH")
-        and symbol.startswith("60")
+        and symbol.startswith(("600", "601", "603", "605", "688", "689"))
         or symbol.endswith(".SZ")
-        and symbol.startswith(("000", "001", "002", "003"))
+        and symbol.startswith(("000", "001", "002", "003", "300", "301"))
+        or symbol.endswith(".BJ")
     )
 
 
@@ -186,6 +187,27 @@ def _normalize_names(rows: list[dict]) -> pl.DataFrame:
     )
 
 
+def _complete_name_history(universe: pl.DataFrame, names: pl.DataFrame) -> pl.DataFrame:
+    """Add safe full-life intervals for stocks that never changed their name."""
+    named_symbols = set(names["symbol"].to_list()) if not names.is_empty() else set()
+    missing = universe.filter(~pl.col("symbol").is_in(named_symbols)).select(
+        "symbol",
+        "name",
+        pl.col("list_date").alias("start_date"),
+        pl.col("delist_date").alias("end_date"),
+        pl.lit(None, dtype=pl.Date).alias("announce_date"),
+        pl.lit("stock_basic未发生更名").alias("change_reason"),
+    )
+    frames = [frame for frame in (names, missing) if not frame.is_empty()]
+    if not frames:
+        return pl.DataFrame()
+    return (
+        pl.concat(frames, how="diagonal_relaxed")
+        .unique(subset=["symbol", "name", "start_date", "end_date"], keep="last")
+        .sort(["symbol", "start_date", "end_date"])
+    )
+
+
 def _instrument_frame(universe: pl.DataFrame, shares: pl.DataFrame, as_of: date) -> pl.DataFrame:
     latest_shares = (
         shares.sort(["symbol", "period_end"])
@@ -247,6 +269,11 @@ def main() -> None:
     parser.add_argument("--start-date", default="2013-08-29")
     parser.add_argument("--end-date", default="2026-08-27")
     parser.add_argument("--publish", action="store_true")
+    parser.add_argument(
+        "--metadata-only",
+        action="store_true",
+        help="只写入历史股票池与名称时点元数据，不采集或发布行情",
+    )
     args = parser.parse_args()
     start = date.fromisoformat(args.start_date)
     end = date.fromisoformat(args.end_date)
@@ -270,7 +297,7 @@ def main() -> None:
         universe_records = []
         for row in basics:
             symbol = str(row.get("ts_code") or "").strip()
-            if not _is_main_board(symbol) or not _overlaps(row, start, end):
+            if not _is_a_share_equity(symbol) or not _overlaps(row, start, end):
                 continue
             listed = _canonical_date(row.get("list_date"))
             universe_records.append(
@@ -300,9 +327,21 @@ def main() -> None:
             if len(rows) >= 10_000:
                 raise RuntimeError(f"namechange {year} reached the 10000-row response cap")
             name_rows.extend(rows)
-        names = _normalize_names(name_rows).filter(
-            pl.col("symbol").is_in(universe["symbol"].to_list())
-        )
+        names = _normalize_names(name_rows)
+        if not names.is_empty():
+            names = names.filter(pl.col("symbol").is_in(universe["symbol"].to_list()))
+        names = _complete_name_history(universe, names)
+
+        if args.metadata_only:
+            research_root = DATA_DIR / "research"
+            _atomic_parquet(universe, research_root / "historical_stock_universe.parquet")
+            _atomic_parquet(names, research_root / "historical_stock_names.parquet")
+            print(
+                f"metadata_only=true universe={universe.height} "
+                f"name_intervals={names.height} name_symbols={names['symbol'].n_unique()}",
+                flush=True,
+            )
+            return
 
         existing_symbols = set()
         raw_root = DATA_DIR / "kline_daily"

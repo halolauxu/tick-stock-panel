@@ -3,6 +3,8 @@ from __future__ import annotations
 # Requirements: AM-S8-001 through AM-S8-010.
 from datetime import date, timedelta
 
+import pytest
+
 from app.alpha_mining.contracts import CandidateSpec, FrozenSignalSpec
 from app.alpha_mining.providers import DeclarativeCandidateRenderer
 from app.alpha_mining.shadow import AlphaShadowService, _factor_decay
@@ -140,7 +142,11 @@ def test_paper_projection_exposes_ordered_and_skipped_signal_lifecycle(tmp_path)
     assert all(item["order_id"] or item["skipped"] for item in account["signals"])
 
 
-def test_shadow_account_reuses_frozen_research_execution_contract(tmp_path) -> None:
+def test_shadow_account_reuses_frozen_research_execution_contract(tmp_path, monkeypatch) -> None:
+    monkeypatch.setattr(
+        "app.alpha_mining.shadow.is_strict_full_history_request",
+        lambda *_args: True,
+    )
     service = AlphaShadowService(tmp_path)
     service.config.update({"enabled": True})
     service.evidence.create_experiment("alpha-shadow", {
@@ -200,3 +206,36 @@ def test_shadow_account_reuses_frozen_research_execution_contract(tmp_path) -> N
     assert config["commission_pct"] == 0.0003
     assert config["slippage_bps"] == 8.0
     assert result["candidate"]["state"]["state"] == "shadow"
+
+
+def test_shadow_rejects_candidate_without_full_history_strict_contract(tmp_path) -> None:
+    service = AlphaShadowService(tmp_path)
+    service.evidence.create_experiment("alpha-not-strict", {
+        "request": {"asset_type": "stock", "budget_profile": "exploratory"},
+    })
+    spec = CandidateSpec(
+        recipe_id="not-strict.factor",
+        engine_id="cross_sectional_rank",
+        engine_version="1.0.0",
+        name="Not strict",
+        thesis="must be blocked",
+        signal_kind="factor_rank",
+        features=("momentum_5d",),
+        directions=(1,),
+        weights=(1.0,),
+        parameters={"top_rank": 20},
+        train_evidence={},
+    )
+    frozen = FrozenSignalSpec.from_candidate(spec)
+    candidate = service.evidence.freeze_candidate(
+        run_id="alpha-not-strict",
+        engine_id=spec.engine_id,
+        candidate=frozen.to_dict(),
+        renderer=dict(DeclarativeCandidateRenderer().render(frozen)),
+    )
+    service.evidence.record_outer_evaluation(
+        candidate["candidate_id"], {"gates": [], "metrics": {}}, "research_candidate",
+    )
+
+    with pytest.raises(ValueError, match="全部可用历史"):
+        service.start(candidate["candidate_id"], object(), date(2026, 1, 5))

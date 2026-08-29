@@ -1061,6 +1061,24 @@ export interface MiningRunProgress {
   percent?: number
   elapsed_ms?: number
   message?: string
+  current_engine_id?: string | null
+  trials_used?: number
+  trial_limit?: number
+  frozen_candidates?: number
+  candidate_limit?: number
+  backtests?: number
+  engine_errors?: number
+  engines?: {
+    engine_id: string
+    status: 'waiting' | 'running' | 'stress' | 'completed' | 'failed'
+    folds_done: number
+    folds_total: number
+    trials: number
+    selected: number
+    backtests: number
+    errors: number
+    message?: string | null
+  }[]
 }
 
 export interface MiningRun {
@@ -1226,11 +1244,13 @@ export type AlphaResearchState =
   | 'discovery'
   | 'frozen'
   | 'outer_evaluated'
+  | 'validation_candidate'
   | 'rejected'
   | 'research_candidate'
   | 'shadow'
   | 'challenger'
   | 'champion'
+  | 'retired'
 
 export interface AlphaEngineManifest {
   engine_id: string
@@ -1332,7 +1352,80 @@ export interface AlphaMiningRequest {
   max_positions: number
   max_candidates_per_engine: number
   max_trials_per_engine: number
+  source_run_id?: string | null
+  source_suggestion_id?: string | null
+  source_candidate_id?: string | null
+  source_diff?: Record<string, { before: unknown; after: unknown }>
+  hypothesis_id?: string | null
   force?: boolean
+}
+
+export interface AlphaHypothesis {
+  hypothesis_id: string
+  version: string
+  source_kind: 'prior' | 'ai' | 'manual' | 'failure'
+  parent_hypothesis_id?: string | null
+  source_run_id?: string | null
+  source_suggestion_id?: string | null
+  title: string
+  thesis: string
+  mechanism: string
+  prediction_object: 'forward_net_return' | 'market_residual_return'
+  asset_type: 'stock' | 'etf'
+  forward_horizon: 1 | 3 | 5 | 10 | 20 | 60
+  information_domains: string[]
+  test_spec: {
+    engine_ids: string[]
+    factor_names: string[]
+    expected_directions: Record<string, -1 | 1>
+    weights: Record<string, number>
+    parameters?: Record<string, number | string | boolean | null>
+  }
+  falsification: string[]
+  data_requirements: string[]
+  provenance?: {
+    proposal_batch_id?: string
+    provider?: string
+    model?: string
+    prompt_sha256?: string
+    response_sha256?: string
+    context_sha256?: string
+    market_snapshot_date?: string | null
+    outcome_data_exposed?: boolean
+  }
+  status: 'proposed' | 'running' | 'supported' | 'rejected' | 'blocked' | 'cancelled'
+  run_ids: string[]
+  results?: {
+    run_id: string
+    verdict: 'supported' | 'rejected' | 'blocked' | 'cancelled'
+    conclusion: string
+    next_hypothesis_ids: string[]
+    recorded_at: string
+  }[]
+  readiness?: { ready: boolean; reasons: string[] }
+}
+
+export interface AlphaHypothesisCreate {
+  source_kind?: 'manual'
+  title: string
+  thesis: string
+  mechanism: string
+  prediction_object?: 'forward_net_return' | 'market_residual_return'
+  asset_type: 'stock' | 'etf'
+  forward_horizon: 1 | 3 | 5 | 10 | 20 | 60
+  information_domains: string[]
+  test_spec: AlphaHypothesis['test_spec']
+  falsification: string[]
+  data_requirements: string[]
+}
+
+export interface AlphaAIHypothesisProposalResult {
+  batch_id: string
+  provider: string
+  model: string
+  outcome_data_exposed: false
+  items: AlphaHypothesis[]
+  rejected: { index: string; reason: string }[]
 }
 
 export interface AlphaRun {
@@ -1353,6 +1446,74 @@ export interface AlphaGateEvidence {
   status: 'passed' | 'failed' | 'pending'
   actual: unknown
   required: unknown
+}
+
+export interface AlphaFoldResult {
+  outer_index?: number
+  train_start?: string
+  train_end?: string
+  test_start?: string
+  test_end?: string
+  kind?: string
+  recipe_id?: string | null
+  score?: number | null
+  error?: string | null
+  metrics?: {
+    total_return?: number | null
+    sharpe?: number | null
+    max_drawdown?: number | null
+    n_trades?: number | null
+    equity_curve?: { date: string; value: number }[]
+    trades?: StrategyBacktestTrade[]
+  } | null
+}
+
+export interface AlphaDiscoverySummary {
+  engine_id: string
+  engine_name: string
+  discovery_trials: number
+  selection_trials: number
+  finite_selection_trials: number
+  selected_folds: number
+  outer_folds: number
+  selection_stability: number | null
+  best_penalized_score: number | null
+  recipes_considered: number
+  selected_recipe_id: string | null
+  selected_recipe_fold_count: number
+  errors: number
+}
+
+export interface AlphaMarketAttribution {
+  available: boolean
+  reason?: string | null
+  regimes: {
+    state: 'strong_up' | 'weak_up' | 'weak_down' | 'strong_down' | string
+    label: string
+    days: number
+    return: number | null
+    positive_day_ratio: number | null
+    contribution: number
+  }[]
+  years: { year: string; days: number; return: number | null }[]
+  daily?: {
+    date: string
+    state: string
+    candidate_return: number
+    market_return: number
+    breadth: number
+    stock_count: number
+  }[]
+  industries: {
+    available: boolean
+    reason?: string | null
+    rows: { industry: string; trades: number; pnl: number; win_rate: number | null }[]
+  }
+  concepts: {
+    available: boolean
+    reason?: string | null
+    rows: Record<string, unknown>[]
+  }
 }
 
 export interface AlphaCandidateResult {
@@ -1396,10 +1557,27 @@ export interface AlphaCandidateResult {
     capacity_return?: number | null
     capacity_passed?: boolean | null
     concentration_passed?: boolean | null
-    stress?: Record<string, unknown>
+    stress?: {
+      status?: string
+      double_cost?: AlphaCandidateResult['metrics']
+      delay?: AlphaCandidateResult['metrics']
+      capacity?: AlphaCandidateResult['metrics']
+      parameter_returns?: (number | null)[]
+      concentration?: {
+        passed?: boolean
+        reason?: string
+        trades?: number
+        positive_contribution?: number
+        top_symbol_share?: number
+        top5_symbol_share?: number
+        top_year_share?: number
+        top_industry_share?: number | null
+        limits?: { symbol: number; top5: number; year: number; industry: number }
+      }
+    }
   }
   gates: AlphaGateEvidence[]
-  folds: Record<string, unknown>[]
+  folds: AlphaFoldResult[]
 }
 
 export interface AlphaEvidenceCandidate {
@@ -1417,7 +1595,8 @@ export interface AlphaEvidenceCandidate {
 }
 
 export interface AlphaLeaderboard {
-  champion: { kind: string; strategy_id: string | null; candidate_id: string | null; effective_at: string | null; reason: string }
+  champion: { kind: string; strategy_id: string | null; candidate_id: string | null; effective_at: string | null; reason: string; metrics?: { stitched_oos_return?: number | null; stitched_oos_sharpe?: number | null; max_drawdown?: number | null } }
+  history?: { strategy_id: string | null; candidate_id: string | null; effective_at: string | null; reason: string }[]
   challengers: { candidate_id: string; engine_id: string; state: AlphaResearchState; return: number | null; sharpe: number | null; max_drawdown: number | null; gates_passed: number; gates_failed: number; gates_pending: number }[]
 }
 
@@ -1438,6 +1617,9 @@ export interface AlphaShadowStatus {
     critical_incidents: number
     drift_detected: boolean
     qualified: boolean
+    required_trading_days: number
+    required_fills: number
+    required_factor_round_trips: number
     factor_decay: {
       status: 'pending' | 'passed' | 'failed'
       completed_round_trips: number
@@ -1468,8 +1650,72 @@ export interface AlphaResult {
     metrics: AlphaCandidateResult['metrics']
   }
   candidates: AlphaCandidateResult[]
+  discovery_summary?: AlphaDiscoverySummary[]
+  market_attribution?: Record<string, AlphaMarketAttribution>
+  candidate_correlations?: {
+    left_engine_id: string
+    right_engine_id: string
+    overlap_days: number
+    correlation: number | null
+  }[]
+  failure_analysis?: {
+    zero_pass: boolean
+    conclusion: string
+    funnel: {
+      selected_engines: number
+      frozen_candidates: number
+      outer_evaluated: number
+      historical_gate_passed: number
+    }
+    best_failed_candidate: {
+      engine_id: string
+      engine_name: string
+      recipe_id: string | null
+      stitched_oos_return: number | null
+      stitched_oos_sharpe: number | null
+      max_drawdown: number | null
+      failed_gate_ids: string[]
+      pending_gate_ids: string[]
+    } | null
+    primary_category_id: string | null
+    categories: {
+      id: 'signal_invalid' | 'oos_decay' | 'regime_dependency' | 'execution_cost' | 'capacity_concentration' | 'insufficient_coverage' | 'engine_or_data_error' | string
+      label: string
+      count: number
+      severity: 'high' | 'medium' | 'low' | string
+      evidence: string[]
+      keep: string[]
+      change: string[]
+      why: string
+    }[]
+    excluded_recipe_ids: string[]
+  }
+  next_research_suggestions?: AlphaNextResearchSuggestion[]
+  hypothesis?: {
+    hypothesis_id: string
+    title: string
+    source_kind: AlphaHypothesis['source_kind']
+    verdict: 'supported' | 'rejected'
+  }
+  next_hypotheses?: AlphaHypothesis[]
   trial_ledger: Record<string, unknown>[]
   engine_failures: { engine_id: string; stage: string; error: string }[]
+}
+
+export interface AlphaNextResearchSuggestion {
+  suggestion_id: string
+  category_id: string
+  title: string
+  why: string
+  keep: string[]
+  changes: {
+    field: string
+    label: string
+    before: unknown
+    after: unknown
+    reason: string
+  }[]
+  request_patch: Partial<AlphaMiningRequest>
 }
 
 export type ResearchCandidateKind = 'factor' | 'strategy'
@@ -2833,6 +3079,46 @@ export const api = {
       load_failures: { engine_id: string; stage: string; error: string }[]
     }>('/api/alpha-mining/v1/engines'),
 
+  alphaHypotheses: (params?: { assetType?: 'stock' | 'etf'; start?: string; end?: string }) => {
+    const query = new URLSearchParams()
+    if (params?.assetType) query.set('asset_type', params.assetType)
+    if (params?.start) query.set('start', params.start)
+    if (params?.end) query.set('end', params.end)
+    const suffix = query.toString()
+    return request<{ items: AlphaHypothesis[] }>(`/api/alpha-mining/v1/hypotheses${suffix ? `?${suffix}` : ''}`)
+  },
+
+  alphaHypothesisCreate: (payload: AlphaHypothesisCreate) =>
+    request<AlphaHypothesis>('/api/alpha-mining/v1/hypotheses', {
+      method: 'POST',
+      body: JSON.stringify(payload),
+    }),
+
+  alphaAIHypothesisPropose: (payload: {
+    asset_type: 'stock' | 'etf'
+    start: string
+    end: string
+    count?: number
+    research_focus?: string
+  }) => request<AlphaAIHypothesisProposalResult>('/api/alpha-mining/v1/hypotheses/ai-proposals', {
+    method: 'POST',
+    body: JSON.stringify(payload),
+  }),
+
+  alphaHypothesisStart: (hypothesisId: string, payload: {
+    start?: string | null
+    end?: string | null
+    budget_profile: MiningBudgetProfile
+    commission_pct: number
+    stamp_tax_pct: number
+    slippage_bps: number
+    max_positions: number
+    force?: boolean
+  }) => request<AlphaRun>(`/api/alpha-mining/v1/hypotheses/${encodeURIComponent(hypothesisId)}/runs`, {
+    method: 'POST',
+    body: JSON.stringify(payload),
+  }),
+
   alphaConfig: () => request<AlphaConfig>('/api/alpha-mining/v1/config'),
 
   alphaUpdateConfig: (payload: Partial<AlphaConfig>) =>
@@ -2902,6 +3188,12 @@ export const api = {
     request<Record<string, unknown>>(
       `/api/alpha-mining/v1/candidates/${encodeURIComponent(candidateId)}/shadow`,
       { method: 'POST', body: JSON.stringify({ baseline_date: baselineDate || null }) },
+    ),
+
+  alphaStrictValidation: (candidateId: string) =>
+    request<AlphaRun>(
+      `/api/alpha-mining/v1/candidates/${encodeURIComponent(candidateId)}/strict-validation`,
+      { method: 'POST' },
     ),
 
   alphaShadow: (candidateId: string) =>
