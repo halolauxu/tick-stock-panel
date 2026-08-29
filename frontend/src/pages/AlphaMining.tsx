@@ -228,6 +228,20 @@ function successfulOosRange(candidate: AlphaCandidateResult) {
   return starts.length && ends.length ? { start: starts[0], end: ends[ends.length - 1] } : null
 }
 
+function hasPeriodCoverage(candidate: AlphaCandidateResult, period: 'year' | 'quarter') {
+  const explicit = period === 'year' ? candidate.metrics.recent_1y_available : candidate.metrics.recent_3m_available
+  if (typeof explicit === 'boolean') return explicit
+  const range = successfulOosRange(candidate)
+  if (!range) return false
+  const span = (Date.parse(range.end) - Date.parse(range.start)) / 86_400_000
+  return span >= (period === 'year' ? 365 : 92)
+}
+
+function gatePeriodUnavailable(candidate: AlphaCandidateResult, gateId: string) {
+  return (gateId === 'recent_year' && !hasPeriodCoverage(candidate, 'year'))
+    || (gateId === 'recent_quarter' && !hasPeriodCoverage(candidate, 'quarter'))
+}
+
 function factorRule(candidate: AlphaCandidateResult, factorMap: Map<string, FactorColumn>) {
   const frozen = candidate.frozen_candidate
   if (!frozen) return '内层筛选未形成可回测方案'
@@ -255,7 +269,8 @@ function SectionTitle({ index, title, subtitle }: { index: number; title: string
 function gateCounts(candidate: AlphaCandidateResult) {
   return candidate.gates.reduce(
     (acc, gate) => {
-      acc[gate.status] += 1
+      const status = gatePeriodUnavailable(candidate, gate.id) ? 'pending' : gate.status
+      acc[status] += 1
       return acc
     },
     { passed: 0, failed: 0, pending: 0 },
@@ -410,6 +425,10 @@ export function AlphaMining() {
   const factorMap = useMemo(
     () => new Map((factorsQuery.data?.columns || []).map(item => [item.id, item])),
     [factorsQuery.data?.columns],
+  )
+  const engineNameMap = useMemo(
+    () => new Map((enginesQuery.data?.items || []).map(item => [item.engine_id, item.name])),
+    [enginesQuery.data?.items],
   )
   const selectedResultCandidate = result?.candidates.find(item => item.candidate_id === selectedCandidateId) || null
   const catalogRows = Object.entries(availabilityQuery.data?.catalog.datasets || {})
@@ -839,12 +858,13 @@ export function AlphaMining() {
           <SectionTitle index={6} title="候选证据" subtitle="先说明发现了什么因子、方向和交易规则，再展示真实样本外与压力测试；没有完整时间覆盖就不显示对应期间收益。" />
           <RunOutcome run={currentRun} result={result} />
           {result
-            ? <CandidateTable candidates={result.candidates} factorMap={factorMap} selectedId={selectedCandidateId} onSelect={id => { if (id) setSelectedCandidateId(id) }} />
+            ? <CandidateTable candidates={result.candidates} factorMap={factorMap} engineNameMap={engineNameMap} selectedId={selectedCandidateId} onSelect={id => { if (id) setSelectedCandidateId(id) }} />
             : <Empty text="尚无可裁决结果；系统不会凭空生成候选。" />}
           {selectedResultCandidate && (
             <CandidateDetail
               candidate={selectedResultCandidate}
               factorMap={factorMap}
+              engineName={engineNameMap.get(selectedResultCandidate.engine_id)}
               evidence={candidateQuery.data}
               horizon={Number(result?.request_summary.forward_horizon) || horizon}
             />
@@ -1023,11 +1043,13 @@ function Empty({ text, compact = false }: { text: string; compact?: boolean }) {
 function CandidateTable({
   candidates,
   factorMap,
+  engineNameMap,
   selectedId,
   onSelect,
 }: {
   candidates: AlphaCandidateResult[]
   factorMap: Map<string, FactorColumn>
+  engineNameMap: Map<string, string>
   selectedId: string | null
   onSelect: (id?: string | null) => void
 }) {
@@ -1044,7 +1066,7 @@ function CandidateTable({
             return (
               <tr key={candidate.engine_id} onClick={() => onSelect(candidate.candidate_id)} className={cn('border-b border-border/60 last:border-0', candidate.candidate_id && 'cursor-pointer hover:bg-elevated/40', selectedId === candidate.candidate_id && 'bg-accent/5')}>
                 <td className="max-w-[310px] px-3 py-2">
-                  <div className="font-medium text-foreground">{candidate.engine_name}</div>
+                  <div className="font-medium text-foreground">{engineNameMap.get(candidate.engine_id) || candidate.engine_name}</div>
                   <div className={cn('mt-0.5 text-[8px] leading-relaxed', hasCandidate ? 'text-secondary' : 'text-muted')}>{factorRule(candidate, factorMap)}</div>
                 </td>
                 <td className={cn('px-3 py-2', hasCandidate ? 'text-secondary' : 'text-muted')}>{hasCandidate ? statusLabel(candidate.state) : '未形成候选'}</td>
@@ -1072,11 +1094,13 @@ function CandidateTable({
 function CandidateDetail({
   candidate,
   factorMap,
+  engineName,
   evidence,
   horizon,
 }: {
   candidate: AlphaCandidateResult
   factorMap: Map<string, FactorColumn>
+  engineName?: string
   evidence?: { candidate: AlphaEvidenceCandidate; events: Record<string, unknown>[] }
   horizon: number
 }) {
@@ -1085,23 +1109,16 @@ function CandidateDetail({
   const range = successfulOosRange(candidate)
   const params = frozen.parameters
   const training = frozen.train_evidence
-  const periodAvailable = (period: 'year' | 'quarter') => {
-    const explicit = period === 'year' ? candidate.metrics.recent_1y_available : candidate.metrics.recent_3m_available
-    if (typeof explicit === 'boolean') return explicit
-    if (!range) return false
-    const span = (Date.parse(range.end) - Date.parse(range.start)) / 86_400_000
-    return span >= (period === 'year' ? 365 : 92)
-  }
-  const failedGates = candidate.gates.filter(gate => gate.status === 'failed')
-  const pendingGates = candidate.gates.filter(gate => gate.status === 'pending')
+  const failedGates = candidate.gates.filter(gate => gate.status === 'failed' && !gatePeriodUnavailable(candidate, gate.id))
+  const pendingGates = candidate.gates.filter(gate => gate.status === 'pending' || gatePeriodUnavailable(candidate, gate.id))
   const numericTraining = (key: string) => typeof training[key] === 'number' ? Number(training[key]) : null
 
   return (
     <div className="border-t border-border bg-base/20 p-3">
       <div className="flex flex-wrap items-start justify-between gap-3">
         <div>
-          <div className="text-xs font-semibold text-foreground">{frozen.name}</div>
-          <div className="mt-1 max-w-4xl text-[9px] leading-relaxed text-muted">{frozen.thesis}</div>
+          <div className="text-xs font-semibold text-foreground">{engineName || candidate.engine_name} · {factorRule(candidate, factorMap)}</div>
+          <div className="mt-1 max-w-4xl text-[9px] leading-relaxed text-muted">冻结假设：该事前规则在训练窗中与未来 {horizon} 个交易日净收益存在稳定关系；是否成立只由下方未见样本回测裁决。</div>
         </div>
         <span className={cn('rounded-full px-2 py-1 text-[8px]', candidate.state === 'rejected' ? 'bg-danger/10 text-danger' : 'bg-emerald-500/10 text-emerald-300')}>{statusLabel(candidate.state)}</span>
       </div>
@@ -1148,8 +1165,8 @@ function CandidateDetail({
             <DetailMetric label="样本外夏普" value={fmtNumber(candidate.metrics.stitched_oos_sharpe)} />
             <DetailMetric label="最大回撤" value={fmtPct(candidate.metrics.max_drawdown)} />
             <DetailMetric label="双倍成本收益" value={fmtPct(candidate.metrics.double_cost_return)} />
-            <DetailMetric label="最近一年收益" value={periodAvailable('year') ? fmtPct(candidate.metrics.recent_1y_return) : '样本不足，不计算'} />
-            <DetailMetric label="最近三个月收益" value={periodAvailable('quarter') ? fmtPct(candidate.metrics.recent_3m_return) : '样本不足，不计算'} />
+            <DetailMetric label="最近一年收益" value={hasPeriodCoverage(candidate, 'year') ? fmtPct(candidate.metrics.recent_1y_return) : '样本不足，不计算'} />
+            <DetailMetric label="最近三个月收益" value={hasPeriodCoverage(candidate, 'quarter') ? fmtPct(candidate.metrics.recent_3m_return) : '样本不足，不计算'} />
           </div>
         </div>
       </div>
@@ -1162,7 +1179,7 @@ function CandidateDetail({
               {failedGates.map(gate => <span key={gate.id} className="rounded border border-danger/20 bg-danger/5 px-2 py-1 text-[8px] text-danger">{GATE_LABELS[gate.id] || gate.id}：{formatGateActual(gate)}</span>)}
             </div>
           ) : <div className="mt-2 text-[8px] text-emerald-300">本次已计算的历史硬门槛没有失败项。</div>}
-          {pendingGates.length > 0 && <div className="mt-2 text-[8px] leading-relaxed text-muted">尚未验证：{pendingGates.map(gate => GATE_LABELS[gate.id] || gate.id).join('、')}。缺失证据不会按通过处理。</div>}
+          {pendingGates.length > 0 && <div className="mt-2 text-[8px] leading-relaxed text-muted">尚未验证：{pendingGates.map(gate => `${GATE_LABELS[gate.id] || gate.id}${gatePeriodUnavailable(candidate, gate.id) ? '（样本覆盖不足，本次不裁决）' : ''}`).join('、')}。缺失证据不会按通过处理。</div>}
         </div>
         <details className="rounded-lg border border-border bg-surface p-3 text-[8px] text-muted">
           <summary className="cursor-pointer font-medium text-secondary">技术审计标识</summary>
