@@ -35,7 +35,7 @@
 - 未改动范围：旧 `/mining` 路由、API 前缀、运行目录和管理器保持原合同。
 - 测试结果：`test_isolation.py`、`test_config.py`、`test_manager.py` 及后端全量回归通过。
 - 页面/运行证据：`/alpha-mining` 直接刷新与 390px 无横向溢出；`/mining` 原页面与控制项可用，控制台无错误。
-- 剩余风险：尚未部署到线上实例；当前结论只对本工作区代码成立。
+- 剩余风险：线上实例已完成部署复验；尚未执行长时间真实研究任务，不能用页面可用替代研究结果。
 
 ## Stage 2：引擎注册系统 — PASS
 
@@ -122,3 +122,25 @@
 | 差异格式检查 | `git diff --check` 无输出 | PASS |
 | Alpha 页面浏览器验收 | 8 区、直接刷新、禁用/空态、390px、无控制台错误 | PASS |
 | 旧挖掘浏览器回归 | 页面、控制项和既有运行记录可见，无控制台错误 | PASS |
+
+## 服务器部署复验
+
+复验日期：`2026-08-29 Asia/Shanghai`
+
+| 验收项 | 服务器实际证据 | 结论 |
+|---|---|---|
+| 部署提交 | 运行代码提交 `f53bb8157859bfbe777625b97156befbed4dffaa`；服务器 `main` 工作区无未提交改动 | PASS |
+| 镜像与容器 | Docker 镜像重建成功；`TickFlow_Stock_Panel` 持续运行且重启次数为 0 | PASS |
+| 后端探活 | `GET /health` 返回 `status=ok`、`version=0.2.1`、`mode=free` | PASS |
+| 服务器全量测试 | 隔离测试环境直接挂载服务器源码，补齐 Node 测试依赖并移除镜像运行时 `DATA_DIR` 覆盖后：`1336 passed, 20 warnings in 77.12s` | PASS |
+| 前端生产构建 | 服务器 Docker 构建执行 TypeScript 与 Vite，`2724 modules transformed`，生成独立 `AlphaMining` chunk | PASS |
+| Alpha 页面 | 已登录浏览器直接访问 `/alpha-mining`；8 个产品区域完整，1280px 下 `scrollWidth=innerWidth=1280`，浏览器日志为空 | PASS |
+| 旧挖掘回归 | `/mining` 原配置、48 个因子、历史运行和自动配置仍可见可用，浏览器日志为空 | PASS |
+| 功能开关 | `enabled=false`、`auto_run_enabled=false`；部署没有自动启动研究、前向账户或策略发布 | PASS |
+| 引擎注册 | 8 个引擎、注册表冻结、`load_failures=[]` | PASS |
+| 历史研究窗口 | 3160 个交易日，`2013-08-29` 至 `2026-08-28`，均衡档最低 660 日，可生成 20 个 Alpha outer folds | PASS |
+| PIT 数据门禁 | 日线、历史股票池、财务公告、行业历史均 ready 且 PIT 已验证；事件历史缺失、概念仅当前快照，相关引擎继续 fail-closed | PASS（按数据集分别裁决） |
+| 最新分区完整性 | raw 与 enriched 的 `2026-08-28` 分区均为 5547 行/5547 唯一标的、重复键 0、OHLC 空值均为 0 | PASS |
+| 当前研究结果 | 实验 0、候选 0、冠军仍为 `n_day_low_reversal`；没有生成或发布虚假 Alpha | FAIL（目标阶段保持失败） |
+
+服务器复验曾实际发现并修复两项跨环境缺陷：扩展配置在同尺寸快速写入时的缓存失效，以及旧挖掘终态与审计事件的并发可见性。两项修复均已进入最终运行提交，并由服务器全量测试覆盖。
