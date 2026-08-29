@@ -19,7 +19,7 @@ from typing import Any
 import polars as pl
 
 from app.backtest.regime_alignment import build_regime_filter_mask
-from app.market_time import CN_TZ, cn_now
+from app.market_time import CN_TZ, cn_now, is_possible_cn_equity_session
 from app.price_limits import is_risk_warning_name, price_limit_pct
 from app.services.paper_ledger import (
     TERMINAL_ORDER_STATUSES,
@@ -165,6 +165,28 @@ class PaperTradingService:
         self._recovery_quote_fetch_last: datetime | None = None
         self._close_quote_refresh_last: datetime | None = None
         self._migrate_legacy_json()
+        repaired = self._repair_invalid_session_orders()
+        if repaired:
+            logger.warning("requeued %d paper orders scheduled on non-session dates", repaired)
+
+    def _repair_invalid_session_orders(self) -> int:
+        """Requeue safe, unfilled orders that were scheduled on a weekend."""
+        candidates = {
+            str(row["id"]): dict(row)
+            for row in [*self.ledger.planned_orders(), *self.ledger.recovery_orders()]
+        }
+        repaired = 0
+        for order in candidates.values():
+            scheduled = order.get("scheduled_date")
+            if not scheduled:
+                continue
+            trading_date = date.fromisoformat(str(scheduled))
+            if is_possible_cn_equity_session(trading_date):
+                continue
+            repaired += int(
+                self.ledger.requeue_invalid_session_order(order["id"], trading_date)
+            )
+        return repaired
 
     def claim_close_quote_refresh(
         self,
@@ -304,30 +326,14 @@ class PaperTradingService:
         if frame is None or frame.is_empty() or frame_date is None:
             return {}
         records = frame.to_dicts()
-        result = _quote_map(records, source="realtime_cache")
-        if result:
-            return result
-        status = service.status()
-        fetched_ms = status.get("last_fetch_ms")
-        if not fetched_ms:
-            return {}
-        quote_at = datetime.fromtimestamp(float(fetched_ms) / 1000, tz=CN_TZ)
-        for record in records:
-            symbol = str(record.get("symbol") or "")
-            if not symbol:
-                continue
-            result[symbol] = {
-                **record,
-                "last_price": record.get("close"),
-                "quote_at": quote_at.isoformat(timespec="seconds"),
-                "_quote_dt": quote_at,
-                "source": "realtime_cache",
-            }
-        return result
+        # Never replace a missing market timestamp with the wall-clock fetch
+        # time.  On weekends and exchange holidays that turns a stale previous
+        # session close into apparently current execution evidence.
+        return _quote_map(records, source="realtime_cache")
 
     @staticmethod
     def _market_is_observed(trading_date: date, quotes: dict[str, dict[str, Any]]) -> bool:
-        return any(
+        return is_possible_cn_equity_session(trading_date) and any(
             quote.get("_quote_dt") is not None
             and quote["_quote_dt"].date() == trading_date
             and _valid_price(quote.get("last_price"))
@@ -339,7 +345,8 @@ class PaperTradingService:
         quote: dict[str, Any] | None, trading_date: date
     ) -> bool:
         return bool(
-            quote
+            is_possible_cn_equity_session(trading_date)
+            and quote
             and quote.get("_quote_dt") is not None
             and quote["_quote_dt"].date() == trading_date
             and _valid_price(quote.get("last_price"))
@@ -419,7 +426,9 @@ class PaperTradingService:
         quotes = quotes if quotes is not None else self._quotes_from_cache()
         summary = {"checked": 0, "deferred": 0, "assigned": 0}
         with self._lock:
-            self.ledger.unlock_positions(trading_date)
+            if not is_possible_cn_equity_session(trading_date):
+                summary["deferred"] = len(self.ledger.planned_orders())
+                return summary
             if not self._market_is_observed(trading_date, quotes):
                 for account in self.ledger.list_accounts():
                     if account["status"] != "active":
@@ -436,6 +445,7 @@ class PaperTradingService:
                     )
                 summary["deferred"] = len(self.ledger.planned_orders())
                 return summary
+            self.ledger.unlock_positions(trading_date)
             for account in self.ledger.list_accounts():
                 self.ledger.resolve_incident(
                     f"account:{account['id']}:TRADING_DAY_UNCONFIRMED:{trading_date}"
@@ -570,6 +580,9 @@ class PaperTradingService:
         trading_date = current.date()
         quotes = quotes if quotes is not None else self._quotes_from_cache()
         summary = {"filled": 0, "partial": 0, "rejected": 0, "unknown": 0, "waiting": 0}
+        if not is_possible_cn_equity_session(trading_date):
+            summary["waiting"] = len(self.ledger.planned_orders())
+            return summary
         with self._lock:
             self.preflight_all(now=current, quotes=quotes)
             market_observed = self._market_is_observed(trading_date, quotes)
@@ -704,6 +717,10 @@ class PaperTradingService:
         selected = {symbol: quote for symbol, quote in quotes.items() if symbol in tracked}
         marked = self.ledger.update_marks(selected, source=source) if selected else 0
         observed = _as_cn()
+        if not is_possible_cn_equity_session(current.date()) or (
+            source == "realtime" and current.date() != observed.date()
+        ):
+            return {"marked": marked, "executed": 0, "risk_triggers": 0}
         if marked and observed.time() >= SETTLEMENT_TIME:
             close_symbols = {
                 symbol for symbol, quote in selected.items()
@@ -1292,6 +1309,8 @@ class PaperTradingService:
             "unknown": 0,
             "waiting_evidence": 0,
         }
+        self._repair_invalid_session_orders()
+        current_session_candidate = is_possible_cn_equity_session(current.date())
         with self._lock:
             result["missed"] += self._promote_historical_misses(current.date())
         existing_recovery = self.ledger.recovery_orders()
@@ -1299,12 +1318,13 @@ class PaperTradingService:
             return result
         with self._lock:
             recovered_accounts: set[str] = set()
-            quotes = self._quotes_from_cache()
+            quotes = self._quotes_from_cache() if current_session_candidate else {}
             symbols = sorted(self.subscription_symbols())
             current_recovery_symbols = {
                 str(row["symbol"])
                 for row in self.ledger.recovery_orders()
-                if row["scheduled_date"] == current.date().isoformat()
+                if current_session_candidate
+                and row["scheduled_date"] == current.date().isoformat()
             }
             fresh_recovery_quotes: dict[str, dict[str, Any]] = {}
             missing_current_quotes = [
@@ -1312,7 +1332,7 @@ class PaperTradingService:
                 if symbol not in quotes
                 or quotes[symbol].get("_quote_dt") is None
                 or quotes[symbol]["_quote_dt"].date() != current.date()
-            ]
+            ] if current_session_candidate else []
             quote_retry_due = (
                 self._recovery_quote_fetch_last is None
                 or (current - self._recovery_quote_fetch_last).total_seconds() >= 300
@@ -1343,7 +1363,7 @@ class PaperTradingService:
                     self.repo.get_minute_batch(symbols, current.date()),
                     current.date(),
                 )
-                if symbols else {}
+                if current_session_candidate and symbols else {}
             )
             minute_quotes = {
                 symbol: {
@@ -1359,7 +1379,7 @@ class PaperTradingService:
                 }
                 for symbol, row in current_minutes.items()
             }
-            if current.time() >= OPEN_DEADLINE:
+            if current_session_candidate and current.time() >= OPEN_DEADLINE:
                 for row in self.ledger.planned_orders():
                     order = dict(row)
                     if (
@@ -1400,7 +1420,7 @@ class PaperTradingService:
                     continue
                 minute_quote["prev_close"] = self._reference_close(order, minute_quote)
             confirmation_quotes = {**minute_quotes, **quotes}
-            if current.time() >= OPEN_DEADLINE and (
+            if current_session_candidate and current.time() >= OPEN_DEADLINE and (
                 self._market_is_observed(current.date(), confirmation_quotes)
                 or bool(current_minutes)
             ):

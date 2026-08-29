@@ -27,8 +27,9 @@ from apscheduler.triggers.interval import IntervalTrigger
 
 from app.config import settings
 from app.indicators.pipeline import run_pipeline
-from app.market_time import cn_now
-from app.services import index_sync, instrument_sync, kline_sync, preferences as _prefs
+from app.market_time import cn_now, is_possible_cn_equity_session
+from app.services import index_sync, instrument_sync, kline_sync
+from app.services import preferences as _prefs
 from app.tickflow.capabilities import Cap, CapabilitySet
 from app.tickflow.pools import DEMO_SYMBOLS, get_pool
 from app.tickflow.repository import KlineRepository
@@ -1296,6 +1297,8 @@ def _register_paper_clock_jobs(scheduler) -> None:
 def _paper_quote_tick() -> None:
     """Keep paper orders and positions priced even when the global UI switch is off."""
     observed = cn_now()
+    if not is_possible_cn_equity_session(observed.date()):
+        return
     current = observed.time()
     in_market_window = (
         dt_time(9, 25) <= current <= dt_time(11, 30)

@@ -18,6 +18,7 @@ from app.services.paper_trading import PaperTradingService, PaperTradingStore
 SIGNAL_DAY = date(2026, 8, 26)
 TRADE_DAY = date(2026, 8, 27)
 OPEN_TIME = datetime(2026, 8, 27, 9, 30, 5, tzinfo=CN_TZ)
+WEEKEND_DAY = date(2026, 8, 29)
 
 
 @pytest.fixture(autouse=True)
@@ -400,6 +401,101 @@ def test_preflight_requires_each_orders_own_current_quote(tmp_path):
     )
 
 
+def test_weekend_quotes_cannot_schedule_or_terminalize_next_open_order(tmp_path):
+    service = _service(tmp_path)
+    account, _ = _account_with_buy_order(service)
+    saturday_open = datetime(2026, 8, 29, 9, 31, tzinfo=CN_TZ)
+
+    result = service.execute_open_orders(
+        now=saturday_open,
+        quotes={"000001.SZ": _quote(at=saturday_open)},
+        finalize_missing=True,
+    )
+    current = service.account(account["id"])
+
+    assert result == {
+        "filled": 0,
+        "partial": 0,
+        "rejected": 0,
+        "unknown": 0,
+        "waiting": 1,
+    }
+    assert current["orders"][0]["status"] == "PLANNED"
+    assert current["orders"][0]["scheduled_date"] is None
+    assert current["fills"] == []
+    assert current["summary"]["critical_incident_count"] == 0
+
+
+def test_weekend_preflight_does_not_unlock_friday_t_plus_one_position(tmp_path):
+    service = _service(tmp_path)
+    account, order_id = _account_with_buy_order(service)
+    service.ledger.assign_due_date(order_id, TRADE_DAY, {"market_observed": True})
+    service.ledger.execute_fill(
+        order_id,
+        price=10,
+        quantity=1_000,
+        quote_at=OPEN_TIME,
+        source="open_quote",
+    )
+    saturday_open = datetime(2026, 8, 29, 9, 25, tzinfo=CN_TZ)
+
+    service.preflight_all(
+        now=saturday_open,
+        quotes={"000001.SZ": _quote(at=saturday_open)},
+    )
+    position = service.account(account["id"])["positions"][0]
+
+    assert position["available_qty"] == 0
+    assert position["locked_qty"] == 1_000
+
+
+def test_cache_fetch_time_never_masquerades_as_quote_time(tmp_path):
+    service = _service(tmp_path)
+    saturday_fetch = datetime(2026, 8, 29, 9, 31, tzinfo=CN_TZ)
+    service.app_state.quote_service = SimpleNamespace(
+        get_enriched_today=lambda: (
+            pl.DataFrame([{
+                "symbol": "000001.SZ",
+                "close": 10.0,
+                "open": 10.0,
+                "high": 10.1,
+                "low": 9.9,
+                "volume": 1_000,
+            }]),
+            WEEKEND_DAY,
+        ),
+        status=lambda: {"last_fetch_ms": saturday_fetch.timestamp() * 1_000},
+    )
+
+    assert service._quotes_from_cache() == {}
+
+
+def test_weekday_without_original_same_day_quote_fails_closed(tmp_path):
+    service = _service(tmp_path)
+    account, _ = _account_with_buy_order(service)
+    monday_open = datetime(2026, 8, 31, 9, 31, tzinfo=CN_TZ)
+    stale_friday = datetime(2026, 8, 28, 15, 0, tzinfo=CN_TZ)
+
+    result = service.execute_open_orders(
+        now=monday_open,
+        quotes={"000001.SZ": _quote(at=stale_friday)},
+        finalize_missing=True,
+    )
+    current = service.account(account["id"])
+
+    assert result["filled"] == 0
+    assert result["unknown"] == 0
+    assert current["orders"][0]["status"] == "PLANNED"
+    assert current["orders"][0]["scheduled_date"] is None
+    assert current["fills"] == []
+    assert current["summary"]["critical_incident_count"] == 0
+    assert any(
+        incident["code"] == "TRADING_DAY_UNCONFIRMED"
+        and incident["status"] == "open"
+        for incident in current["incidents"]
+    )
+
+
 def test_quote_tick_refreshes_tracked_paper_symbols_during_market(monkeypatch):
     calls: list[str] = []
     state = SimpleNamespace(
@@ -418,6 +514,26 @@ def test_quote_tick_refreshes_tracked_paper_symbols_during_market(monkeypatch):
     daily_pipeline._paper_quote_tick()
 
     assert calls == ["refresh"]
+
+
+def test_quote_tick_skips_weekend_market_clock(monkeypatch):
+    calls: list[str] = []
+    state = SimpleNamespace(
+        paper_trading_service=SimpleNamespace(
+            subscription_symbols=lambda: {"000001.SZ"}
+        ),
+        quote_service=SimpleNamespace(refresh=lambda: calls.append("refresh")),
+    )
+    daily_pipeline.set_app_state(state)
+    monkeypatch.setattr(
+        daily_pipeline,
+        "cn_now",
+        lambda: datetime(2026, 8, 29, 11, 25, tzinfo=CN_TZ),
+    )
+
+    daily_pipeline._paper_quote_tick()
+
+    assert calls == []
 
 
 def test_quote_tick_does_not_duplicate_a_running_global_poll(monkeypatch):
@@ -710,6 +826,40 @@ def test_0931_missing_symbol_quote_becomes_unknown_not_a_fill(tmp_path):
     assert result["unknown"] == 1
     assert current["orders"][0]["status"] == "UNKNOWN_MARKET_DATA"
     assert current["fills"] == []
+
+
+def test_restart_requeues_weekend_misclassification_with_compensating_audit(
+    tmp_path, monkeypatch
+):
+    service = _service(tmp_path)
+    account, order_id = _account_with_buy_order(service)
+    saturday = datetime(2026, 8, 29, 9, 31, tzinfo=CN_TZ)
+    service.ledger.assign_due_date(
+        order_id,
+        WEEKEND_DAY,
+        {"market_observed": True, "quote_at": saturday.isoformat()},
+    )
+    service.ledger.terminal_order(
+        order_id,
+        status="UNKNOWN_MARKET_DATA",
+        reason="09:31 当时缺少可靠开盘行情",
+        quality="NO_RELIABLE_OPEN_DATA",
+        scheduled_date=WEEKEND_DAY,
+        severity="critical",
+    )
+    monkeypatch.setattr("app.services.paper_ledger.cn_now", lambda: saturday)
+
+    restarted = _service(tmp_path)
+    current = restarted.account(account["id"])
+    event_types = [event["event_type"] for event in current["timeline"]]
+
+    assert current["orders"][0]["status"] == "PLANNED"
+    assert current["orders"][0]["scheduled_date"] is None
+    assert current["orders"][0]["execution_quality"] is None
+    assert current["fills"] == []
+    assert current["summary"]["critical_incident_count"] == 0
+    assert "INVALID_SESSION_REQUEUED" in event_types
+    assert "UNKNOWN_MARKET_DATA" in event_types
 
 
 def test_late_recovery_preserves_missed_event_and_marks_fill_recovered_late(tmp_path):

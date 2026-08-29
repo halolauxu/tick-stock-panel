@@ -719,6 +719,72 @@ class PaperLedger:
                 payload=preflight,
             )
 
+    def requeue_invalid_session_order(
+        self,
+        order_id: str,
+        invalid_date: date,
+    ) -> bool:
+        """Compensate a non-session scheduling error without deleting audit history."""
+        now = _now_text()
+        reason = "非交易日误调度已纠正; 订单等待下一个真实交易日"
+        recoverable = {
+            "PLANNED",
+            "PREFLIGHT_OK",
+            "MISSED_EXECUTION",
+            "UNKNOWN_MARKET_DATA",
+        }
+        with self.transaction() as conn:
+            order = conn.execute(
+                """SELECT o.*,a.status AS account_status
+                    FROM orders o JOIN accounts a ON a.id=o.account_id
+                    WHERE o.id=?""",
+                (order_id,),
+            ).fetchone()
+            if order is None:
+                raise KeyError(order_id)
+            if (
+                order["account_status"] == "deleted"
+                or order["status"] not in recoverable
+                or order["scheduled_date"] != invalid_date.isoformat()
+                or int(order["filled_qty"]) != 0
+            ):
+                return False
+            if conn.execute(
+                "SELECT 1 FROM fills WHERE order_id=? LIMIT 1", (order_id,)
+            ).fetchone() is not None:
+                return False
+            conn.execute(
+                """UPDATE orders SET scheduled_date=NULL,status='PLANNED',reason=?,
+                    execution_quality=NULL,preflight_json='{}',terminal_at=NULL,updated_at=?
+                    WHERE id=?""",
+                (reason, now, order_id),
+            )
+            conn.execute(
+                """UPDATE incidents SET status='resolved',resolved_at=?
+                    WHERE entity_type='order' AND entity_id=? AND status='open'""",
+                (now, order_id),
+            )
+            self._event(
+                conn,
+                event_key=(
+                    f"{order_id}:INVALID_SESSION_REQUEUED:{invalid_date.isoformat()}"
+                ),
+                account_id=order["account_id"],
+                event_type="INVALID_SESSION_REQUEUED",
+                occurred_at=now,
+                trading_date=invalid_date.isoformat(),
+                entity_type="order",
+                entity_id=order_id,
+                severity="warning",
+                title=f"{order['name'] or order['symbol']} 非交易日误调度已纠正",
+                detail=reason,
+                payload={
+                    "invalid_date": invalid_date.isoformat(),
+                    "previous_status": order["status"],
+                },
+            )
+        return True
+
     def mark_historically_missed(
         self,
         order_id: str,

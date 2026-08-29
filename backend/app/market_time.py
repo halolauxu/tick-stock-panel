@@ -6,7 +6,8 @@
 """
 from __future__ import annotations
 
-from datetime import date, datetime, time as dt_time, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
+from datetime import time as dt_time
 
 CN_TZ = timezone(timedelta(hours=8))
 
@@ -26,6 +27,17 @@ def cn_now() -> datetime:
 def cn_today() -> date:
     """当前北京日期。"""
     return datetime.now(CN_TZ).date()
+
+
+def is_possible_cn_equity_session(value: date) -> bool:
+    """Return the calendar-free hard gate for a possible A-share session.
+
+    A weekday is only a candidate, never proof that the exchange is open.  The
+    execution path must still require a provider quote carrying its original
+    same-day market timestamp, which keeps weekday exchange holidays closed by
+    default.  Weekends can be rejected without consulting external data.
+    """
+    return value.weekday() < 5
 
 
 def trading_minutes_elapsed_from_dt(dt: datetime) -> float:
@@ -76,4 +88,3 @@ def trading_minutes_elapsed_from_ts(ts_ms: int | float | None) -> float:
     except (ValueError, TypeError, OSError):
         return float(_TRADING_TOTAL_MINUTES)
     return trading_minutes_elapsed_from_dt(dt)
-
