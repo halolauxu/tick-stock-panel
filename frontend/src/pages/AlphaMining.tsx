@@ -536,7 +536,13 @@ export function AlphaMining() {
                 className="mt-3 inline-flex h-10 w-full items-center justify-center gap-2 rounded-btn bg-accent text-xs font-semibold text-white disabled:cursor-not-allowed disabled:opacity-50"
               >
                 {active || launchBusy ? <LoaderCircle className="h-4 w-4 animate-spin" /> : <Play className="h-4 w-4" />}
-                {active ? statusLabel(currentRun?.status) : launchBusy ? '正在检查研究条件' : '启动正式研究'}
+                {active
+                  ? statusLabel(currentRun?.status)
+                  : launchBusy
+                    ? '正在检查研究条件'
+                    : profile === 'exploratory'
+                      ? '启动近1年研究'
+                      : '启动正式研究'}
               </button>
               {active && currentRun && (
                 <button
@@ -556,6 +562,7 @@ export function AlphaMining() {
                 onUseQuick={() => setProfile('exploratory')}
                 onUseAll={() => applyDatePreset('all')}
                 showQuickAction={profile !== 'exploratory'}
+                profile={profile}
               />
             </div>
             <div className="grid gap-2 sm:grid-cols-3">
@@ -716,7 +723,7 @@ export function AlphaMining() {
                   ))}
                 </tbody>
               </table>
-              {!runsQuery.data?.items.length && <Empty text="尚无实验；点击上方按钮开始第一轮正式研究。" />}
+              {!runsQuery.data?.items.length && <Empty text="尚无实验；点击上方按钮开始第一轮研究。" />}
             </div>
             <div className="rounded-lg border border-border bg-base/30 p-3">
               <div className="flex items-center gap-2 text-[10px] font-medium text-foreground"><Database className="h-3.5 w-3.5 text-accent" />证据留存</div>
@@ -830,6 +837,7 @@ function ResearchReadiness({
   onUseQuick,
   onUseAll,
   showQuickAction,
+  profile,
 }: {
   blockers: string[]
   tradingBars?: number
@@ -839,12 +847,18 @@ function ResearchReadiness({
   onUseQuick: () => void
   onUseAll: () => void
   showQuickAction: boolean
+  profile: MiningBudgetProfile
 }) {
   if (!blockers.length) {
     return (
       <div className="mt-2 rounded-lg border border-emerald-500/20 bg-emerald-500/5 p-2.5 text-[9px] leading-relaxed text-emerald-300">
-        <div className="flex items-center gap-1.5 font-medium"><CheckCircle2 className="h-3.5 w-3.5" />已经具备启动条件</div>
+        <div className="flex items-center gap-1.5 font-medium"><CheckCircle2 className="h-3.5 w-3.5" />{profile === 'exploratory' ? '近1年研究可以开始' : '正式研究可以开始'}</div>
         <div className="mt-1 text-emerald-300/80">{tradingBars} 个交易日，最低需要 {requiredBars} 个；可形成 {outerFolds} 个独立检验窗口，{usableEngineCount} 个发现引擎可运行。</div>
+        {profile === 'exploratory' && (
+          <div className="mt-1 border-t border-emerald-500/10 pt-1 text-emerald-300/70">
+            近1年用于快速发现和证伪；结果只能进入研究候选，不能直接晋级冠军。正式晋级还必须通过更长历史的标准研究、压力测试和前向模拟。
+          </div>
+        )}
       </div>
     )
   }
