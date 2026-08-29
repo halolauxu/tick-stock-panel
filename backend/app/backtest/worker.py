@@ -139,9 +139,9 @@ def make_worker_task(kind: str, data_dir: Path, config) -> dict[str, Any]:
         encoded = asdict(config)
         encoded["start"] = config.start.isoformat()
         encoded["end"] = config.end.isoformat()
-    elif kind == "mining":
+    elif kind in {"mining", "alpha_mining"}:
         if not isinstance(config, dict):
-            raise TypeError("mining worker config must be a dict")
+            raise TypeError(f"{kind} worker config must be a dict")
         encoded = dict(config)
     else:
         raise ValueError(f"unsupported worker task kind: {kind}")
@@ -212,6 +212,18 @@ def _worker_entry(task: dict[str, Any], event_queue, cancel_event) -> None:
             from app.backtest.mining_runtime import run_mining_runtime
 
             result = run_mining_runtime(
+                task["config"],
+                data_dir=data_dir,
+                service=service,
+                strategy_engine=strategy_engine,
+                progress_cb=_progress,
+                cancel_check=cancel_event,
+                rss_sampler=sampler,
+            )
+        elif kind == "alpha_mining":
+            from app.alpha_mining.runtime import run_alpha_mining_runtime
+
+            result = run_alpha_mining_runtime(
                 task["config"],
                 data_dir=data_dir,
                 service=service,

@@ -27,6 +27,7 @@ WorkerRunner = Callable[
     dict[str, Any],
 ]
 TaskFactory = Callable[[str, Path, dict[str, Any]], dict[str, Any]]
+StoreFactory = Callable[[Path], MiningRunStore]
 
 _SUCCESS_STATUSES = {"succeeded", "succeeded_with_budget_exhausted"}
 _SHUTDOWN_JOIN_SECONDS = 1.0
@@ -40,11 +41,17 @@ class MiningJobManager:
         data_dir: Path | str,
         worker_runner: WorkerRunner = run_worker_task,
         task_factory: TaskFactory = make_worker_task,
+        *,
+        store_factory: StoreFactory = MiningRunStore,
+        task_kind: str = "mining",
+        thread_name_prefix: str = "mining",
     ) -> None:
         self._data_dir = Path(data_dir).resolve()
-        self._store = MiningRunStore(self._data_dir)
+        self._store = store_factory(self._data_dir)
         self._worker_runner = worker_runner
         self._task_factory = task_factory
+        self._task_kind = task_kind
+        self._thread_name_prefix = thread_name_prefix
         self._lock = threading.RLock()
         self._threads: dict[str, threading.Thread] = {}
         self._cancel_events: dict[str, threading.Event] = {}
@@ -151,7 +158,7 @@ class MiningJobManager:
         thread = threading.Thread(
             target=self._run_job,
             args=(run_id, source, cancel_event),
-            name=f"mining-{run_id}",
+            name=f"{self._thread_name_prefix}-{run_id}",
             daemon=True,
         )
         self._cancel_events[run_id] = cancel_event
@@ -177,7 +184,7 @@ class MiningJobManager:
                     "data_fingerprint": manifest["data_fingerprint"],
                     "source": source,
                 }
-                task = self._task_factory("mining", self._data_dir, payload)
+                task = self._task_factory(self._task_kind, self._data_dir, payload)
                 result = self._worker_runner(
                     task,
                     lambda progress: self._record_progress(run_id, progress, cancel_event),

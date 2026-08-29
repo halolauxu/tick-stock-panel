@@ -1218,6 +1218,241 @@ export interface MiningScheduleConfig {
   mining_budget_profile: Exclude<MiningBudgetProfile, 'exploratory'>
 }
 
+// ===== Independent Alpha mining =====
+export type AlphaResearchState =
+  | 'draft'
+  | 'registered'
+  | 'data_ready'
+  | 'discovery'
+  | 'frozen'
+  | 'outer_evaluated'
+  | 'rejected'
+  | 'research_candidate'
+  | 'shadow'
+  | 'challenger'
+  | 'champion'
+
+export interface AlphaEngineManifest {
+  engine_id: string
+  version: string
+  api_version: string
+  name: string
+  family: string
+  information_domains: string[]
+  mechanism_classes: string[]
+  economic_mechanism: string
+  discovery_classes: string[]
+  discovery_method: string
+  prediction_objects: string[]
+  forecast_targets: string[]
+  frequencies: string[]
+  decision_clocks: string[]
+  required_datasets: { dataset_id: string; minimum_coverage: number; pit_required: boolean; timestamp_field: string | null }[]
+  forecast_horizons: number[]
+  output_candidate_types: string[]
+  parameter_contract_version: string
+  artifact_contract_version: string
+  auto_run_allowed: boolean
+  required_features: string[]
+  optional_features: string[]
+  asset_types: string[]
+  readiness: 'ready' | 'blocked'
+  description: string
+}
+
+export interface AlphaDataQualification {
+  ready: boolean
+  reasons: string[]
+  observations: Record<string, unknown>
+}
+
+export interface AlphaCatalog {
+  fingerprint: string
+  first_date: string | null
+  last_date: string | null
+  datasets: Record<string, AlphaDataQualification>
+}
+
+export interface AlphaEngineAvailability {
+  engine_id: string
+  ready: boolean
+  reasons: string[]
+  observations: Record<string, unknown>
+}
+
+export interface AlphaConfig {
+  enabled: boolean
+  auto_run_enabled: boolean
+  auto_run_profile: 'balanced' | 'strict'
+  shadow_min_trading_days: number
+  shadow_min_fills: number
+  shadow_min_factor_round_trips: number
+  shadow_min_rank_ic: number
+}
+
+export interface AlphaCharter {
+  algorithm_version: string
+  objective: string
+  benchmark_policy: string
+  historical_policy: string
+  completion_levels: { id: string; label: string; meaning: string }[]
+  hard_gates: { id: string; label: string; required: boolean }[]
+  coverage_roadmap: { id: string; name: string; status: string; slot: string }[]
+  extension_contract: Record<string, string | boolean | number>
+}
+
+export interface AlphaAvailability {
+  asset_type: 'stock' | 'etf'
+  budget_profile: MiningBudgetProfile
+  trading_bars: number
+  required_bars: number
+  outer_folds: number
+  eligible: boolean
+  available_start: string | null
+  available_end: string | null
+  effective_start: string | null
+  effective_end: string | null
+  catalog: AlphaCatalog
+  engines: AlphaEngineAvailability[]
+}
+
+export interface AlphaMiningRequest {
+  engine_ids: string[]
+  factor_names: string[]
+  symbols?: string[] | null
+  asset_type: 'stock' | 'etf'
+  start?: string | null
+  end?: string | null
+  budget_profile: MiningBudgetProfile
+  forward_horizon: 1 | 3 | 5 | 10 | 20 | 60
+  champion_strategy_id?: string | null
+  commission_pct: number
+  stamp_tax_pct: number
+  slippage_bps: number
+  max_positions: number
+  max_candidates_per_engine: number
+  max_trials_per_engine: number
+  force?: boolean
+}
+
+export interface AlphaRun {
+  run_id: string
+  status: MiningRunStatus
+  request: AlphaMiningRequest
+  created_at: string
+  updated_at: string
+  started_at?: string | null
+  finished_at?: string | null
+  error?: string | null
+  progress?: MiningRunProgress | null
+  research_state?: AlphaResearchState | null
+}
+
+export interface AlphaGateEvidence {
+  id: string
+  status: 'passed' | 'failed' | 'pending'
+  actual: unknown
+  required: unknown
+}
+
+export interface AlphaCandidateResult {
+  candidate_id?: string | null
+  engine_id: string
+  engine_name: string
+  state: AlphaResearchState
+  metrics: {
+    stitched_oos_return?: number | null
+    stitched_oos_sharpe?: number | null
+    max_drawdown?: number | null
+    positive_half_year_ratio?: number | null
+    beat_champion_half_year_ratio?: number | null
+    recent_1y_return?: number | null
+    recent_3m_return?: number | null
+    half_year_windows?: number
+    oos_days?: number
+    equity_curve?: { date: string; value: number }[]
+    double_cost_return?: number | null
+    delayed_entry_return?: number | null
+    worst_parameter_return?: number | null
+    capacity_return?: number | null
+    capacity_passed?: boolean | null
+    concentration_passed?: boolean | null
+    stress?: Record<string, unknown>
+  }
+  gates: AlphaGateEvidence[]
+  folds: Record<string, unknown>[]
+}
+
+export interface AlphaEvidenceCandidate {
+  candidate_id: string
+  engine_id: string
+  run_id: string
+  content_sha256: string
+  candidate: Record<string, unknown>
+  renderer: Record<string, unknown>
+  state: { state: AlphaResearchState; revision: number; updated_at: string }
+  outer_evaluation?: Record<string, unknown> | null
+  shadow?: Record<string, unknown> | null
+  forward_evaluation?: Record<string, unknown> | null
+  publication?: Record<string, unknown> | null
+}
+
+export interface AlphaLeaderboard {
+  champion: { kind: string; strategy_id: string; candidate_id: string | null; effective_at: string | null; reason: string }
+  challengers: { candidate_id: string; engine_id: string; state: AlphaResearchState; return: number | null; sharpe: number | null; max_drawdown: number | null; gates_passed: number; gates_failed: number; gates_pending: number }[]
+}
+
+export interface AlphaShadowStatus {
+  candidate: AlphaEvidenceCandidate
+  account: Record<string, unknown>
+  evaluation: {
+    trading_days: number
+    fills: number
+    orders: number
+    signals: number
+    total_return: number
+    max_drawdown: number
+    average_slippage_bps: number | null
+    reconcile_ok: boolean
+    signal_order_parity: boolean
+    no_synthetic_profit: boolean
+    critical_incidents: number
+    drift_detected: boolean
+    qualified: boolean
+    factor_decay: {
+      status: 'pending' | 'passed' | 'failed'
+      completed_round_trips: number
+      rank_ic: number | null
+      minimum_rank_ic: number
+      minimum_round_trips: number
+    }
+  }
+}
+
+export interface AlphaResult {
+  status: string
+  research_state: AlphaResearchState
+  algorithm_version: string
+  data_as_of: string
+  request_summary: Record<string, unknown>
+  summary: {
+    outer_fold_count: number
+    candidate_engine_count: number
+    trial_count: number
+    backtest_count: number
+    panel_rows: number
+    matrix_bytes: number
+    elapsed_ms: number
+  }
+  champion: {
+    strategy_id: string
+    metrics: AlphaCandidateResult['metrics']
+  }
+  candidates: AlphaCandidateResult[]
+  trial_ledger: Record<string, unknown>[]
+  engine_failures: { engine_id: string; stage: string; error: string }[]
+}
+
 export type ResearchCandidateKind = 'factor' | 'strategy'
 export type ResearchCandidateStatus = 'pending' | 'validated' | 'rejected'
 
@@ -2567,6 +2802,106 @@ export const api = {
       method: 'PATCH',
       body: JSON.stringify(payload),
     }),
+
+  alphaCharter: () => request<AlphaCharter>('/api/alpha-mining/v1/charter'),
+
+  alphaEngines: () =>
+    request<{
+      api_version: string
+      registry_frozen: boolean
+      items: AlphaEngineManifest[]
+      taxonomy: Record<string, { id: string; engine_ids: string[]; covered: boolean }[]>
+      load_failures: { engine_id: string; stage: string; error: string }[]
+    }>('/api/alpha-mining/v1/engines'),
+
+  alphaConfig: () => request<AlphaConfig>('/api/alpha-mining/v1/config'),
+
+  alphaUpdateConfig: (payload: Partial<AlphaConfig>) =>
+    request<AlphaConfig>('/api/alpha-mining/v1/config', {
+      method: 'PATCH',
+      body: JSON.stringify(payload),
+    }),
+
+  alphaCatalog: (assetType: 'stock' | 'etf', start?: string, end?: string) => {
+    const query = new URLSearchParams({ asset_type: assetType })
+    if (start) query.set('start', start)
+    if (end) query.set('end', end)
+    return request<AlphaCatalog>(`/api/alpha-mining/v1/catalog?${query}`, { quiet: true })
+  },
+
+  alphaAvailability: (params: {
+    assetType: 'stock' | 'etf'
+    budgetProfile: MiningBudgetProfile
+    forwardHorizon: number
+    start?: string
+    end?: string
+  }) => {
+    const query = new URLSearchParams({
+      asset_type: params.assetType,
+      budget_profile: params.budgetProfile,
+      forward_horizon: String(params.forwardHorizon),
+    })
+    if (params.start) query.set('start', params.start)
+    if (params.end) query.set('end', params.end)
+    return request<AlphaAvailability>(`/api/alpha-mining/v1/availability?${query}`, { quiet: true })
+  },
+
+  alphaRuns: () => request<{ items: AlphaRun[] }>('/api/alpha-mining/v1/runs'),
+
+  alphaRun: (runId: string) =>
+    request<AlphaRun>(`/api/alpha-mining/v1/runs/${encodeURIComponent(runId)}`, { quiet: true }),
+
+  alphaStart: (payload: AlphaMiningRequest) =>
+    request<AlphaRun>('/api/alpha-mining/v1/runs', {
+      method: 'POST',
+      body: JSON.stringify(payload),
+    }),
+
+  alphaResult: (runId: string) =>
+    request<AlphaResult>(`/api/alpha-mining/v1/runs/${encodeURIComponent(runId)}/result`),
+
+  alphaCancel: (runId: string) =>
+    request<AlphaRun>(`/api/alpha-mining/v1/runs/${encodeURIComponent(runId)}/cancel`, {
+      method: 'POST',
+    }),
+
+  alphaExperiments: () =>
+    request<{ items: Record<string, unknown>[] }>('/api/alpha-mining/v1/experiments'),
+
+  alphaCandidates: () =>
+    request<{ items: AlphaEvidenceCandidate[]; leaderboard: AlphaLeaderboard }>('/api/alpha-mining/v1/candidates'),
+
+  alphaCandidate: (candidateId: string) =>
+    request<{ candidate: AlphaEvidenceCandidate; events: Record<string, unknown>[] }>(
+      `/api/alpha-mining/v1/candidates/${encodeURIComponent(candidateId)}`,
+      { quiet: true },
+    ),
+
+  alphaChampion: () => request<AlphaLeaderboard>('/api/alpha-mining/v1/champion'),
+
+  alphaShadowStart: (candidateId: string, baselineDate?: string) =>
+    request<Record<string, unknown>>(
+      `/api/alpha-mining/v1/candidates/${encodeURIComponent(candidateId)}/shadow`,
+      { method: 'POST', body: JSON.stringify({ baseline_date: baselineDate || null }) },
+    ),
+
+  alphaShadow: (candidateId: string) =>
+    request<AlphaShadowStatus>(
+      `/api/alpha-mining/v1/candidates/${encodeURIComponent(candidateId)}/shadow`,
+      { quiet: true },
+    ),
+
+  alphaShadowEvaluate: (candidateId: string) =>
+    request<AlphaShadowStatus>(
+      `/api/alpha-mining/v1/candidates/${encodeURIComponent(candidateId)}/shadow/evaluate`,
+      { method: 'POST' },
+    ),
+
+  alphaPromote: (candidateId: string) =>
+    request<Record<string, unknown>>(
+      `/api/alpha-mining/v1/candidates/${encodeURIComponent(candidateId)}/promote`,
+      { method: 'POST' },
+    ),
 
   researchCandidates: () =>
     request<{ items: ResearchCandidate[] }>('/api/backtest/candidates'),

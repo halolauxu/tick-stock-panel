@@ -186,6 +186,22 @@ def test_strategy_direction_changes_score_without_dynamic_formula_execution():
         )
 
 
+def test_entry_delay_is_an_actual_signal_shift_not_a_declared_flag():
+    strategy = StrategyEngine._load_file(STRATEGY_PATH).matrix_strategy
+    market = _market()
+    params = {
+        "scoring": {"amount": 1.0},
+        "directions": {"amount": "high"},
+        "entry_score": 60.0,
+        "exit_score": 0.0,
+        "top_rank": 2,
+    }
+    immediate = strategy.compute_signals(market, params)
+    delayed = strategy.compute_signals(market, {**params, "entry_delay_days": 1})
+    assert delayed.entry[0].sum() == 0
+    assert delayed.entry[1].tolist() == immediate.entry[0].tolist()
+
+
 @pytest.mark.parametrize(
     ("params", "message"),
     [

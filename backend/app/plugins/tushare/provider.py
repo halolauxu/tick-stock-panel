@@ -19,7 +19,7 @@ import contextlib
 import logging
 from collections.abc import Callable
 from dataclasses import dataclass, field
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 
 import polars as pl
 
@@ -33,7 +33,7 @@ logger = logging.getLogger(__name__)
 
 API_KEY_ENV = "TUSHARE_TOKEN"
 SECRETS_FIELD = "tushare_api_key"
-_DATASETS = ("minute", "financial")
+_DATASETS = ("adj_factor", "minute", "financial")
 _MINUTE_CANONICAL = [
     "symbol",
     "datetime",
@@ -154,7 +154,7 @@ def probe_api_key(api_key: str) -> tuple[bool, str]:
 @dataclass
 class _TushareConfig:
     name: str = "tushare"
-    display_name: str = "Tushare (分钟/财务/盘后特色数据)"
+    display_name: str = "Tushare (除权/分钟/财务/盘后特色数据)"
     datasets: dict = field(default_factory=lambda: dict.fromkeys(_DATASETS))
     path: None = None
     builtin: bool = True
@@ -194,6 +194,124 @@ class TushareProvider:
         if self._client is None:
             self._client = TushareClient(get_api_key())
         return self._client
+
+    def get_adj_factors(
+        self,
+        symbols: list[str],
+        start_time: datetime | None,
+        end_time: datetime | None,
+        asset_type: AssetType = "stock",
+        on_chunk_done: Callable[[int, int], None] | None = None,
+    ) -> pl.DataFrame:
+        """Return event ratios derived from Tushare's cumulative factors.
+
+        The enriched pipeline expects one ``pre/post`` ratio per ex-date, while
+        Tushare returns a cumulative daily factor.  Differencing the cumulative
+        series by symbol preserves that contract and avoids persisting millions
+        of unchanged daily rows.
+        """
+        if not symbols:
+            return pl.DataFrame()
+        if asset_type != "stock":
+            raise TushareError(f"当前除权因子仅支持 A股, 不支持 asset_type={asset_type}")
+
+        if len(symbols) > 20 and start_time is not None and end_time is not None:
+            return self._get_adj_factors_by_date(
+                symbols,
+                start_time,
+                end_time,
+                on_chunk_done,
+            )
+
+        frames: list[pl.DataFrame] = []
+        failures = 0
+        total = len(symbols)
+        for index, symbol in enumerate(symbols, start=1):
+            try:
+                rows = self._get_client().adjustment_factors(
+                    symbol,
+                    start_time=start_time,
+                    end_time=end_time,
+                )
+            except TushareError as exc:
+                message = str(exc)
+                if any(marker in message for marker in ("没有接口", "没有权限", "未配置")):
+                    raise
+                failures += 1
+                logger.warning("tushare adj-factor symbol failed: symbol=%s: %s", symbol, exc)
+                rows = []
+            frame = self._adj_factor_df(rows)
+            if not frame.is_empty():
+                frames.append(frame)
+            if on_chunk_done is not None:
+                on_chunk_done(index, total)
+            if index % 100 == 0 or index == total:
+                logger.info(
+                    "tushare adj-factor progress: symbols=%d/%d events=%d failures=%d",
+                    index,
+                    total,
+                    sum(item.height for item in frames),
+                    failures,
+                )
+        if not frames:
+            return pl.DataFrame()
+        return (
+            pl.concat(frames, how="diagonal_relaxed")
+            .unique(subset=["symbol", "trade_date"], keep="last")
+            .sort(["symbol", "trade_date"])
+        )
+
+    def _get_adj_factors_by_date(
+        self,
+        symbols: list[str],
+        start_time: datetime,
+        end_time: datetime,
+        on_chunk_done: Callable[[int, int], None] | None,
+    ) -> pl.DataFrame:
+        """Use bounded date queries for full-universe incremental refreshes."""
+        start_date = start_time.date()
+        end_date = end_time.date()
+        if end_date < start_date:
+            return pl.DataFrame()
+        # A prior observation is required to turn Tushare's cumulative value
+        # into an event ratio.  Twenty-one calendar days covers long A-share
+        # exchange holidays while keeping the daily refresh bounded.
+        query_start = start_date - timedelta(days=21)
+        dates = [
+            query_start + timedelta(days=offset)
+            for offset in range((end_date - query_start).days + 1)
+        ]
+        requested = set(symbols)
+        rows: list[dict] = []
+        failures = 0
+        for index, trade_date in enumerate(dates, start=1):
+            try:
+                fetched = self._get_client().adjustment_factors_by_date(trade_date)
+            except TushareError as exc:
+                message = str(exc)
+                if any(marker in message for marker in ("没有接口", "没有权限", "未配置")):
+                    raise
+                failures += 1
+                logger.warning("tushare adj-factor date failed: date=%s: %s", trade_date, exc)
+                fetched = []
+            rows.extend(
+                row for row in fetched if str(row.get("ts_code") or "") in requested
+            )
+            if on_chunk_done is not None:
+                on_chunk_done(index, len(dates))
+        frame = self._adj_factor_df(rows)
+        if frame.is_empty():
+            return frame
+        logger.info(
+            "tushare adj-factor date refresh: dates=%d events=%d failures=%d",
+            len(dates),
+            frame.height,
+            failures,
+        )
+        return frame.filter(
+            (pl.col("trade_date") >= start_date)
+            & (pl.col("trade_date") <= end_date)
+        )
 
     def get_minute(
         self,
@@ -582,6 +700,8 @@ class TushareProvider:
             raise ValueError(f"Tushare 插件不支持数据集: {dataset}")
         if dataset == "minute":
             frame = self.get_minute(symbols or ["600000.SH"], None, None)
+        elif dataset == "adj_factor":
+            frame = self.get_adj_factors(symbols or ["600000.SH"], None, None)
         else:
             frame = self.get_financials("metrics", symbols or ["600000.SH"])
         return {
@@ -591,6 +711,47 @@ class TushareProvider:
             "columns": frame.columns,
             "preview": frame.head(5).to_dicts() if not frame.is_empty() else [],
         }
+
+    @staticmethod
+    def _adj_factor_df(rows: list[dict]) -> pl.DataFrame:
+        """Convert cumulative daily factors into sparse ex-date event ratios."""
+        if not rows:
+            return pl.DataFrame()
+        required = {"ts_code", "trade_date", "adj_factor"}
+        frame = pl.DataFrame(rows, infer_schema_length=None)
+        missing = sorted(required - set(frame.columns))
+        if missing:
+            raise TushareError(f"adj_factor 响应缺少字段: {', '.join(missing)}")
+        return (
+            frame.select(
+                pl.col("ts_code").cast(pl.Utf8).alias("symbol"),
+                pl.col("trade_date")
+                .cast(pl.Utf8)
+                .str.to_date("%Y%m%d", strict=False)
+                .alias("trade_date"),
+                pl.col("adj_factor").cast(pl.Float64, strict=False).alias("_cumulative"),
+            )
+            .drop_nulls(["symbol", "trade_date", "_cumulative"])
+            .filter(pl.col("_cumulative") > 0)
+            .unique(subset=["symbol", "trade_date"], keep="last")
+            .sort(["symbol", "trade_date"])
+            .with_columns(
+                (
+                    pl.col("_cumulative")
+                    / pl.col("_cumulative").shift(1).over("symbol")
+                ).alias("ex_factor")
+            )
+            .filter(
+                pl.col("ex_factor").is_finite()
+                & (pl.col("ex_factor") > 0)
+                & ((pl.col("ex_factor") - 1.0).abs() > 1e-10)
+            )
+            .with_columns(
+                pl.lit("stock").alias("asset_type"),
+                pl.lit("tushare").alias("source"),
+            )
+            .select(["symbol", "asset_type", "source", "trade_date", "ex_factor"])
+        )
 
 
 def _canonical_date(value: object) -> str | None:

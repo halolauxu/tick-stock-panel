@@ -46,6 +46,15 @@ META = {
             "max": 100,
             "step": 1,
         },
+        {
+            "id": "entry_delay_days",
+            "label": "额外延迟入场",
+            "type": "int",
+            "default": 0,
+            "min": 0,
+            "max": 5,
+            "step": 1,
+        },
     ],
     # Research-generated scoring is supplied in params. Keeping META scoring
     # empty prevents the framework pipeline from replacing the strategy score.
@@ -109,10 +118,13 @@ class FactorRankResearchMatrixStrategy:
         entry_score = _bounded_float(params.get("entry_score", 70.0), "entry_score")
         exit_score = _bounded_float(params.get("exit_score", 40.0), "exit_score")
         top_rank = int(params.get("top_rank", 20))
+        entry_delay_days = int(params.get("entry_delay_days", 0))
         if not 1 <= top_rank <= 100:
             raise ValueError("top_rank must be between 1 and 100")
         if exit_score > entry_score:
             raise ValueError("exit_score must not exceed entry_score")
+        if not 0 <= entry_delay_days <= 5:
+            raise ValueError("entry_delay_days must be between 0 and 5")
 
         universe = np.isfinite(market.close)
         score = build_matrix_score(
@@ -126,6 +138,10 @@ class FactorRankResearchMatrixStrategy:
         )
         entry = universe & (score >= np.float32(entry_score))
         entry = _limit_top_rank(entry, score, top_rank)
+        if entry_delay_days:
+            delayed = np.zeros_like(entry)
+            delayed[entry_delay_days:] = entry[:-entry_delay_days]
+            entry = delayed & universe
         exit_ = universe & (score <= np.float32(exit_score))
         return make_signal_matrix(
             market.shape,

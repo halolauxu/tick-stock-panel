@@ -1,6 +1,6 @@
 """历史股本解析。
 
-财务股本按公告日可用，历史缺失时回退 instruments 最新流通股本。
+财务股本按公告日可用, 历史缺失时回退 instruments 最新流通股本。
 """
 from __future__ import annotations
 
@@ -11,15 +11,19 @@ import polars as pl
 
 
 def load_share_history(data_dir: Path) -> pl.DataFrame:
-    """读取本地财务股本表；未同步或损坏时返回空表。"""
-    path = data_dir / "financials" / "shares" / "part.parquet"
-    if not path.exists():
+    """读取本地财务股本表; 未同步或损坏时返回空表。"""
+    root = data_dir / "financials" / "shares"
+    paths = sorted(root.glob("*.parquet"))
+    if not paths:
         return pl.DataFrame()
     try:
-        shares = pl.read_parquet(path)
+        shares = pl.concat(
+            [pl.read_parquet(path) for path in paths],
+            how="diagonal_relaxed",
+        )
         if not {"symbol", "period_end", "float_shares"} <= set(shares.columns):
             return pl.DataFrame()
-        return shares
+        return shares.unique(subset=["symbol", "period_end"], keep="last")
     except Exception:
         return pl.DataFrame()
 
@@ -32,7 +36,7 @@ def apply_historical_float_shares(
 ) -> pl.DataFrame:
     """为行情行解析有效流通股本。
 
-    当日保留 rows.float_shares；历史日期使用公告日不晚于交易日的最新股本，
+    当日保留 rows.float_shares; 历史日期使用公告日不晚于交易日的最新股本,
     找不到历史记录时继续使用 rows.float_shares。
     """
     required = {"symbol", "date", "float_shares"}

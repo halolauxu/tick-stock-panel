@@ -27,6 +27,12 @@ MINUTE_FIELDS = (
     "amount",
 )
 
+ADJ_FACTOR_FIELDS = (
+    "ts_code",
+    "trade_date",
+    "adj_factor",
+)
+
 AUCTION_FIELDS = (
     "ts_code",
     "trade_date",
@@ -210,6 +216,29 @@ class TushareClient:
             params["end_date"] = end_time.strftime("%Y-%m-%d %H:%M:%S")
         return self.query("stk_mins", params, MINUTE_FIELDS)
 
+    def adjustment_factors(
+        self,
+        symbol: str,
+        *,
+        start_time: datetime | None = None,
+        end_time: datetime | None = None,
+    ) -> list[dict]:
+        """Fetch one stock's cumulative Tushare adjustment-factor history."""
+        params: dict[str, str] = {"ts_code": symbol}
+        if start_time is not None:
+            params["start_date"] = start_time.strftime("%Y%m%d")
+        if end_time is not None:
+            params["end_date"] = end_time.strftime("%Y%m%d")
+        return self.query("adj_factor", params, ADJ_FACTOR_FIELDS)
+
+    def adjustment_factors_by_date(self, trade_date: date) -> list[dict]:
+        """Fetch all cumulative adjustment factors published for one date."""
+        return self.query(
+            "adj_factor",
+            {"trade_date": trade_date.strftime("%Y%m%d")},
+            ADJ_FACTOR_FIELDS,
+        )
+
     def financial_records(self, table: str, symbol: str) -> list[dict]:
         """Fetch one stock's standard (non-VIP) financial dataset."""
         try:
@@ -258,8 +287,8 @@ class TushareClient:
         return self.query(
             f"irm_qa_{normalized}",
             {
-                # irm_qa_* 的 pub_start/pub_end 是发布时间，而不是 YYYYMMDD
-                # 日期参数。使用完整日边界，避免服务端将无效格式按空结果处理。
+                # irm_qa_* 的 pub_start/pub_end 是发布时间, 而不是 YYYYMMDD
+                # 日期参数。使用完整日边界, 避免服务端将无效格式按空结果处理。
                 "pub_start": pub_start.strftime("%Y-%m-%d 00:00:00"),
                 "pub_end": pub_end.strftime("%Y-%m-%d 23:59:59"),
             },

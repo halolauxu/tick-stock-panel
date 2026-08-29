@@ -142,6 +142,7 @@ class MatcherCandidateEvaluator:
         request: RuntimeRequest,
         base_market,
         cancel_check: CancelCheck | None,
+        result_policy: BacktestResultPolicy = _RESULT_POLICY,
     ) -> None:
         self.service = service
         self.strategy_engine = strategy_engine
@@ -149,6 +150,7 @@ class MatcherCandidateEvaluator:
         self.request = request
         self.base_market = base_market
         self.cancel_check = cancel_check
+        self.result_policy = result_policy
         self.backtest_count = 0
         self.peak_compute_cache_bytes = 0
 
@@ -210,7 +212,7 @@ class MatcherCandidateEvaluator:
                     config,
                     cancel_event=self.cancel_check,
                     prepared=prepared,
-                    result_policy=_RESULT_POLICY,
+                    result_policy=self.result_policy,
                 )
                 self.peak_compute_cache_bytes = max(
                     self.peak_compute_cache_bytes,
@@ -225,6 +227,12 @@ class MatcherCandidateEvaluator:
                 key: _finite_or_none(result.stats.get(key))
                 for key in ("total_return", "sharpe", "max_drawdown", "n_trades")
             }
+            if self.result_policy.include_curves:
+                metrics["equity_curve"] = result.equity_curve
+            if self.result_policy.include_trades:
+                metrics["trades"] = result.trades
+            if self.result_policy.include_per_symbol_stats:
+                metrics["per_symbol_stats"] = result.per_symbol_stats
             score = _finite_or_none(metrics.get("sharpe"))
             if score is None:
                 return CandidateEvaluation(
@@ -264,6 +272,15 @@ class MatcherCandidateEvaluator:
                 "exit_score": 40.0,
                 "top_rank": 20,
             }
+            parameters = definition.get("parameters")
+            if isinstance(parameters, Mapping):
+                for key in ("entry_score", "exit_score", "top_rank", "entry_delay_days"):
+                    if key in parameters:
+                        params[key] = (
+                            int(parameters[key])
+                            if key in {"top_rank", "entry_delay_days"}
+                            else float(parameters[key])
+                        )
             overrides = {}
         else:
             raise ValueError(f"unsupported mining candidate kind: {kind!r}")
@@ -287,7 +304,7 @@ class MatcherCandidateEvaluator:
             commission_pct=self.request.commission_pct,
             stamp_tax_pct=self.request.stamp_tax_pct,
             slippage_bps=self.request.slippage_bps,
-            max_positions=10,
+            max_positions=int(getattr(self.request, "max_positions", 10)),
             max_exposure_pct=1.0,
             initial_capital=1_000_000.0,
             position_sizing="equal",

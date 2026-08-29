@@ -85,6 +85,59 @@ def test_client_posts_stk_mins_contract_and_transposes_rows(monkeypatch):
     assert body["fields"] == ",".join(tc.MINUTE_FIELDS)
 
 
+def test_client_posts_adj_factor_contract(monkeypatch):
+    fields = list(tc.ADJ_FACTOR_FIELDS)
+    fake = _patch_http(
+        monkeypatch,
+        {
+            "code": 0,
+            "msg": None,
+            "data": {
+                "fields": fields,
+                "items": [["600000.SH", "20260827", 17.3774]],
+            },
+        },
+    )
+    client = TushareClient("secret-token", min_interval_s=0)
+
+    rows = client.adjustment_factors(
+        "600000.SH",
+        start_time=datetime(2019, 8, 28),
+        end_time=datetime(2026, 8, 27),
+    )
+
+    assert rows == [
+        {"ts_code": "600000.SH", "trade_date": "20260827", "adj_factor": 17.3774}
+    ]
+    _, body = fake.calls[0]
+    assert body["api_name"] == "adj_factor"
+    assert body["params"] == {
+        "ts_code": "600000.SH",
+        "start_date": "20190828",
+        "end_date": "20260827",
+    }
+    assert body["fields"] == ",".join(tc.ADJ_FACTOR_FIELDS)
+
+
+def test_client_posts_adj_factor_date_contract(monkeypatch):
+    fields = list(tc.ADJ_FACTOR_FIELDS)
+    fake = _patch_http(
+        monkeypatch,
+        {
+            "code": 0,
+            "msg": None,
+            "data": {"fields": fields, "items": [["600000.SH", "20260827", 17.3774]]},
+        },
+    )
+    client = TushareClient("secret-token", min_interval_s=0)
+
+    rows = client.adjustment_factors_by_date(date(2026, 8, 27))
+
+    assert rows[0]["ts_code"] == "600000.SH"
+    _, body = fake.calls[0]
+    assert body["params"] == {"trade_date": "20260827"}
+
+
 def test_client_api_error_never_exposes_token(monkeypatch):
     _patch_http(monkeypatch, {"code": 2002, "msg": "没有接口权限", "data": None})
     client = TushareClient("top-secret-token", min_interval_s=0)
@@ -132,6 +185,18 @@ class _FakeClient:
 
     def stock_minutes(self, symbol: str, **kwargs):
         self.calls.append({"symbol": symbol, **kwargs})
+        if self.error:
+            raise self.error
+        return self.rows
+
+    def adjustment_factors(self, symbol: str, **kwargs):
+        self.calls.append({"symbol": symbol, **kwargs})
+        if self.error:
+            raise self.error
+        return self.rows
+
+    def adjustment_factors_by_date(self, trade_date: date):
+        self.calls.append({"trade_date": trade_date})
         if self.error:
             raise self.error
         return self.rows
@@ -209,6 +274,73 @@ def test_provider_empty_symbols_does_not_create_client():
     assert provider._client is None
 
 
+def test_provider_converts_cumulative_adjustment_factors_to_sparse_event_ratios():
+    provider = TushareProvider()
+    fake = _FakeClient(
+        rows=[
+            {"ts_code": "600000.SH", "trade_date": "20200103", "adj_factor": 12.0},
+            {"ts_code": "600000.SH", "trade_date": "20200102", "adj_factor": 10.0},
+            {"ts_code": "600000.SH", "trade_date": "20200106", "adj_factor": 12.0},
+            {"ts_code": "600000.SH", "trade_date": "20200107", "adj_factor": 15.0},
+        ]
+    )
+    provider._client = fake
+    progress: list[tuple[int, int]] = []
+
+    frame = provider.get_adj_factors(
+        ["600000.SH"],
+        datetime(2020, 1, 1),
+        datetime(2020, 1, 31),
+        on_chunk_done=lambda current, total: progress.append((current, total)),
+    )
+
+    assert frame.columns == [
+        "symbol", "asset_type", "source", "trade_date", "ex_factor",
+    ]
+    assert frame["trade_date"].to_list() == [date(2020, 1, 3), date(2020, 1, 7)]
+    assert frame["ex_factor"].to_list() == pytest.approx([1.2, 1.25])
+    assert progress == [(1, 1)]
+    assert fake.calls[0] == {
+        "symbol": "600000.SH",
+        "start_time": datetime(2020, 1, 1),
+        "end_time": datetime(2020, 1, 31),
+    }
+
+
+def test_provider_adj_factor_rejects_non_stock_assets():
+    with pytest.raises(TushareError, match="仅支持 A股"):
+        TushareProvider().get_adj_factors(["510300.SH"], None, None, asset_type="etf")
+
+
+def test_provider_uses_date_queries_for_full_universe_and_keeps_prior_context():
+    provider = TushareProvider()
+    fake = _FakeClient(rows=[])
+
+    def rows_for_date(trade_date: date):
+        fake.calls.append({"trade_date": trade_date})
+        factor = 10.0 if trade_date < date(2026, 8, 25) else 12.0
+        return [
+            {"ts_code": symbol, "trade_date": trade_date.strftime("%Y%m%d"), "adj_factor": factor}
+            for symbol in ("600000.SH", "000001.SZ")
+        ]
+
+    fake.adjustment_factors_by_date = rows_for_date
+    provider._client = fake
+    symbols = ["600000.SH", "000001.SZ"] + [f"600{i:03d}.SH" for i in range(19)]
+
+    frame = provider.get_adj_factors(
+        symbols,
+        datetime(2026, 8, 25),
+        datetime(2026, 8, 27),
+    )
+
+    assert frame.height == 2
+    assert set(frame["symbol"].to_list()) == {"600000.SH", "000001.SZ"}
+    assert set(frame["trade_date"].to_list()) == {date(2026, 8, 25)}
+    assert frame["ex_factor"].to_list() == pytest.approx([1.2, 1.2])
+    assert len(fake.calls) == 24
+
+
 def test_provider_streams_bounded_symbol_batches():
     provider = TushareProvider()
     fake = _FakeClient()
@@ -262,12 +394,12 @@ def test_probe_rejects_missing_permission(monkeypatch):
     assert "2002" in reason
 
 
-def test_manifest_declares_minute_financial_and_ui_token_field():
+def test_manifest_declares_adj_factor_minute_financial_and_ui_token_field():
     from app.data_providers.custom import loader
 
     manifest = loader.plugin_manifest("tushare")
     assert manifest is not None
-    assert manifest["datasets"] == ["minute", "financial"]
+    assert manifest["datasets"] == ["adj_factor", "minute", "financial"]
     assert manifest["api_key_env"] == tp.API_KEY_ENV
 
 

@@ -36,6 +36,7 @@ const BUILTIN_PAGES: NavEntry[] = [
   { id: '/screener', label: '策略', type: 'builtin', visible: true },
   { id: '/backtest', label: '回测', type: 'builtin', visible: true },
   { id: '/mining', label: '挖掘', type: 'builtin', visible: true },
+  { id: '/alpha-mining', label: 'Alpha挖掘', type: 'builtin', visible: true },
   { id: '/limit-ladder', label: '连板梯队', type: 'builtin', visible: true },
   { id: '/concept-analysis', label: '概念分析', type: 'builtin', visible: true },
   { id: '/industry-analysis', label: '行业分析', type: 'builtin', visible: true },

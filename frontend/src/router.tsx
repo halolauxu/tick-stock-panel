@@ -20,6 +20,7 @@ const Screener = lazy(() => import('./pages/Screener').then(m => ({ default: m.S
 const Backtest = lazy(() => import('./pages/Backtest').then(m => ({ default: m.Backtest })))
 const PaperTrading = lazy(() => import('./pages/PaperTrading').then(m => ({ default: m.PaperTrading })))
 const Mining = lazy(() => import('./pages/Mining').then(m => ({ default: m.Mining })))
+const AlphaMining = lazy(() => import('./pages/AlphaMining').then(m => ({ default: m.AlphaMining })))
 const Financials = lazy(() => import('./pages/Financials').then(m => ({ default: m.Financials })))
 const Data = lazy(() => import('./pages/Data').then(m => ({ default: m.Data })))
 const Monitor = lazy(() => import('./pages/Monitor').then(m => ({ default: m.Monitor })))
@@ -53,6 +54,7 @@ const CORE_ROUTE_PATHS = new Set([
   '/backtest',
   '/paper-trading',
   '/mining',
+  '/alpha-mining',
   '/financials',
   '/data',
   '/monitor',
@@ -127,6 +129,7 @@ export const router = createBrowserRouter([
       { path: 'backtest', element: <Backtest /> },
       { path: 'paper-trading', element: <PaperTrading /> },
       { path: 'mining', element: <Mining /> },
+      { path: 'alpha-mining', element: <AlphaMining /> },
       { path: 'financials', element: <Financials /> },
       { path: 'data', element: <Data /> },
       { path: 'monitor', element: <Monitor /> },

@@ -57,6 +57,21 @@ export const QK = {
   miningRun:            (id: string) => ['backtest-mining-run', id] as const,
   miningResult:         (id: string) => ['backtest-mining-result', id] as const,
   miningConfig:         ['backtest-mining-config'] as const,
+  alphaCharter:         ['alpha-mining-charter'] as const,
+  alphaEngines:         ['alpha-mining-engines'] as const,
+  alphaConfig:          ['alpha-mining-config'] as const,
+  alphaCatalog:         (assetType: string, start: string, end: string) =>
+                         ['alpha-mining-catalog', assetType, start, end] as const,
+  alphaExperiments:     ['alpha-mining-experiments'] as const,
+  alphaCandidates:      ['alpha-mining-candidates'] as const,
+  alphaChampion:        ['alpha-mining-champion'] as const,
+  alphaCandidate:       (id: string) => ['alpha-mining-candidate', id] as const,
+  alphaShadow:          (id: string) => ['alpha-mining-shadow', id] as const,
+  alphaRuns:            ['alpha-mining-runs'] as const,
+  alphaAvailability:    (assetType: string, profile: string, horizon: number, start: string, end: string) =>
+                         ['alpha-mining-availability', assetType, profile, horizon, start, end] as const,
+  alphaRun:             (id: string) => ['alpha-mining-run', id] as const,
+  alphaResult:          (id: string) => ['alpha-mining-result', id] as const,
   researchCandidates:  ['research-candidates'] as const,
   strategyLinkOptions: (assetType?: 'stock' | 'etf') => assetType
     ? ['strategy-link-options', assetType] as const

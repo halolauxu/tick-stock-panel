@@ -49,6 +49,7 @@ from app.extensions.loader import (
     start_backend_extensions,
 )
 from app.jobs import daily_pipeline
+from app.optional_alpha import load_alpha_api
 from app.services.matrix_prewarm_owner import MatrixCachePrewarmOwner
 from app.services.mining_process_lock import MiningProcessLock
 from app.services.quote_service import QuoteService
@@ -61,6 +62,10 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
 )
 logger = logging.getLogger(__name__)
+
+# Alpha挖掘是可拔出的隔离子系统. 即使模块被删除或加载失败, 核心应用和旧
+# `/api/backtest/mining` 仍须启动; 错误只在 Alpha 能力上暴露.
+alpha_mining_api = load_alpha_api()
 
 # 追加文件日志: uvicorn (含 --reload 开发模式) 默认只有 StreamHandler, 同步/管道等
 # 运行时日志仅出现在 dev 终端, 关掉或滚屏后即丢失, 排查「同步后日志没落」时无处可查。
@@ -112,6 +117,21 @@ async def _application_lifespan(app: FastAPI):
     app.state.mining_manager = mining_manager
     if recovered_mining_runs:
         logger.warning("recovered %d interrupted mining runs", recovered_mining_runs)
+    app.state.alpha_mining_manager = None
+    if alpha_mining_api is not None:
+        try:
+            from app.services.alpha_mining_manager import AlphaMiningJobManager
+
+            alpha_mining_manager = AlphaMiningJobManager(store.data_dir)
+            recovered_alpha_runs = alpha_mining_manager.recover_interrupted()
+            app.state.alpha_mining_manager = alpha_mining_manager
+            if recovered_alpha_runs:
+                logger.warning("recovered %d interrupted Alpha mining runs", recovered_alpha_runs)
+        except Exception as exc:  # noqa: BLE001
+            logger.error(
+                "Alpha mining manager unavailable; legacy mining remains active: %s",
+                exc,
+            )
     # 在接受回测请求前固定 managed generation，避免首批并发 worker 各自创建版本。
     if settings.backtest_matrix_disk_cache_enabled:
         try:
@@ -376,6 +396,9 @@ async def _application_lifespan(app: FastAPI):
         mmanager = getattr(app.state, "mining_manager", None)
         if mmanager:
             mmanager.shutdown()
+        alpha_manager = getattr(app.state, "alpha_mining_manager", None)
+        if alpha_manager:
+            alpha_manager.shutdown()
         if app.state.scheduler:
             app.state.scheduler.shutdown(wait=False)
         ps = getattr(app.state, "pull_scheduler", None)
@@ -481,6 +504,8 @@ app.include_router(watchlist.router)
 app.include_router(screener.router)
 app.include_router(backtest.router)
 app.include_router(mining.router)
+if alpha_mining_api is not None:
+    app.include_router(alpha_mining_api.router)
 app.include_router(intraday.router)
 app.include_router(indices.router)
 app.include_router(overview.router)

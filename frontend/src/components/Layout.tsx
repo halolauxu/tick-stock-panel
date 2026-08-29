@@ -83,6 +83,7 @@ const nav = [
   { to: '/backtest',   label: '回测', icon: History },
   { to: '/paper-trading', label: '模拟交易', icon: WalletCards },
   { to: '/mining',     label: '挖掘', icon: Pickaxe },
+  { to: '/alpha-mining', label: 'Alpha挖掘', icon: Sparkles },
   { to: '/stock-analysis',    label: '个股分析', icon: TrendingUp },
   { to: '/limit-ladder', label: '连板梯队', icon: Flame },
   { to: '/concept-analysis', label: '概念分析', icon: Layers3 },

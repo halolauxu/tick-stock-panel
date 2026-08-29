@@ -1503,6 +1503,19 @@ class PaperLedger:
     def _account_projection(self, row: sqlite3.Row) -> dict[str, Any]:
         account_id = str(row["id"])
         with self._connect() as conn:
+            signals = [dict(item) for item in conn.execute(
+                """SELECT s.*,
+                       (SELECT o.id FROM orders o WHERE o.signal_id=s.id LIMIT 1) AS order_id,
+                       EXISTS(
+                           SELECT 1 FROM events e
+                           WHERE e.entity_type='signal' AND e.entity_id=s.id
+                             AND e.event_type='SIGNAL_SKIPPED'
+                       ) AS skipped
+                    FROM signal_intents s
+                    WHERE s.account_id=?
+                    ORDER BY s.frozen_at DESC,s.id DESC LIMIT 2000""",
+                (account_id,),
+            ).fetchall()]
             positions = [dict(item) for item in conn.execute(
                 "SELECT * FROM positions WHERE account_id=? AND quantity>0 ORDER BY symbol", (account_id,)
             ).fetchall()]
@@ -1529,6 +1542,9 @@ class PaperLedger:
             ).fetchall()]
         for order in orders:
             order["preflight"] = _loads(order.pop("preflight_json", "{}"), {})
+        for signal in signals:
+            signal["payload"] = _loads(signal.pop("payload_json", "{}"), {})
+            signal["skipped"] = bool(signal["skipped"])
         for event in timeline:
             event["payload"] = _loads(event.pop("payload_json", "{}"), {})
         config = _loads(row["config_json"], {})
@@ -1620,6 +1636,7 @@ class PaperLedger:
                 ),
             },
             "positions": positions,
+            "signals": signals,
             "orders": orders,
             "fills": fills,
             "cash_entries": cash_entries,

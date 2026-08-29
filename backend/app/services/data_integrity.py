@@ -170,10 +170,16 @@ def _is_snapshot(day: date, quote_ts_ms: int | None) -> bool:
 
 
 def _candidate_days(today: date, lookback_days: int, *, include_today: bool = False) -> list[date]:
-    """最近自然日内的工作日；可让盘后管线同时检查当天覆盖度。"""
+    """最近自然日内的工作日；盘后显式要求时也检查当天已有分区。
+
+    ``include_today`` 不能再隐含“今天一定是交易日”。周末或节假日若意外残留
+    了实时行情分区，也必须进入覆盖度检查并被清理，而不是因为日历过滤永久
+    留在正式日 K 数据集中。
+    """
     days: list[date] = []
-    start = 0 if include_today else 1
-    for offset in range(start, lookback_days + 1):
+    if include_today:
+        days.append(today)
+    for offset in range(1, lookback_days + 1):
         d = today - timedelta(days=offset)
         if d.weekday() < 5:
             days.append(d)
@@ -211,11 +217,21 @@ def scan_recent_integrity(
         if latest is None or latest < window_start:
             continue
 
-        candidate_days = _candidate_days(today, lookback_days, include_today=include_today)
+        calendar_candidates = _candidate_days(
+            today, lookback_days, include_today=include_today,
+        )
+        # 已落盘的最近分区也必须检查。否则本地数据停更超过扫描窗口后，历史最后
+        # 一天若是盘中快照，会因“已不在墙上时钟最近 7 天”而逃过门禁。尾部
+        # missing 仍只按墙上时钟窗口判断，避免把长期停用的数据集扩成大范围修复。
+        inspectable_existing = (
+            existing if include_today else {day for day in existing if day < today}
+        )
+        recent_existing = sorted(inspectable_existing)[-max(1, lookback_days):]
+        candidate_days = sorted(set(calendar_candidates) | set(recent_existing))
         counts = {
             day: _partition_symbol_count(base / f"date={day.isoformat()}")
             for day in existing
-            if day >= window_start
+            if day >= window_start or day in recent_existing
         }
         coverage_baseline = max(counts.values(), default=0)
         coverage_threshold = coverage_baseline * MIN_PARTITION_COVERAGE_RATIO
@@ -226,7 +242,11 @@ def scan_recent_integrity(
                 # 历史内部空洞是另一类问题(laggards), 已有独立告警, 不在此扩面。
                 # enriched 的当天缺失是盘后计算前的正常状态，不单独报 missing；
                 # 它会在对应 raw daily 完成后由指标阶段生成。
-                if table in _RAW_DAILY_TABLES and day > latest:
+                if (
+                    table in _RAW_DAILY_TABLES
+                    and day in calendar_candidates
+                    and day > latest
+                ):
                     issues.append(IntegrityIssue(day=day, table=table, kind="missing"))
                 continue
             part_dir = base / f"date={day.isoformat()}"

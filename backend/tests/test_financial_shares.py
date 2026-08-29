@@ -9,6 +9,7 @@ import pytest
 from app.api import data as data_api
 from app.indicators import pipeline
 from app.services import financial_sync
+from app.share_capital import load_share_history
 from app.tickflow.capabilities import CapabilitySet
 
 
@@ -194,6 +195,30 @@ def test_turnover_without_share_history_keeps_existing_behavior(monkeypatch):
     )
 
     assert result["turnover_rate"][0] == pytest.approx(0.5)
+
+
+def test_share_history_loads_all_shards_and_deduplicates(tmp_path):
+    root = tmp_path / "financials" / "shares"
+    root.mkdir(parents=True)
+    pl.DataFrame(
+        {
+            "symbol": ["600000.SH"],
+            "period_end": ["2024-06-30"],
+            "float_shares": [10.0],
+        }
+    ).write_parquet(root / "part.parquet")
+    pl.DataFrame(
+        {
+            "symbol": ["600000.SH", "000001.SZ"],
+            "period_end": ["2024-06-30", "2024-06-30"],
+            "float_shares": [11.0, 20.0],
+        }
+    ).write_parquet(root / "historical.parquet")
+
+    result = load_share_history(tmp_path).sort("symbol")
+
+    assert result.height == 2
+    assert result.filter(pl.col("symbol") == "600000.SH")["float_shares"][0] == 10.0
 
 
 def test_data_status_includes_share_history(tmp_path):
