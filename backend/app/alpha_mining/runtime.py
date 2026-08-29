@@ -56,7 +56,7 @@ class AlphaRuntimeRequest:
     engine_ids: tuple[str, ...]
     factor_names: tuple[str, ...]
     strategy_ids: tuple[str, ...]
-    champion_strategy_id: str
+    champion_strategy_id: str | None
     symbols: list[str] | None
     asset_type: Literal["stock", "etf"]
     start: date
@@ -117,6 +117,7 @@ def run_alpha_mining_runtime(
         request.factor_names,
         expected_generation=generation,
         cancel_check=cancel_check,
+        preserve_market_columns=True,
     )
     if source_panel.is_empty():
         raise ValueError("Alpha date range contains no enriched data")
@@ -188,6 +189,7 @@ def run_alpha_mining_runtime(
     panel = attach_alpha_labels(
         source_panel,
         trading_dates,
+        horizons=(request.forward_horizon,),
         commission_pct=request.commission_pct,
         stamp_tax_pct=request.stamp_tax_pct,
         slippage_bps=request.slippage_bps,
@@ -299,12 +301,13 @@ def run_alpha_mining_runtime(
                 "outer_test_dates_hidden": len(outer.test_labels),
             },
         )
-        benchmark_eval = evaluator.evaluate_candidate_labels(
-            outer.train_labels,
-            outer.test_labels,
-            {"kind": "existing_strategy", "strategy_id": request.champion_strategy_id},
-        )
-        benchmark_folds.append(_evaluation_row(outer, None, benchmark_eval, "champion"))
+        if request.champion_strategy_id is not None:
+            benchmark_eval = evaluator.evaluate_candidate_labels(
+                outer.train_labels,
+                outer.test_labels,
+                {"kind": "existing_strategy", "strategy_id": request.champion_strategy_id},
+            )
+            benchmark_folds.append(_evaluation_row(outer, None, benchmark_eval, "champion"))
 
         for engine_id in request.engine_ids:
             engine = registry.get(engine_id)
@@ -527,17 +530,19 @@ def _decode_request(
     horizon = int(values.get("forward_horizon") or 5)
     if horizon not in _HORIZONS:
         raise ValueError(f"forward_horizon must be one of {sorted(_HORIZONS)}")
-    champion = str(values.get("champion_strategy_id") or "n_day_low_reversal")
-    champion_strategy = strategy_engine.get(champion)
-    if champion_strategy.meta.get("research_only"):
-        raise ValueError("Alpha champion cannot be a research-only strategy")
+    champion_value = values.get("champion_strategy_id")
+    champion = str(champion_value) if champion_value else None
+    if champion is not None:
+        champion_strategy = strategy_engine.get(champion)
+        if champion_strategy.meta.get("research_only"):
+            raise ValueError("Alpha champion cannot be a research-only strategy")
     symbols_value = values.get("symbols")
     symbols = None if symbols_value is None else list(dict.fromkeys(str(v) for v in symbols_value if v))
     return AlphaRuntimeRequest(
         run_id=run_id,
         engine_ids=engine_ids,
         factor_names=factor_names,
-        strategy_ids=(champion,),
+        strategy_ids=(champion,) if champion is not None else (),
         champion_strategy_id=champion,
         symbols=symbols or None,
         asset_type=asset_type,  # type: ignore[arg-type]

@@ -251,10 +251,12 @@ def start_run(payload: AlphaMiningStartRequest, request: Request) -> dict[str, A
         if not AlphaConfigStore(_data_dir(request)).get()["enabled"]:
             raise HTTPException(status_code=409, detail="Alpha挖掘功能开关已关闭")
         champion = AlphaChampionStore(_data_dir(request)).get()["current"]
-        champion_strategy_id = str(champion["strategy_id"])
+        champion_value = champion.get("strategy_id")
+        champion_strategy_id = str(champion_value) if champion_value else None
         if payload.champion_strategy_id not in (None, champion_strategy_id):
             raise ValueError("请求冠军与动态冠军账本不一致")
-        request.app.state.strategy_engine.get(champion_strategy_id)
+        if champion_strategy_id is not None:
+            request.app.state.strategy_engine.get(champion_strategy_id)
         worker_request = payload.model_dump(mode="json", exclude={"force"})
         worker_request["champion_strategy_id"] = champion_strategy_id
         dates = enriched_partition_dates(

@@ -326,6 +326,7 @@ def _load_compact_factor_panel(
     *,
     expected_generation: str,
     cancel_check: CancelCheck | None,
+    preserve_market_columns: bool = False,
 ) -> pl.DataFrame:
     panel_columns = [
         "symbol",
@@ -416,6 +417,14 @@ def _load_compact_factor_panel(
                 missing,
                 assume_sorted=True,
             )
+        market_columns = (
+            [
+                pl.col(name).cast(pl.Float32, strict=False).alias(name)
+                for name in ("open", "high", "low", "close", "volume")
+            ]
+            if preserve_market_columns
+            else ["close"]
+        )
         projected = batch.filter(
             (pl.col("date") >= config.start)
             & (pl.col("date") <= config.end)
@@ -424,7 +433,7 @@ def _load_compact_factor_panel(
         ).select([
             "symbol",
             "date",
-            "close",
+            *market_columns,
             *(
                 pl.col(name).cast(pl.Float32, strict=False).alias(name)
                 for name in factor_names

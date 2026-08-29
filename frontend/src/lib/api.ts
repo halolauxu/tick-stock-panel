@@ -1398,7 +1398,7 @@ export interface AlphaEvidenceCandidate {
 }
 
 export interface AlphaLeaderboard {
-  champion: { kind: string; strategy_id: string; candidate_id: string | null; effective_at: string | null; reason: string }
+  champion: { kind: string; strategy_id: string | null; candidate_id: string | null; effective_at: string | null; reason: string }
   challengers: { candidate_id: string; engine_id: string; state: AlphaResearchState; return: number | null; sharpe: number | null; max_drawdown: number | null; gates_passed: number; gates_failed: number; gates_pending: number }[]
 }
 
@@ -1445,7 +1445,7 @@ export interface AlphaResult {
     elapsed_ms: number
   }
   champion: {
-    strategy_id: string
+    strategy_id: string | null
     metrics: AlphaCandidateResult['metrics']
   }
   candidates: AlphaCandidateResult[]

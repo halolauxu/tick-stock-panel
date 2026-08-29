@@ -156,6 +156,62 @@ def test_compact_factor_panel_matches_full_symbol_independent_calculation(
     assert compact.equals(full)
 
 
+def test_compact_factor_panel_can_preserve_alpha_label_market_columns() -> None:
+    first = date(2024, 1, 2)
+    raw = pl.DataFrame({
+        "symbol": ["a", "a"],
+        "date": [first, first + timedelta(days=1)],
+        "open": [9.8, 10.8],
+        "high": [10.2, 11.2],
+        "low": [9.7, 10.7],
+        "close": [10.0, 11.0],
+        "volume": [1000.0, 1100.0],
+        "amount": [10_000.0, 12_100.0],
+        "turnover_rate": [1.0, 1.1],
+    })
+
+    class Engine:
+        def load_panel(self, *_args, **_kwargs):
+            return raw
+
+    from app.backtest.factor import FactorBacktestService
+
+    result = _load_compact_factor_panel(
+        FactorBacktestService(Engine()),
+        SimpleNamespace(
+            symbols=None,
+            start=first,
+            end=first + timedelta(days=1),
+            asset_type="stock",
+        ),
+        ("turnover_rate",),
+        expected_generation="generation",
+        cancel_check=None,
+        preserve_market_columns=True,
+    )
+
+    assert result.columns == [
+        "symbol",
+        "date",
+        "open",
+        "high",
+        "low",
+        "close",
+        "volume",
+        "turnover_rate",
+    ]
+    assert result.select("open", "high", "low", "close", "volume").null_count().row(0) == (0, 0, 0, 0, 0)
+
+    from app.alpha_mining.labels import attach_alpha_labels
+
+    labelled = attach_alpha_labels(
+        result,
+        [first, first + timedelta(days=1)],
+        horizons=(1,),
+    )
+    assert "target_return_1d" in labelled.columns
+
+
 def test_compact_factor_panel_rejects_noncanonical_symbol_date_keys() -> None:
     first = date(2024, 1, 2)
     canonical = pl.DataFrame({

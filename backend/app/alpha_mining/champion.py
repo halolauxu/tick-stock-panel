@@ -29,11 +29,11 @@ class AlphaChampionStore:
             return {
                 "schema_version": "alpha-champion-v1",
                 "current": {
-                    "kind": "existing_strategy",
-                    "strategy_id": "n_day_low_reversal",
+                    "kind": "none",
+                    "strategy_id": None,
                     "candidate_id": None,
                     "effective_at": None,
-                    "reason": "initial comparable benchmark",
+                    "reason": "尚无通过Alpha系统全部门槛的正式冠军",
                 },
                 "history": [],
             }

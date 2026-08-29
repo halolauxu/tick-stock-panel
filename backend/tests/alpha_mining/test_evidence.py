@@ -81,6 +81,14 @@ def test_dynamic_champion_requires_every_historical_gate_and_forward_pass(tmp_pa
     assert store.get_state(candidate_id)["state"] == "champion"
 
 
+def test_champion_ledger_starts_empty_instead_of_using_an_existing_strategy(tmp_path) -> None:
+    current = AlphaChampionStore(tmp_path).get()["current"]
+
+    assert current["kind"] == "none"
+    assert current["strategy_id"] is None
+    assert current["candidate_id"] is None
+
+
 def test_experiment_result_is_write_once_and_lists_failed_trials(tmp_path) -> None:
     store = AlphaEvidenceStore(tmp_path)
     store.create_experiment("alpha-ledger", {"budget": 3})

@@ -19,6 +19,7 @@ import {
   type AlphaCandidateResult,
   type AlphaConfig,
   type AlphaMiningRequest,
+  type AlphaResult,
   type AlphaRun,
   type MiningBudgetProfile,
 } from '@/lib/api'
@@ -90,8 +91,22 @@ const DATASET_LABELS: Record<string, { title: string; description: string }> = {
   concept_snapshot: { title: '当前概念快照', description: '仅供当前观察，不进入历史研究' },
 }
 
-const STRATEGY_LABELS: Record<string, string> = {
-  n_day_low_reversal: '新低反转',
+const PROFILE_META: Record<MiningBudgetProfile, { title: string; description: string; budget: string }> = {
+  exploratory: {
+    title: '近1年快速研究',
+    description: '快速发现与证伪，结果不能直接晋级',
+    budget: '每引擎最多24次尝试 / 2个候选',
+  },
+  balanced: {
+    title: '标准研究',
+    description: '更长历史与多窗口样本外验证',
+    budget: '每引擎最多64次尝试 / 4个候选',
+  },
+  strict: {
+    title: '严格研究',
+    description: '最长历史、更多窗口和最大试验预算',
+    budget: '每引擎最多128次尝试 / 8个候选',
+  },
 }
 
 const EVIDENCE_KEY_LABELS: Record<string, string> = {
@@ -161,7 +176,7 @@ function termLabel(value: string) {
 }
 
 function strategyLabel(strategyId?: string | null) {
-  return strategyId ? STRATEGY_LABELS[strategyId] || strategyId : '—'
+  return strategyId || '—'
 }
 
 function translateReason(reason: string) {
@@ -180,6 +195,16 @@ function translateReason(reason: string) {
     .replaceAll('financial_pit', '公告时点财务数据')
     .replaceAll('industry_pit', '历史行业归属')
     .replaceAll('concept_snapshot', '当前概念快照')
+}
+
+function translateRunError(error?: string | null) {
+  if (!error) return '未记录失败原因'
+  if (error.includes("Alpha labels require columns: ['high', 'low', 'open']")) {
+    return '研究面板缺少开盘价、最高价和最低价，无法生成未来收益与风险标签'
+  }
+  const firstLine = error.split('\n', 1)[0]
+  if (/[一-鿿]/.test(firstLine)) return translateReason(firstLine)
+  return '研究任务在执行阶段异常退出，失败证据已保留'
 }
 
 function yearsBefore(isoDate: string, years: number) {
@@ -287,8 +312,11 @@ export function AlphaMining() {
 
   useEffect(() => {
     if (currentRunId) return
-    const activeRun = runsQuery.data?.items.find(item => ACTIVE.has(item.status))
-    if (activeRun) setCurrentRunId(activeRun.run_id)
+    const runs = runsQuery.data?.items || []
+    const preferred = runs.find(item => ACTIVE.has(item.status)) || runs[0]
+    if (!preferred) return
+    setCurrentRunId(preferred.run_id)
+    if (SUCCESS.has(preferred.status)) setSelectedRunId(preferred.run_id)
   }, [currentRunId, runsQuery.data])
 
   const runQuery = useQuery({
@@ -488,6 +516,28 @@ export function AlphaMining() {
                   ))}
                 </div>
               </div>
+              <div className="mb-3">
+                <div className="mb-1.5 text-[9px] font-medium text-foreground">研究强度</div>
+                <div className="grid gap-1.5 sm:grid-cols-3 xl:grid-cols-1">
+                  {(Object.entries(PROFILE_META) as [MiningBudgetProfile, typeof PROFILE_META[MiningBudgetProfile]][]).map(([value, meta]) => (
+                    <button
+                      key={value}
+                      type="button"
+                      onClick={() => setProfile(value)}
+                      className={cn(
+                        'rounded-lg border px-2.5 py-2 text-left transition-colors',
+                        profile === value
+                          ? 'border-accent/50 bg-accent/10'
+                          : 'border-border bg-base/30 hover:border-secondary/40',
+                      )}
+                    >
+                      <div className={cn('text-[9px] font-semibold', profile === value ? 'text-accent' : 'text-foreground')}>{meta.title}</div>
+                      <div className="mt-0.5 text-[8px] leading-relaxed text-muted">{meta.description}</div>
+                      <div className="mt-1 font-mono text-[7px] text-secondary">{meta.budget}</div>
+                    </button>
+                  ))}
+                </div>
+              </div>
               <div className="grid grid-cols-2 gap-2">
                 <label className="text-[9px] text-muted">
                   资产
@@ -497,11 +547,9 @@ export function AlphaMining() {
                   </select>
                 </label>
                 <label className="text-[9px] text-muted">
-                  研究强度
-                  <select className={INPUT} value={profile} onChange={event => setProfile(event.target.value as MiningBudgetProfile)}>
-                    <option value="exploratory">快速研究（适合近1年）</option>
-                    <option value="balanced">标准研究（需要更长历史）</option>
-                    <option value="strict">严格研究（最大验证强度）</option>
+                  预测周期
+                  <select className={INPUT} value={horizon} onChange={event => setHorizon(Number(event.target.value) as typeof horizon)}>
+                    {[1, 3, 5, 10, 20, 60].map(value => <option key={value} value={value}>{value}个交易日</option>)}
                   </select>
                 </label>
                 <label className="text-[9px] text-muted">
@@ -521,12 +569,6 @@ export function AlphaMining() {
                     value={end}
                     onChange={event => { setEnd(event.target.value); setDatePreset('custom') }}
                   />
-                </label>
-                <label className="col-span-2 text-[9px] text-muted">
-                  预测周期
-                  <select className={INPUT} value={horizon} onChange={event => setHorizon(Number(event.target.value) as typeof horizon)}>
-                    {[1, 3, 5, 10, 20, 60].map(value => <option key={value} value={value}>{value}个交易日</option>)}
-                  </select>
                 </label>
               </div>
               <button
@@ -584,9 +626,8 @@ export function AlphaMining() {
                   tone={blockers.length ? 'bad' : 'good'}
                 />
               </div>
-              <div className="sm:col-span-3 rounded-lg border border-border bg-base/30 px-3 py-2 text-[9px] text-muted">
-                当前比较基准：<span className="font-medium text-foreground">{strategyLabel(championQuery.data?.champion.strategy_id)}</span>
-                <span className="ml-2 text-muted">候选必须用相同区间、成本和成交规则正面对比。</span>
+              <div className="sm:col-span-3 rounded-lg border border-accent/20 bg-accent/5 px-3 py-2 text-[9px] text-secondary">
+                研究边界：从当时的全部合格股票出发，任何现有策略都不进入发现样本。只有Alpha系统已产生正式冠军时，才在公共验证的最后一步追加同口径比较。
               </div>
             </div>
           </div>
@@ -705,7 +746,7 @@ export function AlphaMining() {
             <div className="overflow-x-auto">
               <table className="w-full min-w-[700px] text-left text-[9px]">
                 <thead className="text-muted">
-                  <tr>{['实验编号', '状态', '创建时间', '当前进度', '研究结论'].map(value => <th key={value} className="border-b border-border px-2 py-2 font-medium">{value}</th>)}</tr>
+                  <tr>{['实验编号', '状态', '创建时间', '当前进度', '研究结论', '失败原因'].map(value => <th key={value} className="border-b border-border px-2 py-2 font-medium">{value}</th>)}</tr>
                 </thead>
                 <tbody>
                   {runsQuery.data?.items.slice(0, 12).map((run: AlphaRun) => (
@@ -719,6 +760,7 @@ export function AlphaMining() {
                       <td className="px-2 py-2 text-muted">{run.created_at?.slice(0, 19)}</td>
                       <td className="px-2 py-2 text-muted">{run.progress?.label || '—'}</td>
                       <td className="px-2 py-2 text-muted">{statusLabel(run.research_state)}</td>
+                      <td className="max-w-[260px] px-2 py-2 text-danger">{run.status === 'failed' ? translateRunError(run.error) : '—'}</td>
                     </tr>
                   ))}
                 </tbody>
@@ -743,6 +785,7 @@ export function AlphaMining() {
 
         <section className={CARD}>
           <SectionTitle index={6} title="候选证据" subtitle="统一展示样本外收益、近期表现、成本、延迟、参数、容量和集中度；任一硬门槛失败即淘汰。" />
+          <RunOutcome run={currentRun} result={result} />
           {result
             ? <CandidateTable candidates={result.candidates} onSelect={id => { if (id) setSelectedCandidateId(id) }} />
             : <Empty text="尚无可裁决结果；系统不会凭空生成候选。" />}
@@ -766,12 +809,12 @@ export function AlphaMining() {
         </section>
 
         <section className={CARD}>
-          <SectionTitle index={7} title="冠军挑战" subtitle="所有候选必须与当前冠军使用相同区间、资金、成本和成交规则，不能换口径取巧。" />
+          <SectionTitle index={7} title="独立准入与冠军晋级" subtitle="发现阶段不使用任何现有策略；首任冠军先过绝对收益、风险和稳定性门槛，之后挑战者才追加同口径冠军比较。" />
           <div className="grid gap-3 p-3 lg:grid-cols-[260px_minmax(0,1fr)]">
             <div className="rounded-lg border border-accent/30 bg-accent/5 p-3">
-              <div className="flex items-center gap-2 text-[10px] text-accent"><ShieldCheck className="h-4 w-4" />当前比较基准</div>
-              <div className="mt-2 text-sm font-semibold text-foreground">{strategyLabel(championQuery.data?.champion.strategy_id)}</div>
-              <div className="mt-1 text-[9px] text-muted">{championQuery.data?.champion.reason === 'initial comparable benchmark' ? '系统初始可比基准' : championQuery.data?.champion.reason || '正在读取冠军账本'}</div>
+              <div className="flex items-center gap-2 text-[10px] text-accent"><ShieldCheck className="h-4 w-4" />Alpha系统正式冠军</div>
+              <div className="mt-2 text-sm font-semibold text-foreground">{championQuery.data?.champion.strategy_id ? strategyLabel(championQuery.data.champion.strategy_id) : '尚无正式冠军'}</div>
+              <div className="mt-1 text-[9px] leading-relaxed text-muted">{championQuery.data?.champion.reason || '正在读取冠军账本'}</div>
             </div>
             <div className="overflow-x-auto">
               <table className="w-full min-w-[620px] text-left text-[9px]">
@@ -824,6 +867,57 @@ export function AlphaMining() {
           </div>
         </section>
       </main>
+    </div>
+  )
+}
+
+function RunOutcome({ run, result }: { run: AlphaRun | null; result?: AlphaResult }) {
+  if (!run) {
+    return <div className="border-b border-border px-3 py-2 text-[9px] text-muted">尚未运行研究，任务完成后会在这里直接展示结果或失败原因。</div>
+  }
+  if (run.status === 'failed') {
+    return (
+      <div className="border-b border-danger/20 bg-danger/5 px-3 py-3 text-[9px] text-danger">
+        <div className="flex items-center gap-1.5 font-semibold"><AlertTriangle className="h-3.5 w-3.5" />本次研究未产生结果</div>
+        <div className="mt-1.5 text-[10px] leading-relaxed">{translateRunError(run.error)}</div>
+        <div className="mt-1 text-danger/70">停止阶段：{run.progress?.label || '未记录'} · 失败证据已写入实验账本</div>
+        {run.error && (
+          <details className="mt-2 text-[8px] text-muted">
+            <summary className="cursor-pointer">查看技术详情</summary>
+            <pre className="mt-1 max-h-36 overflow-auto whitespace-pre-wrap break-all rounded bg-base/50 p-2 font-mono">{run.error}</pre>
+          </details>
+        )}
+      </div>
+    )
+  }
+  if (ACTIVE.has(run.status)) {
+    return (
+      <div className="border-b border-accent/20 bg-accent/5 px-3 py-3 text-[9px] text-secondary">
+        <div className="flex items-center gap-1.5 font-medium"><LoaderCircle className="h-3.5 w-3.5 animate-spin" />研究正在运行</div>
+        <div className="mt-1">{run.progress?.label || '正在准备'}{run.progress?.total ? ` · ${run.progress.done || 0}/${run.progress.total}` : ''}</div>
+      </div>
+    )
+  }
+  if (SUCCESS.has(run.status) && result) {
+    return (
+      <div className="grid gap-px border-b border-border bg-border sm:grid-cols-3 lg:grid-cols-6">
+        <Metric label="研究结论" value={statusLabel(result.research_state)} tone="good" />
+        <Metric label="外层检验窗口" value={result.summary.outer_fold_count} />
+        <Metric label="已评估引擎" value={result.summary.candidate_engine_count} />
+        <Metric label="记录尝试" value={result.summary.trial_count} />
+        <Metric label="真实回测" value={result.summary.backtest_count} />
+        <Metric label="引擎异常" value={result.engine_failures.length} tone={result.engine_failures.length ? 'bad' : 'good'} />
+        {result.engine_failures.length > 0 && (
+          <div className="sm:col-span-3 lg:col-span-6 bg-surface px-3 py-2 text-[8px] text-danger">
+            {result.engine_failures.map(item => `${item.engine_id}：${translateRunError(item.error)}`).join('；')}
+          </div>
+        )}
+      </div>
+    )
+  }
+  return (
+    <div className="border-b border-border px-3 py-2 text-[9px] text-muted">
+      任务状态：{statusLabel(run.status)}。该任务没有可展示的候选结果。
     </div>
   )
 }

@@ -7,12 +7,12 @@ from typing import Any
 ALPHA_ALGORITHM_VERSION = "alpha-mining-v1"
 
 HARD_GATES: tuple[dict[str, Any], ...] = (
-    {"id": "return_vs_champion", "label": "13年拼接样本外净收益高于冠军", "required": True},
-    {"id": "sharpe", "label": "夏普≥max(0.8, 冠军+0.2)", "required": True},
-    {"id": "drawdown", "label": "最大回撤≤25%且不差于冠军", "required": True},
+    {"id": "return_vs_champion", "label": "13年拼接样本外净收益为正; 已有正式冠军时还须超过冠军", "required": True},
+    {"id": "sharpe", "label": "夏普≥0.8; 已有正式冠军时还须高出0.2", "required": True},
+    {"id": "drawdown", "label": "最大回撤≤25%; 已有正式冠军时不得更差", "required": True},
     {"id": "positive_half_years", "label": "正收益半年窗口≥65%", "required": True},
-    {"id": "beat_champion_windows", "label": "跑赢冠军半年窗口≥60%", "required": True},
-    {"id": "recent_year", "label": "最近一年跑赢冠军", "required": True},
+    {"id": "beat_champion_windows", "label": "半年窗口稳定性达标; 已有正式冠军时跑赢窗口≥60%", "required": True},
+    {"id": "recent_year", "label": "最近一年为正; 已有正式冠军时还须跑赢冠军", "required": True},
     {"id": "recent_quarter", "label": "最近三个月绝对收益为正", "required": True},
     {"id": "double_cost", "label": "双倍成本后仍为正", "required": True},
     {"id": "delay", "label": "延迟成交不崩塌", "required": True},
@@ -44,8 +44,8 @@ COVERAGE_ROADMAP: tuple[dict[str, Any], ...] = (
 def charter() -> dict[str, Any]:
     return {
         "algorithm_version": ALPHA_ALGORITHM_VERSION,
-        "objective": "稳定找到净收益、风险收益比和跨窗口表现均高于当前冠军的可交易 Alpha",
-        "benchmark_policy": "发现不依赖冠军; 所有候选最终必须以相同资金、成本和成交口径对比当前冠军",
+        "objective": "从完整合格股票池独立发现稳定、可交易、可复现的 Alpha",
+        "benchmark_policy": "任何现有策略都不作为发现底座; 只有Alpha系统正式冠军存在时, 才在公共验证末端追加同口径比较",
         "historical_policy": "13年数据用于滚动训练与拼接样本外; 所有发现引擎只能读取外层训练窗",
         "completion_levels": [
             {"id": "engineering", "label": "工程完成", "meaning": "链路、隔离、重跑和审计通过"},
@@ -80,43 +80,59 @@ def evaluate_historical_gates(
 
     candidate_return = _number(metrics.get("stitched_oos_return"))
     champion_return = _number(champion.get("stitched_oos_return"))
+    return_floor = champion_return if champion_return is not None else 0.0
     add(
         "return_vs_champion",
-        None if candidate_return is None or champion_return is None else candidate_return > champion_return,
+        None if candidate_return is None else candidate_return > return_floor,
         candidate_return,
-        champion_return,
+        {"minimum": return_floor, "comparison": "正式冠军" if champion_return is not None else "绝对正收益"},
     )
     candidate_sharpe = _number(metrics.get("stitched_oos_sharpe"))
     champion_sharpe = _number(champion.get("stitched_oos_sharpe"))
-    sharpe_floor = None if champion_sharpe is None else max(0.8, champion_sharpe + 0.2)
+    sharpe_floor = max(0.8, champion_sharpe + 0.2) if champion_sharpe is not None else 0.8
     add(
         "sharpe",
-        None if candidate_sharpe is None or sharpe_floor is None else candidate_sharpe >= sharpe_floor,
+        None if candidate_sharpe is None else candidate_sharpe >= sharpe_floor,
         candidate_sharpe,
         sharpe_floor,
     )
     candidate_dd = _number(metrics.get("max_drawdown"))
     champion_dd = _number(champion.get("max_drawdown"))
-    dd_floor = None if champion_dd is None else max(-0.25, champion_dd)
+    dd_floor = max(-0.25, champion_dd) if champion_dd is not None else -0.25
     add(
         "drawdown",
-        None if candidate_dd is None or dd_floor is None else candidate_dd >= dd_floor,
+        None if candidate_dd is None else candidate_dd >= dd_floor,
         candidate_dd,
         dd_floor,
     )
     for gate_id, metric_id, threshold in (
         ("positive_half_years", "positive_half_year_ratio", 0.65),
-        ("beat_champion_windows", "beat_champion_half_year_ratio", 0.60),
     ):
         actual = _number(metrics.get(metric_id))
         add(gate_id, None if actual is None else actual >= threshold, actual, threshold)
+    beat_ratio = _number(metrics.get("beat_champion_half_year_ratio"))
+    positive_ratio = _number(metrics.get("positive_half_year_ratio"))
+    if champion_return is None:
+        add(
+            "beat_champion_windows",
+            None if positive_ratio is None else positive_ratio >= 0.65,
+            positive_ratio,
+            {"minimum": 0.65, "comparison": "首任冠军采用正收益半年窗口"},
+        )
+    else:
+        add(
+            "beat_champion_windows",
+            None if beat_ratio is None else beat_ratio >= 0.60,
+            beat_ratio,
+            0.60,
+        )
     recent_year = _number(metrics.get("recent_1y_return"))
     champion_year = _number(champion.get("recent_1y_return"))
     add(
         "recent_year",
-        None if recent_year is None or champion_year is None else recent_year > champion_year,
+        None if recent_year is None else recent_year > (champion_year if champion_year is not None else 0.0),
         recent_year,
-        champion_year,
+        champion_year if champion_year is not None else "> 0",
     )
     recent_quarter = _number(metrics.get("recent_3m_return"))
     add("recent_quarter", None if recent_quarter is None else recent_quarter > 0, recent_quarter, "> 0")
