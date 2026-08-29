@@ -18,9 +18,11 @@ import {
   api,
   type AlphaCandidateResult,
   type AlphaConfig,
+  type AlphaEvidenceCandidate,
   type AlphaMiningRequest,
   type AlphaResult,
   type AlphaRun,
+  type FactorColumn,
   type MiningBudgetProfile,
 } from '@/lib/api'
 import { QK } from '@/lib/queryKeys'
@@ -109,32 +111,20 @@ const PROFILE_META: Record<MiningBudgetProfile, { title: string; description: st
   },
 }
 
-const EVIDENCE_KEY_LABELS: Record<string, string> = {
-  recipe_id: '方案编号',
-  engine_id: '发现引擎',
-  engine_version: '引擎版本',
-  name: '名称',
-  thesis: '研究假设',
-  signal_kind: '信号类型',
-  features: '使用因子',
-  directions: '因子方向',
-  weights: '因子权重',
-  parameters: '参数',
-  train_evidence: '训练期证据',
-  metrics: '指标',
-  gates: '门槛',
-  status: '状态',
-  passed: '通过',
-  failed: '失败',
-  pending: '待验证',
-  stitched_oos_return: '拼接样本外收益',
-  stitched_oos_sharpe: '拼接样本外夏普',
-  max_drawdown: '最大回撤',
-  recent_1y_return: '近一年收益',
-  recent_3m_return: '近三个月收益',
-  double_cost_return: '双倍成本收益',
-  delayed_entry_return: '延迟成交收益',
-  worst_parameter_return: '参数扰动最差收益',
+const GATE_LABELS: Record<string, string> = {
+  return_vs_champion: '拼接样本外净收益',
+  sharpe: '样本外夏普',
+  drawdown: '最大回撤',
+  positive_half_years: '正收益半年窗口',
+  beat_champion_windows: '半年窗口稳定性',
+  recent_year: '最近一年收益',
+  recent_quarter: '最近三个月收益',
+  double_cost: '双倍成本',
+  delay: '延迟成交',
+  parameter_perturbation: '参数扰动',
+  capacity: '持仓容量',
+  concentration: '收益集中度',
+  forward_shadow: '前向模拟',
 }
 
 function fmtPct(value: number | null | undefined) {
@@ -214,18 +204,38 @@ function yearsBefore(isoDate: string, years: number) {
   return value.toISOString().slice(0, 10)
 }
 
-function translateEvidence(value: unknown): unknown {
-  if (Array.isArray(value)) return value.map(translateEvidence)
-  if (value && typeof value === 'object') {
-    return Object.fromEntries(
-      Object.entries(value).map(([key, item]) => [
-        EVIDENCE_KEY_LABELS[key] || TERM_LABELS[key] || key.replaceAll('_', ' '),
-        translateEvidence(item),
-      ]),
-    )
+function formatGateActual(gate: AlphaCandidateResult['gates'][number]) {
+  if (gate.actual == null) return '本次研究未覆盖'
+  if (typeof gate.actual === 'boolean') return gate.actual ? '通过' : '未通过'
+  if (typeof gate.actual === 'number') {
+    if (['sharpe'].includes(gate.id)) return fmtNumber(gate.actual)
+    if (['capacity', 'concentration'].includes(gate.id)) return gate.actual ? '通过' : '未通过'
+    return fmtPct(gate.actual)
   }
-  if (typeof value === 'string') return statusLabel(value) !== '未开始' ? statusLabel(value) : termLabel(value)
-  return value
+  return String(gate.actual)
+}
+
+function successfulOosRange(candidate: AlphaCandidateResult) {
+  if (candidate.metrics.oos_start && candidate.metrics.oos_end) {
+    return { start: candidate.metrics.oos_start, end: candidate.metrics.oos_end }
+  }
+  const folds = candidate.folds.filter(fold => {
+    const metrics = fold.metrics as { equity_curve?: unknown[] } | undefined
+    return Array.isArray(metrics?.equity_curve) && metrics.equity_curve.length > 0
+  })
+  const starts = folds.map(fold => String(fold.test_start || '')).filter(Boolean).sort()
+  const ends = folds.map(fold => String(fold.test_end || '')).filter(Boolean).sort()
+  return starts.length && ends.length ? { start: starts[0], end: ends[ends.length - 1] } : null
+}
+
+function factorRule(candidate: AlphaCandidateResult, factorMap: Map<string, FactorColumn>) {
+  const frozen = candidate.frozen_candidate
+  if (!frozen) return '内层筛选未形成可回测方案'
+  return frozen.features.map((feature, index) => {
+    const factor = factorMap.get(feature)
+    const direction = (frozen.directions[index] || 1) > 0 ? '高值优先' : '低值优先'
+    return `${factor?.label || feature}（${direction}）`
+  }).join(' + ')
 }
 
 function SectionTitle({ index, title, subtitle }: { index: number; title: string; subtitle: string }) {
@@ -397,9 +407,27 @@ export function AlphaMining() {
   const currentRun = runQuery.data || runsQuery.data?.items.find(item => item.run_id === currentRunId) || null
   const active = !!currentRun && ACTIVE.has(currentRun.status)
   const result = resultQuery.data
+  const factorMap = useMemo(
+    () => new Map((factorsQuery.data?.columns || []).map(item => [item.id, item])),
+    [factorsQuery.data?.columns],
+  )
+  const selectedResultCandidate = result?.candidates.find(item => item.candidate_id === selectedCandidateId) || null
   const catalogRows = Object.entries(availabilityQuery.data?.catalog.datasets || {})
   const evidenceItems = candidatesQuery.data?.items || []
   const hasTopError = [charterQuery, enginesQuery, configQuery, runsQuery, availabilityQuery].some(query => query.isError)
+
+  useEffect(() => {
+    if (!result) return
+    const selectable = result.candidates.find(item => item.candidate_id)
+    if (!selectable) {
+      setSelectedCandidateId(null)
+      return
+    }
+    if (!result.candidates.some(item => item.candidate_id === selectedCandidateId)) {
+      setSelectedCandidateId(selectable.candidate_id || null)
+    }
+  }, [result, selectedCandidateId])
+
   const blockers = useMemo(() => {
     const availability = availabilityQuery.data
     if (availabilityQuery.isError) return ['研究条件检查失败，请刷新后重试']
@@ -612,16 +640,34 @@ export function AlphaMining() {
                 profile={profile}
               />
             </div>
-            <div className="grid gap-2 sm:grid-cols-3">
-              {charterQuery.data?.completion_levels.map((level, index) => (
-                <div key={level.id} className="rounded-lg border border-border bg-base/40 p-3">
-                  <div className="flex items-center gap-2 text-xs font-semibold text-foreground">
-                    <span className="font-mono text-accent">0{index + 1}</span>{level.label}
+            <div className="space-y-2">
+              <div className="rounded-lg border border-border bg-base/30 p-3">
+                <div className="flex flex-wrap items-end justify-between gap-2">
+                  <div>
+                    <div className="text-[11px] font-semibold text-foreground">本次研究究竟在做什么</div>
+                    <div className="mt-1 text-[8px] text-muted">预测未来 {horizon} 个交易日净收益；预测周期不是固定持仓天数。</div>
                   </div>
-                  <p className="mt-2 text-[10px] leading-relaxed text-muted">{level.meaning}</p>
+                  <span className="rounded-full bg-accent/10 px-2 py-1 text-[8px] text-accent">完整合格股票池独立发现</span>
                 </div>
-              ))}
-              <div className="sm:col-span-3 grid grid-cols-2 gap-px overflow-hidden rounded-lg bg-border md:grid-cols-4">
+                <div className="mt-3 grid gap-2 sm:grid-cols-2 xl:grid-cols-4">
+                  {[
+                    ['1', '训练窗发现', '按各引擎登记的方法检验因子、交互、事件或匹配样本'],
+                    ['2', '隐藏窗筛选', '只保留方向、有效期和稳定性达到预设底线的方案'],
+                    ['3', '外层样本外回测', '冻结规则后，用引擎从未见过的日期进行真实撮合'],
+                    ['4', '统一压力测试', '提高成本、延迟成交、扰动参数并检查容量与集中度'],
+                  ].map(([step, title, description]) => (
+                    <div key={step} className="border-l-2 border-accent/40 pl-2">
+                      <div className="text-[9px] font-medium text-foreground"><span className="mr-1 font-mono text-accent">{step}</span>{title}</div>
+                      <div className="mt-1 text-[8px] leading-relaxed text-muted">{description}</div>
+                    </div>
+                  ))}
+                </div>
+              </div>
+              <div className="rounded-lg border border-secondary/20 bg-secondary/5 px-3 py-2 text-[8px] leading-relaxed text-secondary">
+                <span className="font-medium text-foreground">统一交易口径：</span>
+                收盘后打分 → 次日开盘买卖；评分≥70且当日排名前20进入候选；等权、最多10只；评分≤40退出，另设8%止损、最长30日；佣金0.02%、卖出印花税0.05%、滑点5个基点。
+              </div>
+              <div className="grid grid-cols-2 gap-px overflow-hidden rounded-lg bg-border md:grid-cols-4">
                 <Metric label="当前交易日" value={availabilityQuery.data?.trading_bars ?? '—'} />
                 <Metric label="本档最低需要" value={availabilityQuery.data?.required_bars ?? '—'} />
                 <Metric label="独立检验窗口" value={availabilityQuery.data?.outer_folds ?? '—'} />
@@ -631,7 +677,7 @@ export function AlphaMining() {
                   tone={blockers.length ? 'bad' : 'good'}
                 />
               </div>
-              <div className="sm:col-span-3 rounded-lg border border-accent/20 bg-accent/5 px-3 py-2 text-[9px] text-secondary">
+              <div className="rounded-lg border border-accent/20 bg-accent/5 px-3 py-2 text-[9px] text-secondary">
                 研究边界：从当时的全部合格股票出发，任何现有策略都不进入发现样本。只有Alpha系统已产生正式冠军时，才在公共验证的最后一步追加同口径比较。
               </div>
             </div>
@@ -734,9 +780,10 @@ export function AlphaMining() {
                       </div>
                       <div className="mt-1 text-[8px] leading-relaxed text-muted">
                         {readiness?.ready
-                          ? `${engine.discovery_classes.map(termLabel).join(' / ')} · 预测${engine.forecast_horizons.join('/')}个交易日`
+                          ? engine.discovery_method
                           : readiness?.reasons.map(translateReason).join('；') || '正在检查资格'}
                       </div>
+                      {readiness?.ready && <div className="mt-1 text-[7px] leading-relaxed text-secondary">{engine.description} · 可预测{engine.forecast_horizons.join('/')}个交易日</div>}
                     </div>
                   </div>
                 </label>
@@ -789,27 +836,18 @@ export function AlphaMining() {
         </section>
 
         <section className={CARD}>
-          <SectionTitle index={6} title="候选证据" subtitle="统一展示样本外收益、近期表现、成本、延迟、参数、容量和集中度；任一硬门槛失败即淘汰。" />
+          <SectionTitle index={6} title="候选证据" subtitle="先说明发现了什么因子、方向和交易规则，再展示真实样本外与压力测试；没有完整时间覆盖就不显示对应期间收益。" />
           <RunOutcome run={currentRun} result={result} />
           {result
-            ? <CandidateTable candidates={result.candidates} onSelect={id => { if (id) setSelectedCandidateId(id) }} />
+            ? <CandidateTable candidates={result.candidates} factorMap={factorMap} selectedId={selectedCandidateId} onSelect={id => { if (id) setSelectedCandidateId(id) }} />
             : <Empty text="尚无可裁决结果；系统不会凭空生成候选。" />}
-          {candidateQuery.data && (
-            <div className="grid gap-2 border-t border-border p-3 lg:grid-cols-3">
-              <EvidenceBlock title="已冻结的候选方案" value={candidateQuery.data.candidate.candidate} />
-              <EvidenceBlock title="样本外与压力测试证据" value={candidateQuery.data.candidate.outer_evaluation} />
-              <div className="rounded-lg border border-border bg-base/30 p-3 text-[9px] text-muted">
-                <div className="font-medium text-foreground">不可修改的状态记录</div>
-                <div className="mt-2 font-mono">{candidateQuery.data.candidate.candidate_id}</div>
-                <div className="mt-1">状态事件：{candidateQuery.data.events.length} 条</div>
-                <div className="mt-1 break-all">内容指纹：{candidateQuery.data.candidate.content_sha256}</div>
-                <div className="mt-2 space-y-1">
-                  {candidateQuery.data.events.slice(-5).map(event => (
-                    <div key={String(event.event_sha256)}>{statusLabel(String(event.from))} → {statusLabel(String(event.to))}</div>
-                  ))}
-                </div>
-              </div>
-            </div>
+          {selectedResultCandidate && (
+            <CandidateDetail
+              candidate={selectedResultCandidate}
+              factorMap={factorMap}
+              evidence={candidateQuery.data}
+              horizon={Number(result?.request_summary.forward_horizon) || horizon}
+            />
           )}
         </section>
 
@@ -904,14 +942,19 @@ function RunOutcome({ run, result }: { run: AlphaRun | null; result?: AlphaResul
     )
   }
   if (SUCCESS.has(run.status) && result) {
+    const frozenCount = result.candidates.filter(item => item.frozen_candidate).length
+    const continuingCount = result.candidates.filter(item => ['research_candidate', 'shadow', 'challenger', 'champion'].includes(item.state)).length
     return (
       <div className="grid gap-px border-b border-border bg-border sm:grid-cols-3 lg:grid-cols-6">
-        <Metric label="研究结论" value={statusLabel(result.research_state)} tone="good" />
+        <Metric label="研究结论" value={continuingCount ? `${continuingCount}个可继续验证` : '0个通过硬门槛'} tone={continuingCount ? 'good' : 'bad'} />
         <Metric label="外层检验窗口" value={result.summary.outer_fold_count} />
-        <Metric label="已评估引擎" value={result.summary.candidate_engine_count} />
+        <Metric label="冻结可回测方案" value={`${frozenCount}/${result.summary.candidate_engine_count}`} />
         <Metric label="记录尝试" value={result.summary.trial_count} />
         <Metric label="真实回测" value={result.summary.backtest_count} />
         <Metric label="引擎异常" value={result.engine_failures.length} tone={result.engine_failures.length ? 'bad' : 'good'} />
+        <div className="sm:col-span-3 lg:col-span-6 bg-surface px-3 py-2 text-[8px] leading-relaxed text-muted">
+          本轮先在训练窗发现，再经隐藏内选冻结 {frozenCount} 个方案，最后只用外层未见数据和统一撮合裁决；“任务完成”仅代表研究流程结束，不代表找到了Alpha。
+        </div>
         {result.engine_failures.length > 0 && (
           <div className="sm:col-span-3 lg:col-span-6 bg-surface px-3 py-2 text-[8px] text-danger">
             {result.engine_failures.map(item => `${item.engine_id}：${translateRunError(item.error)}`).join('；')}
@@ -950,14 +993,10 @@ function ResearchReadiness({
 }) {
   if (!blockers.length) {
     return (
-      <div className="mt-2 rounded-lg border border-emerald-500/20 bg-emerald-500/5 p-2.5 text-[9px] leading-relaxed text-emerald-300">
-        <div className="flex items-center gap-1.5 font-medium"><CheckCircle2 className="h-3.5 w-3.5" />{profile === 'exploratory' ? '近1年研究可以开始' : '正式研究可以开始'}</div>
-        <div className="mt-1 text-emerald-300/80">{tradingBars} 个交易日，最低需要 {requiredBars} 个；可形成 {outerFolds} 个独立检验窗口，{usableEngineCount} 个发现引擎可运行。</div>
-        {profile === 'exploratory' && (
-          <div className="mt-1 border-t border-emerald-500/10 pt-1 text-emerald-300/70">
-            近1年用于快速发现和证伪；结果只能进入研究候选，不能直接晋级冠军。正式晋级还必须通过更长历史的标准研究、压力测试和前向模拟。
-          </div>
-        )}
+      <div className="mt-2 flex flex-wrap items-center gap-x-2 gap-y-1 rounded-lg border border-emerald-500/20 bg-emerald-500/5 px-2.5 py-2 text-[8px] leading-relaxed text-emerald-300">
+        <span className="flex items-center gap-1 font-medium"><CheckCircle2 className="h-3 w-3" />可以开始</span>
+        <span className="text-emerald-300/80">{tradingBars}个交易日 / 最低{requiredBars}个 · {outerFolds}个外测窗口 · {usableEngineCount}个引擎</span>
+        {profile === 'exploratory' && <span className="text-amber-300">快速研究只用于发现和证伪，不能直接晋级。</span>}
       </div>
     )
   }
@@ -981,35 +1020,46 @@ function Empty({ text, compact = false }: { text: string; compact?: boolean }) {
   return <div className={cn('grid place-items-center text-center', compact ? 'min-h-20' : 'min-h-40')}><div><CircleDashed className="mx-auto h-6 w-6 text-muted" /><div className="mt-2 text-[10px] text-muted">{text}</div></div></div>
 }
 
-function EvidenceBlock({ title, value }: { title: string; value: unknown }) {
-  const translated = value ? translateEvidence(value) : null
-  return <div className="rounded-lg border border-border bg-base/30 p-3 text-[9px]"><div className="font-medium text-foreground">{title}</div><pre className="mt-2 max-h-48 overflow-auto whitespace-pre-wrap break-all font-mono leading-relaxed text-muted">{translated ? JSON.stringify(translated, null, 2) : '尚无证据'}</pre></div>
-}
-
-function CandidateTable({ candidates, onSelect }: { candidates: AlphaCandidateResult[]; onSelect: (id?: string | null) => void }) {
+function CandidateTable({
+  candidates,
+  factorMap,
+  selectedId,
+  onSelect,
+}: {
+  candidates: AlphaCandidateResult[]
+  factorMap: Map<string, FactorColumn>
+  selectedId: string | null
+  onSelect: (id?: string | null) => void
+}) {
   if (!candidates.length) return <Empty text="本次实验没有冻结候选" />
   return (
     <div className="overflow-x-auto">
-      <table className="w-full min-w-[1180px] text-left text-[9px]">
-        <thead className="border-b border-border bg-base/40 text-muted"><tr>{['发现引擎', '状态', '样本外收益', '夏普比率', '最大回撤', '近1年', '近3个月', '双倍成本', '延迟成交', '参数扰动', '容量', '集中度', '门槛'].map(label => <th key={label} className="px-3 py-2 font-medium">{label}</th>)}</tr></thead>
+      <table className="w-full min-w-[1120px] text-left text-[9px]">
+        <thead className="border-b border-border bg-base/40 text-muted"><tr>{['发现引擎与实际因子', '状态', '真实样本外区间', '样本外收益', '夏普', '最大回撤', '双倍成本', '延迟成交', '参数扰动', '裁决'].map(label => <th key={label} className="px-3 py-2 font-medium">{label}</th>)}</tr></thead>
         <tbody>
           {candidates.map(candidate => {
             const counts = gateCounts(candidate)
+            const range = successfulOosRange(candidate)
+            const hasCandidate = !!candidate.frozen_candidate
             return (
-              <tr key={candidate.engine_id} onClick={() => onSelect(candidate.candidate_id)} className={cn('border-b border-border/60 last:border-0', candidate.candidate_id && 'cursor-pointer hover:bg-elevated/40')}>
-                <td className="px-3 py-2"><div className="font-medium text-foreground">{candidate.engine_name}</div><div className="font-mono text-[8px] text-muted">{candidate.candidate_id || candidate.engine_id}</div></td>
-                <td className="px-3 py-2 text-secondary">{statusLabel(candidate.state)}</td>
+              <tr key={candidate.engine_id} onClick={() => onSelect(candidate.candidate_id)} className={cn('border-b border-border/60 last:border-0', candidate.candidate_id && 'cursor-pointer hover:bg-elevated/40', selectedId === candidate.candidate_id && 'bg-accent/5')}>
+                <td className="max-w-[310px] px-3 py-2">
+                  <div className="font-medium text-foreground">{candidate.engine_name}</div>
+                  <div className={cn('mt-0.5 text-[8px] leading-relaxed', hasCandidate ? 'text-secondary' : 'text-muted')}>{factorRule(candidate, factorMap)}</div>
+                </td>
+                <td className={cn('px-3 py-2', hasCandidate ? 'text-secondary' : 'text-muted')}>{hasCandidate ? statusLabel(candidate.state) : '未形成候选'}</td>
+                <td className="px-3 py-2 font-mono text-[8px] text-muted">{range ? <>{range.start}<br />至 {range.end}<br />{candidate.metrics.oos_days || 0}个交易日</> : '未进入外层回测'}</td>
                 <td className="px-3 py-2 font-mono">{fmtPct(candidate.metrics.stitched_oos_return)}</td>
                 <td className="px-3 py-2 font-mono">{fmtNumber(candidate.metrics.stitched_oos_sharpe)}</td>
                 <td className="px-3 py-2 font-mono">{fmtPct(candidate.metrics.max_drawdown)}</td>
-                <td className="px-3 py-2 font-mono">{fmtPct(candidate.metrics.recent_1y_return)}</td>
-                <td className="px-3 py-2 font-mono">{fmtPct(candidate.metrics.recent_3m_return)}</td>
                 <td className="px-3 py-2 font-mono">{fmtPct(candidate.metrics.double_cost_return)}</td>
                 <td className="px-3 py-2 font-mono">{fmtPct(candidate.metrics.delayed_entry_return)}</td>
                 <td className="px-3 py-2 font-mono">{fmtPct(candidate.metrics.worst_parameter_return)}</td>
-                <td className="px-3 py-2">{candidate.metrics.capacity_passed == null ? '—' : candidate.metrics.capacity_passed ? '通过' : '失败'}</td>
-                <td className="px-3 py-2">{candidate.metrics.concentration_passed == null ? '—' : candidate.metrics.concentration_passed ? '通过' : '失败'}</td>
-                <td className="px-3 py-2"><span className="text-emerald-400">{counts.passed}过</span> <span className="text-danger">{counts.failed}败</span> <span className="text-muted">{counts.pending}待验证</span></td>
+                <td className="px-3 py-2">
+                  {hasCandidate
+                    ? <><span className="text-emerald-400">{counts.passed}过</span> <span className="text-danger">{counts.failed}败</span> <span className="text-muted">{counts.pending}待验证</span></>
+                    : <span className="text-muted">训练/内选未通过</span>}
+                </td>
               </tr>
             )
           })}
@@ -1017,4 +1067,114 @@ function CandidateTable({ candidates, onSelect }: { candidates: AlphaCandidateRe
       </table>
     </div>
   )
+}
+
+function CandidateDetail({
+  candidate,
+  factorMap,
+  evidence,
+  horizon,
+}: {
+  candidate: AlphaCandidateResult
+  factorMap: Map<string, FactorColumn>
+  evidence?: { candidate: AlphaEvidenceCandidate; events: Record<string, unknown>[] }
+  horizon: number
+}) {
+  const frozen = candidate.frozen_candidate
+  if (!frozen) return null
+  const range = successfulOosRange(candidate)
+  const params = frozen.parameters
+  const training = frozen.train_evidence
+  const periodAvailable = (period: 'year' | 'quarter') => {
+    const explicit = period === 'year' ? candidate.metrics.recent_1y_available : candidate.metrics.recent_3m_available
+    if (typeof explicit === 'boolean') return explicit
+    if (!range) return false
+    const span = (Date.parse(range.end) - Date.parse(range.start)) / 86_400_000
+    return span >= (period === 'year' ? 365 : 92)
+  }
+  const failedGates = candidate.gates.filter(gate => gate.status === 'failed')
+  const pendingGates = candidate.gates.filter(gate => gate.status === 'pending')
+  const numericTraining = (key: string) => typeof training[key] === 'number' ? Number(training[key]) : null
+
+  return (
+    <div className="border-t border-border bg-base/20 p-3">
+      <div className="flex flex-wrap items-start justify-between gap-3">
+        <div>
+          <div className="text-xs font-semibold text-foreground">{frozen.name}</div>
+          <div className="mt-1 max-w-4xl text-[9px] leading-relaxed text-muted">{frozen.thesis}</div>
+        </div>
+        <span className={cn('rounded-full px-2 py-1 text-[8px]', candidate.state === 'rejected' ? 'bg-danger/10 text-danger' : 'bg-emerald-500/10 text-emerald-300')}>{statusLabel(candidate.state)}</span>
+      </div>
+
+      <div className="mt-3 grid gap-2 lg:grid-cols-3">
+        <div className="rounded-lg border border-border bg-surface p-3">
+          <div className="text-[10px] font-medium text-foreground">1. 因子是什么</div>
+          <div className="mt-2 space-y-2">
+            {frozen.features.map((feature, index) => {
+              const meta = factorMap.get(feature)
+              const direction = (frozen.directions[index] || 1) > 0 ? '数值越高，选股排名越靠前' : '数值越低，选股排名越靠前'
+              return (
+                <div key={feature} className="rounded-md bg-base/50 p-2">
+                  <div className="text-[9px] font-medium text-secondary">{meta?.label || feature} · {direction}</div>
+                  <div className="mt-1 text-[8px] leading-relaxed text-muted">{meta?.desc || '该字段暂缺中文定义，不能据此进入正式研究。'} · 权重 {((Math.abs(frozen.weights[index] || 0)) * 100).toFixed(0)}%</div>
+                </div>
+              )
+            })}
+          </div>
+          <div className="mt-2 text-[8px] leading-relaxed text-muted">
+            训练期证据：日均排序相关 {fmtNumber(numericTraining('ic_mean'))}，信息比率 {fmtNumber(numericTraining('ic_ir'))}，方向一致日占比 {fmtPct(numericTraining('positive_date_ratio'))}，有效交易日 {numericTraining('valid_dates') ?? '—'}。
+          </div>
+        </div>
+
+        <div className="rounded-lg border border-border bg-surface p-3">
+          <div className="text-[10px] font-medium text-foreground">2. 怎么生成信号和回测</div>
+          <ol className="mt-2 list-decimal space-y-1.5 pl-4 text-[8px] leading-relaxed text-muted">
+            <li>每个交易日收盘后，在当时全部合格股票中计算因子横截面百分位得分。</li>
+            <li>得分≥{Number(params.entry_score ?? 70)}且排名前{Number(params.top_rank ?? 20)}只成为买入候选；得分≤{Number(params.exit_score ?? 40)}触发退出。</li>
+            <li>信号次日开盘成交，等权配置，最多持有10只；另设8%止损和最长30日持仓。</li>
+            <li>佣金0.02%、卖出印花税0.05%、滑点5个基点；随后重复双倍成本、延迟成交、参数扰动和容量测试。</li>
+          </ol>
+          <div className="mt-2 rounded-md border border-accent/20 bg-accent/5 p-2 text-[8px] text-secondary">
+            预测对象是未来 {horizon} 个交易日净收益；最终显示的是组合逐日真实撮合结果，不是IC或打分直接换算的收益。
+          </div>
+        </div>
+
+        <div className="rounded-lg border border-border bg-surface p-3">
+          <div className="text-[10px] font-medium text-foreground">3. 这次结果能说明什么</div>
+          <div className="mt-2 grid grid-cols-2 gap-1.5">
+            <DetailMetric label="真实外测区间" value={range ? `${range.start} 至 ${range.end}` : '未形成'} />
+            <DetailMetric label="外测交易日" value={`${candidate.metrics.oos_days || 0}日`} />
+            <DetailMetric label="拼接样本外收益" value={fmtPct(candidate.metrics.stitched_oos_return)} />
+            <DetailMetric label="样本外夏普" value={fmtNumber(candidate.metrics.stitched_oos_sharpe)} />
+            <DetailMetric label="最大回撤" value={fmtPct(candidate.metrics.max_drawdown)} />
+            <DetailMetric label="双倍成本收益" value={fmtPct(candidate.metrics.double_cost_return)} />
+            <DetailMetric label="最近一年收益" value={periodAvailable('year') ? fmtPct(candidate.metrics.recent_1y_return) : '样本不足，不计算'} />
+            <DetailMetric label="最近三个月收益" value={periodAvailable('quarter') ? fmtPct(candidate.metrics.recent_3m_return) : '样本不足，不计算'} />
+          </div>
+        </div>
+      </div>
+
+      <div className="mt-2 grid gap-2 lg:grid-cols-[minmax(0,1fr)_300px]">
+        <div className="rounded-lg border border-danger/20 bg-danger/5 p-3">
+          <div className="text-[10px] font-medium text-foreground">裁决原因</div>
+          {failedGates.length > 0 ? (
+            <div className="mt-2 flex flex-wrap gap-1.5">
+              {failedGates.map(gate => <span key={gate.id} className="rounded border border-danger/20 bg-danger/5 px-2 py-1 text-[8px] text-danger">{GATE_LABELS[gate.id] || gate.id}：{formatGateActual(gate)}</span>)}
+            </div>
+          ) : <div className="mt-2 text-[8px] text-emerald-300">本次已计算的历史硬门槛没有失败项。</div>}
+          {pendingGates.length > 0 && <div className="mt-2 text-[8px] leading-relaxed text-muted">尚未验证：{pendingGates.map(gate => GATE_LABELS[gate.id] || gate.id).join('、')}。缺失证据不会按通过处理。</div>}
+        </div>
+        <details className="rounded-lg border border-border bg-surface p-3 text-[8px] text-muted">
+          <summary className="cursor-pointer font-medium text-secondary">技术审计标识</summary>
+          <div className="mt-2 break-all font-mono">候选编号：{candidate.candidate_id || '—'}</div>
+          <div className="mt-1 break-all font-mono">方案编号：{frozen.recipe_id}</div>
+          {evidence && <><div className="mt-1">状态事件：{evidence.events.length}条</div><div className="mt-1 break-all font-mono">内容指纹：{evidence.candidate.content_sha256}</div></>}
+        </details>
+      </div>
+    </div>
+  )
+}
+
+function DetailMetric({ label, value }: { label: string; value: string }) {
+  return <div className="rounded-md bg-base/50 p-2"><div className="text-[7px] text-muted">{label}</div><div className="mt-0.5 text-[9px] font-medium text-foreground">{value}</div></div>
 }

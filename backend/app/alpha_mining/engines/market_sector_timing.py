@@ -1,4 +1,4 @@
-"""Market and sector conditional-time-series discovery."""
+"""Market-residual cross-sectional discovery."""
 from __future__ import annotations
 
 import polars as pl
@@ -15,25 +15,24 @@ from app.alpha_mining.engines._shared import materialize, rank_univariate_candid
 class MarketSectorTimingEngine:
     manifest = AlphaEngineManifest(
         engine_id="market_sector_timing",
-        version="1.0.0",
+        version="1.1.0",
         api_version=ENGINE_API_VERSION,
-        name="市场与板块时序",
+        name="市场残差截面因子",
         family="market_sector_timing",
-        information_domains=("market_regime", "industry", "price_volume"),
-        mechanism_classes=("structural_flow", "information_diffusion"),
-        economic_mechanism="市场广度与行业状态改变个股因子的收益兑现条件",
-        discovery_classes=("conditional_time_series",),
-        discovery_method="按训练窗市场方向和点时行业状态分层检验截面因子",
-        prediction_objects=("forward_net_return", "market_residual_return"),
+        information_domains=("price_volume", "liquidity", "fundamentals"),
+        mechanism_classes=("relative_mispricing",),
+        economic_mechanism="剥离同期市场平均收益后仍可排序的个股特征可能反映横截面错价",
+        discovery_classes=("residual_attribution", "cross_sectional_rank"),
+        discovery_method="逐项检验事前因子与未来市场残差收益的日度横截面排序关系",
+        prediction_objects=("market_residual_return",),
         forecast_targets=("1d", "3d", "5d", "10d", "20d"),
         required_datasets=(
             DatasetRequirement("daily_enriched", 0.95, True, "date"),
             DatasetRequirement("historical_universe", 0.95, True, "available_date"),
-            DatasetRequirement("industry_pit", 0.90, True, "in_date"),
         ),
         forecast_horizons=(1, 3, 5, 10, 20),
         output_candidate_types=("factor_rank",),
-        description="从市场和板块状态寻找可重复条件, 不引用任何现有策略信号。",
+        description="当前实现只研究市场残差截面排序, 不宣称已经实现市场或行业状态分层。",
     )
 
     def preflight(self, context: DataCatalogContext):
@@ -61,8 +60,8 @@ class MarketSectorTimingEngine:
             engine_id=self.manifest.engine_id,
             engine_version=self.manifest.version,
             recipe_prefix="market_sector_timing",
-            name_prefix="状态条件因子",
-            thesis="训练窗中该因子对市场残差收益的方向在多个市场/行业状态下保持一致。",
+            name_prefix="市场残差因子",
+            thesis="训练窗中该事前因子对未来市场残差收益具有稳定横截面排序。",
         )
 
     def materialize(self, candidate, context):

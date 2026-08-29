@@ -411,6 +411,19 @@ def run_alpha_mining_runtime(
     stress_backtest_count = 0
     for engine_id, folds in engine_folds.items():
         metrics = _aggregate_fold_metrics(folds, champion_folds=benchmark_folds)
+        frozen_candidate = _representative_candidate(folds)
+        if frozen_candidate is None:
+            candidates_summary.append({
+                "engine_id": engine_id,
+                "engine_name": registry.get(engine_id).manifest.name,
+                "state": "rejected",
+                "metrics": metrics,
+                "gates": [],
+                "folds": folds,
+                "frozen_candidate": None,
+                "evidence_reason": "inner_selection_no_finite_candidate",
+            })
+            continue
         stress_metrics, stress_count = _run_stress_suite(
             folds=folds,
             request=request,
@@ -428,7 +441,6 @@ def run_alpha_mining_runtime(
         failed = any(gate["status"] == "failed" for gate in historical)
         complete = bool(historical) and all(gate["status"] == "passed" for gate in historical)
         state = "rejected" if failed else ("research_candidate" if complete else "outer_evaluated")
-        frozen_candidate = _representative_candidate(folds)
         candidates_summary.append({
             "engine_id": engine_id,
             "engine_name": registry.get(engine_id).manifest.name,
@@ -713,6 +725,7 @@ def _aggregate_fold_metrics(
 ) -> dict[str, Any]:
     returns = _stitch_fold_returns(folds)
     champion_returns = _stitch_fold_returns(champion_folds or ())
+    coverage_start, coverage_end = _fold_coverage_bounds(folds)
     if not returns:
         return {
             "stitched_oos_return": None,
@@ -722,6 +735,14 @@ def _aggregate_fold_metrics(
             "beat_champion_half_year_ratio": None,
             "recent_1y_return": None,
             "recent_3m_return": None,
+            "recent_1y_available": False,
+            "recent_3m_available": False,
+            "oos_start": coverage_start.isoformat() if coverage_start else None,
+            "oos_end": coverage_end.isoformat() if coverage_end else None,
+            "oos_calendar_days": (
+                (coverage_end - coverage_start).days + 1
+                if coverage_start and coverage_end else 0
+            ),
             "oos_days": 0,
         }
     values = [value for _, value in returns]
@@ -738,19 +759,54 @@ def _aggregate_fold_metrics(
         sum(half_years[key] > champion_half_years[key] for key in comparable) / len(comparable)
         if comparable else None
     )
-    end = returns[-1][0]
+    end = coverage_end or returns[-1][0]
+    start = coverage_start or returns[0][0]
+    year_cutoff = end - timedelta(days=365)
+    quarter_cutoff = end - timedelta(days=92)
+    year_available = start <= year_cutoff
+    quarter_available = start <= quarter_cutoff
     return {
         "stitched_oos_return": total_return,
         "stitched_oos_sharpe": sharpe,
         "max_drawdown": max_drawdown,
         "positive_half_year_ratio": positive_ratio,
         "beat_champion_half_year_ratio": beat_ratio,
-        "recent_1y_return": _compound([value for day, value in returns if day > end - timedelta(days=365)]),
-        "recent_3m_return": _compound([value for day, value in returns if day > end - timedelta(days=92)]),
+        "recent_1y_return": (
+            _compound([value for day, value in returns if day > year_cutoff])
+            if year_available else None
+        ),
+        "recent_3m_return": (
+            _compound([value for day, value in returns if day > quarter_cutoff])
+            if quarter_available else None
+        ),
+        "recent_1y_available": year_available,
+        "recent_3m_available": quarter_available,
+        "oos_start": start.isoformat(),
+        "oos_end": end.isoformat(),
+        "oos_calendar_days": (end - start).days + 1,
         "half_year_windows": len(half_years),
         "oos_days": len(returns),
         "equity_curve": _equity_curve(returns),
     }
+
+
+def _fold_coverage_bounds(
+    folds: Sequence[Mapping[str, Any]],
+) -> tuple[date | None, date | None]:
+    """Return the actual outer-test coverage, excluding folds with no backtest curve."""
+    starts: list[date] = []
+    ends: list[date] = []
+    for fold in folds:
+        metrics = fold.get("metrics")
+        curve = metrics.get("equity_curve") if isinstance(metrics, Mapping) else None
+        if not isinstance(curve, list) or not curve:
+            continue
+        try:
+            starts.append(date.fromisoformat(str(fold.get("test_start"))[:10]))
+            ends.append(date.fromisoformat(str(fold.get("test_end"))[:10]))
+        except ValueError:
+            continue
+    return (min(starts), max(ends)) if starts and ends else (None, None)
 
 
 def _stitch_fold_returns(folds: Sequence[Mapping[str, Any]]) -> list[tuple[date, float]]:

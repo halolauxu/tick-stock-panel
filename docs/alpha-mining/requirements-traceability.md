@@ -95,16 +95,16 @@
 | ID | 需求 | 证据 | 结论 |
 |---|---|---|---|
 | AM-S5-001 | 全市场截面因子 | `cross_sectional.py` | PASS |
-| AM-S5-002 | 市场与板块时序 | `market_sector_timing.py` | PASS |
+| AM-S5-002 | 市场与板块时序 | 当前仅实现市场残差截面排序，未做市场/行业状态分层 | FAIL |
 | AM-S5-003 | 事件与事件序列 | `event_sequence.py` | PASS |
 | AM-S5-004 | 行业/概念/产业链扩散 | `network_diffusion.py` | PASS |
 | AM-S5-005 | 财务变化与预期差 | `financial_revision.py` | PASS |
 | AM-S5-006 | 赢家/输家匹配归因 | `matched_outcomes.py` | PASS |
-| AM-S5-007 | 策略残差与组合互补 | `portfolio_residual.py` | PASS |
+| AM-S5-007 | 策略残差与组合互补 | 当前不读取策略残差，也未做相关性惩罚或组合互补优化 | FAIL |
 | AM-S5-008 | 非线性交互 | `nonlinear_interaction.py` | PASS |
 | AM-S5-009 | 独立预算与全市场发现 | `TrialBudget`、运行时逐引擎预算 | PASS |
 | AM-S5-010 | 至少一个引擎不引用现有策略 | 七个非残差引擎均从合格股票池和训练特征出发 | PASS |
-| AM-S5-011 | 已知 Alpha 真阳性测试 | 八引擎合成机制真阳性测试 | PASS |
+| AM-S5-011 | 已知 Alpha 真阳性测试 | 现有测试复用同一强排序因子，不是逐引擎机制真阳性 | FAIL |
 | AM-S5-012 | 随机噪声假阳性控制 | 八引擎噪声拒绝测试 | PASS |
 | AM-S5-013 | 缺数据明确停止 | Manifest 数据要求、引擎预检、API 阻断 | PASS |
 
@@ -134,10 +134,10 @@
 | AM-S7-003 | 信息与数据覆盖 | 页面区域 3 | PASS |
 | AM-S7-004 | 发现引擎 | 页面区域 4，动态读取注册表 | PASS |
 | AM-S7-005 | 实验账本 | 页面区域 5 | PASS |
-| AM-S7-006 | 候选证据钻取 | 页面区域 6 | PASS |
+| AM-S7-006 | 候选证据钻取 | 已改为因子、规则、撮合、覆盖和裁决说明；待线上浏览器复验 | FAIL |
 | AM-S7-007 | 完整冠军挑战 | 页面区域 7 | PASS |
 | AM-S7-008 | 前向模拟 | 页面区域 8 | PASS |
-| AM-S7-009 | 加载/空/错/取消/重连/窄屏 | API 测试、浏览器刷新及 390px 验收 | PASS |
+| AM-S7-009 | 加载/空/错/取消/重连/窄屏 | 本轮修改后尚未完成线上桌面与窄屏复验 | FAIL |
 | AM-S7-010 | 旧挖掘浏览器无回归 | `/mining` 页面浏览器验收 | PASS |
 
 ## Stage 8：前向模拟闭环

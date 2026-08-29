@@ -4,7 +4,7 @@ from __future__ import annotations
 from collections.abc import Mapping
 from typing import Any
 
-ALPHA_ALGORITHM_VERSION = "alpha-mining-v1"
+ALPHA_ALGORITHM_VERSION = "alpha-mining-v2"
 
 HARD_GATES: tuple[dict[str, Any], ...] = (
     {"id": "return_vs_champion", "label": "13年拼接样本外净收益为正; 已有正式冠军时还须超过冠军", "required": True},
@@ -27,11 +27,12 @@ COVERAGE_ROADMAP: tuple[dict[str, Any], ...] = (
     {"id": "cross_sectional", "name": "截面排序", "status": "ready", "slot": "engine"},
     {"id": "outcome_attribution", "name": "赢家/输家归因", "status": "ready", "slot": "engine"},
     {"id": "interaction", "name": "非线性交互", "status": "ready", "slot": "engine"},
-    {"id": "market_sector_timing", "name": "市场/行业时序", "status": "ready", "slot": "engine"},
+    {"id": "market_sector_timing", "name": "市场/行业时序", "status": "planned", "slot": "engine"},
+    {"id": "market_residual_rank", "name": "市场残差截面排序", "status": "ready", "slot": "engine"},
     {"id": "event_sequence", "name": "事件序列", "status": "ready", "slot": "engine"},
     {"id": "network_diffusion", "name": "行业/概念扩散", "status": "ready", "slot": "engine"},
     {"id": "financial_revision", "name": "财务变化与预期差", "status": "ready", "slot": "engine"},
-    {"id": "portfolio_residual", "name": "组合残差与互补收益", "status": "ready", "slot": "engine"},
+    {"id": "portfolio_residual", "name": "策略残差与组合互补", "status": "planned", "slot": "engine"},
     {"id": "auction_microstructure", "name": "竞价与微观结构", "status": "data_gap", "slot": "engine"},
     {"id": "holder_supply", "name": "股东/筹码供需", "status": "data_gap", "slot": "engine"},
     {"id": "event_text", "name": "公告/政策文本事件", "status": "data_gap", "slot": "engine"},

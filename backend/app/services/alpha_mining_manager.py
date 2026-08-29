@@ -132,14 +132,16 @@ class AlphaMiningJobManager(MiningJobManager):
                 renderer=dict(rendered),
             )
             target = "research_candidate" if row.get("state") == "research_candidate" else "rejected"
+            outer_evaluation = {
+                "metrics": row.get("metrics"),
+                "gates": row.get("gates"),
+                "folds": row.get("folds"),
+            }
+            if champion.get("strategy_id"):
+                outer_evaluation["champion"] = champion
             evidence = self.evidence.record_outer_evaluation(
                 evidence["candidate_id"],
-                {
-                    "metrics": row.get("metrics"),
-                    "gates": row.get("gates"),
-                    "folds": row.get("folds"),
-                    "champion": champion,
-                },
+                outer_evaluation,
                 target,
             )
             row["candidate_id"] = evidence["candidate_id"]

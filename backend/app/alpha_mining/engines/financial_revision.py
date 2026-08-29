@@ -1,4 +1,4 @@
-"""Announcement-time financial revision and expectation-gap discovery."""
+"""Point-in-time financial factor discovery."""
 from __future__ import annotations
 
 from app.alpha_mining.contracts import (
@@ -27,15 +27,15 @@ FINANCIAL_FEATURES = (
 class FinancialRevisionEngine:
     manifest = AlphaEngineManifest(
         engine_id="financial_revision",
-        version="1.0.0",
+        version="1.1.0",
         api_version=ENGINE_API_VERSION,
-        name="财务变化与预期差",
+        name="公告时点财务因子",
         family="financial_revision",
         information_domains=("fundamentals", "corporate_event"),
-        mechanism_classes=("expectation_revision", "behavioral_underreaction"),
-        economic_mechanism="公告后的盈利质量变化和相对历史预期差可能被市场分期消化",
-        discovery_classes=("revision_surprise", "event_study"),
-        discovery_method="按公告时间构造同比变化、环比修正及同行业标准化意外",
+        mechanism_classes=("relative_mispricing", "expectation_revision"),
+        economic_mechanism="公告后已知的估值、盈利质量、增长或修订字段可能形成横截面错价",
+        discovery_classes=("cross_sectional_rank",),
+        discovery_method="逐项检验公告时点可见财务字段与未来净收益的日度横截面排序关系",
         prediction_objects=("forward_net_return", "market_residual_return", "gap_risk"),
         forecast_targets=("3d", "5d", "10d", "20d", "60d"),
         required_datasets=(
@@ -64,8 +64,8 @@ class FinancialRevisionEngine:
             engine_id=self.manifest.engine_id,
             engine_version=self.manifest.version,
             recipe_prefix="financial_revision",
-            name_prefix="财务预期差",
-            thesis="公告后可见的财务变化特征在训练窗中对未来净收益具有稳定排序。",
+            name_prefix="公告财务因子",
+            thesis="公告后可见的财务字段在训练窗中对未来净收益具有稳定横截面排序; 字段本身不等同于预期差。",
             features=features,
         )
 

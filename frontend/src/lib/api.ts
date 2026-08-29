@@ -1360,6 +1360,20 @@ export interface AlphaCandidateResult {
   engine_id: string
   engine_name: string
   state: AlphaResearchState
+  evidence_reason?: string | null
+  frozen_candidate?: {
+    recipe_id: string
+    engine_id: string
+    engine_version: string
+    name: string
+    thesis: string
+    signal_kind: string
+    features: string[]
+    directions: number[]
+    weights: number[]
+    parameters: Record<string, number | string | boolean | null>
+    train_evidence: Record<string, number | string | boolean | null>
+  } | null
   metrics: {
     stitched_oos_return?: number | null
     stitched_oos_sharpe?: number | null
@@ -1368,6 +1382,11 @@ export interface AlphaCandidateResult {
     beat_champion_half_year_ratio?: number | null
     recent_1y_return?: number | null
     recent_3m_return?: number | null
+    recent_1y_available?: boolean
+    recent_3m_available?: boolean
+    oos_start?: string | null
+    oos_end?: string | null
+    oos_calendar_days?: number
     half_year_windows?: number
     oos_days?: number
     equity_curve?: { date: string; value: number }[]
