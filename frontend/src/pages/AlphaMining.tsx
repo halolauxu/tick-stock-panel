@@ -883,16 +883,24 @@ export function AlphaMining() {
               <table className="w-full min-w-[620px] text-left text-[9px]">
                 <thead className="text-muted"><tr>{['候选', '状态', '样本外收益', '夏普比率', '最大回撤', '门槛'].map(value => <th key={value} className="border-b border-border px-2 py-2 font-medium">{value}</th>)}</tr></thead>
                 <tbody>
-                  {championQuery.data?.challengers.map(item => (
-                    <tr key={item.candidate_id} className="border-b border-border/60">
-                      <td className="px-2 py-2 font-mono text-secondary">{item.candidate_id}</td>
-                      <td className="px-2 py-2 text-foreground">{statusLabel(item.state)}</td>
-                      <td className="px-2 py-2 font-mono">{fmtPct(item.return)}</td>
-                      <td className="px-2 py-2 font-mono">{fmtNumber(item.sharpe)}</td>
-                      <td className="px-2 py-2 font-mono">{fmtPct(item.max_drawdown)}</td>
-                      <td className="px-2 py-2"><span className="text-emerald-400">{item.gates_passed}过</span> <span className="text-danger">{item.gates_failed}败</span> <span className="text-muted">{item.gates_pending}待验证</span></td>
-                    </tr>
-                  ))}
+                  {championQuery.data?.challengers.map(item => {
+                    const currentCandidate = result?.candidates.find(candidate => candidate.candidate_id === item.candidate_id)
+                    const counts = currentCandidate ? gateCounts(currentCandidate) : {
+                      passed: item.gates_passed,
+                      failed: item.gates_failed,
+                      pending: item.gates_pending,
+                    }
+                    return (
+                      <tr key={item.candidate_id} className="border-b border-border/60">
+                        <td className="px-2 py-2 font-mono text-secondary">{item.candidate_id}</td>
+                        <td className="px-2 py-2 text-foreground">{statusLabel(item.state)}</td>
+                        <td className="px-2 py-2 font-mono">{fmtPct(item.return)}</td>
+                        <td className="px-2 py-2 font-mono">{fmtNumber(item.sharpe)}</td>
+                        <td className="px-2 py-2 font-mono">{fmtPct(item.max_drawdown)}</td>
+                        <td className="px-2 py-2"><span className="text-emerald-400">{counts.passed}过</span> <span className="text-danger">{counts.failed}败</span> <span className="text-muted">{counts.pending}待验证</span></td>
+                      </tr>
+                    )
+                  })}
                 </tbody>
               </table>
             </div>
