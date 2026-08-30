@@ -135,7 +135,11 @@ def categorize_events(events: pl.DataFrame) -> pl.DataFrame:
     )
 
 
-def load_panel(data_dir: Path) -> pl.DataFrame:
+def load_panel(
+    data_dir: Path,
+    start: date = START,
+    panel_end: date = PANEL_END,
+) -> pl.DataFrame:
     paths = sorted((data_dir / "kline_daily_enriched").glob("date=*/part.parquet"))
     if not paths:
         raise ValueError("daily enriched data is required")
@@ -155,7 +159,7 @@ def load_panel(data_dir: Path) -> pl.DataFrame:
             "raw_low",
         )
         .filter(
-            pl.col("date").is_between(START, PANEL_END, closed="both")
+            pl.col("date").is_between(start, panel_end, closed="both")
             & pl.col("symbol").str.contains(r"^\d{6}\.(?:SH|SZ|BJ)$")
         )
         .collect(engine="streaming")
@@ -273,7 +277,11 @@ def prepare_panel(panel: pl.DataFrame) -> pl.DataFrame:
     )
 
 
-def map_entry_indices(events: pl.DataFrame, panel: pl.DataFrame) -> pl.DataFrame:
+def map_entry_indices(
+    events: pl.DataFrame,
+    panel: pl.DataFrame,
+    holding_trading_days: int = HOLD_TRADING_DAYS,
+) -> pl.DataFrame:
     calendar = panel.select("date", "trade_index").unique().sort("date")
     return (
         events.with_columns(
@@ -289,7 +297,9 @@ def map_entry_indices(events: pl.DataFrame, panel: pl.DataFrame) -> pl.DataFrame
         .rename({"date": "mapped_entry_date"})
         .with_columns(
             (pl.col("trade_index") - 1).alias("prior_index"),
-            (pl.col("trade_index") + HOLD_TRADING_DAYS).alias("planned_exit_index"),
+            (pl.col("trade_index") + holding_trading_days).alias(
+                "planned_exit_index"
+            ),
         )
         .sort(["ann_date", "symbol"])
     )
@@ -318,8 +328,12 @@ def _lookup(panel: pl.DataFrame, index_column: str, prefix: str) -> pl.DataFrame
     )
 
 
-def build_trades(events: pl.DataFrame, panel: pl.DataFrame) -> pl.DataFrame:
-    work = map_entry_indices(events, panel)
+def build_trades(
+    events: pl.DataFrame,
+    panel: pl.DataFrame,
+    holding_trading_days: int = HOLD_TRADING_DAYS,
+) -> pl.DataFrame:
+    work = map_entry_indices(events, panel, holding_trading_days)
     work = work.join(
         _lookup(panel, "prior_index", "prior"),
         on=["symbol", "prior_index"],
