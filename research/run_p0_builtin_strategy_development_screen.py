@@ -122,21 +122,22 @@ def run(data_dir: Path, research_dir: Path, output: Path) -> dict[str, Any]:
     ]
     for config in configs:
         config.enforce_t_plus_one = True
-    loader = common._prepared(service, configs)
-    prepared_objects = []
-    try:
-        market, pit_context = common._attach_point_in_time_universe(
-            loader.market_data, data_dir
-        )
-        prepared_by_name, prepared_objects = common._prepared_groups(
-            service, strategy_ids, configs, market
-        )
-        results: dict[str, Any] = {}
-        promoted = []
-        for strategy_id, config in zip(strategy_ids, configs, strict=True):
+    results: dict[str, Any] = {}
+    promoted = []
+    pit_context: dict[str, Any] | None = None
+    for strategy_id, config in zip(strategy_ids, configs, strict=True):
+        loader = common._prepared(service, [config])
+        prepared = None
+        try:
+            market, current_pit_context = common._attach_point_in_time_universe(
+                loader.market_data, data_dir
+            )
+            if pit_context is None:
+                pit_context = current_pit_context
+            prepared = common._prepared(service, [config], market)
             result = service.run(
                 config,
-                prepared=prepared_by_name[strategy_id],
+                prepared=prepared,
                 result_policy=POLICY,
             )
             if result.error:
@@ -150,51 +151,51 @@ def run(data_dir: Path, research_dir: Path, output: Path) -> dict[str, Any]:
             results[strategy_id] = {"stats": stats, "decision": decision}
             if decision["passed"]:
                 promoted.append(strategy_id)
-        payload = {
-            "schema_version": "p0-builtin-strategy-development-screen-v1",
-            "contract_frozen": "2026-08-30",
-            "period": {
-                "start": DEVELOPMENT_START,
-                "end": DEVELOPMENT_END,
-                "validation_read": False,
-                "known_stress_read": False,
+        finally:
+            if prepared is not None:
+                prepared.compute_cache.close()
+            loader.compute_cache.close()
+    payload = {
+        "schema_version": "p0-builtin-strategy-development-screen-v1",
+        "contract_frozen": "2026-08-30",
+        "period": {
+            "start": DEVELOPMENT_START,
+            "end": DEVELOPMENT_END,
+            "validation_read": False,
+            "known_stress_read": False,
+        },
+        "account": {
+            "initial_cash_cny": 200_000.0,
+            "max_positions": 10,
+            "t_plus_one": True,
+            "entry_exit": "next trading-day open",
+        },
+        "point_in_time_context": pit_context,
+        "strategy_ids": strategy_ids,
+        "results": results,
+        "promoted_to_independent_validation": promoted,
+        "strict_qualified_count": 0,
+    }
+    output.parent.mkdir(parents=True, exist_ok=True)
+    output.write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+    digest = hashlib.sha256(output.read_bytes()).hexdigest()
+    print(
+        json.dumps(
+            {
+                "strategy_count": len(strategy_ids),
+                "results": results,
+                "promoted_to_independent_validation": promoted,
+                "output": str(output),
+                "sha256": digest,
             },
-            "account": {
-                "initial_cash_cny": 200_000.0,
-                "max_positions": 10,
-                "t_plus_one": True,
-                "entry_exit": "next trading-day open",
-            },
-            "point_in_time_context": pit_context,
-            "strategy_ids": strategy_ids,
-            "results": results,
-            "promoted_to_independent_validation": promoted,
-            "strict_qualified_count": 0,
-        }
-        output.parent.mkdir(parents=True, exist_ok=True)
-        output.write_text(
-            json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8"
-        )
-        digest = hashlib.sha256(output.read_bytes()).hexdigest()
-        print(
-            json.dumps(
-                {
-                    "strategy_count": len(strategy_ids),
-                    "results": results,
-                    "promoted_to_independent_validation": promoted,
-                    "output": str(output),
-                    "sha256": digest,
-                },
-                ensure_ascii=False,
-                indent=2,
-            ),
-            flush=True,
-        )
-        return payload
-    finally:
-        for prepared in prepared_objects:
-            prepared.compute_cache.close()
-        loader.compute_cache.close()
+            ensure_ascii=False,
+            indent=2,
+        ),
+        flush=True,
+    )
+    return payload
 
 
 def main() -> None:
