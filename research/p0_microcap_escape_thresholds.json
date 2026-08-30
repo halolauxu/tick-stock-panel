@@ -1,0 +1,21 @@
+{
+  "schema_version": "p0-microcap-escape-thresholds-v1",
+  "contract_commit": "ec56f88",
+  "calibration_code_commit": "e13a97f",
+  "calibration_period": {
+    "start": "2013-08-29",
+    "end": "2020-12-31"
+  },
+  "calibration_output": {
+    "server_path": "/mnt/data/tick-stock-panel/data/research/p0_microcap_escape_calibration.json",
+    "sha256": "6d305bb5b42e6984f42ffc790d75ba4405b67bcc53c87b4f52f71c3cfc28fd39"
+  },
+  "quantile_interpolation": "nearest",
+  "thresholds": {
+    "microcap_excess_5d_p10": -0.02012421350845861,
+    "microcap_breadth_3d_p10": 0.2822831103242099,
+    "microcap_limit_down_3d_p90": 0.011011011011011013,
+    "microcap_liquidity_5d_60d_p10": 0.6401950242931338,
+    "microcap_limit_down_3d_p95": 0.06341463414634146
+  }
+}
