@@ -71,8 +71,8 @@ def normalize(rows: list[dict[str, Any]], year: int, month: int) -> pl.DataFrame
                 "stk_div": "stock_dividend_per_share",
                 "stk_bo_rate": "bonus_share_per_share",
                 "stk_co_rate": "capitalization_share_per_share",
-                "cash_div": "cash_dividend_pre_tax_per_share",
-                "cash_div_tax": "cash_dividend_after_tax_per_share",
+                "cash_div": "cash_dividend_after_tax_per_share",
+                "cash_div_tax": "cash_dividend_pre_tax_per_share",
             }
         )
         .with_columns(

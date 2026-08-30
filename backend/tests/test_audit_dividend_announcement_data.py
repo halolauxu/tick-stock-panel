@@ -87,3 +87,32 @@ def test_complete_unique_metadata_qualifies_without_outcomes(tmp_path) -> None:
     assert result["status"] == "DATA_QUALIFIED"
     assert result["development_annual_cash_plans"] >= 500
     assert result["duplicate_rows"] == 0
+
+
+def test_current_period_plan_is_not_rejected_only_because_period_has_not_ended(
+    tmp_path,
+) -> None:
+    root = tmp_path / "event_data" / "dividend_announcements"
+    for year in range(2012, 2021):
+        for month in range(1, 13):
+            target = root / f"year={year}" / f"month={month:02d}" / "part.parquet"
+            target.parent.mkdir(parents=True)
+            rows = []
+            if year >= 2014:
+                rows = [
+                    {
+                        **row,
+                        "symbol": f"{month * 100 + index:06d}.SZ",
+                        "period_end": date(year, 12, 31),
+                    }
+                    for index, row in enumerate(
+                        _frame(year, month).to_dicts() * 8,
+                        start=1,
+                    )
+                ]
+            pl.DataFrame(rows, schema=_frame(2012, 1).schema).write_parquet(target)
+
+    result = audit.audit(tmp_path)
+
+    assert result["status"] == "DATA_QUALIFIED"
+    assert result["invalid_rows"] == 0

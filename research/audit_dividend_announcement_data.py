@@ -52,7 +52,6 @@ def audit(data_dir: Path) -> dict[str, Any]:
         ~pl.col("symbol").str.contains(r"^\d{6}\.(?:SH|SZ|BJ)$")
         | pl.col("period_end").is_null()
         | pl.col("ann_date").is_null()
-        | (pl.col("period_end") > pl.col("ann_date"))
     ).height
     maximum_daily_rows = (
         frame.group_by("ann_date").len()["len"].max() if frame.height else 0

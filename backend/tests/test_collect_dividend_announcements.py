@@ -36,7 +36,7 @@ def _row(symbol: str = "000001.SZ") -> dict:
         "stk_div": 0,
         "stk_bo_rate": 0,
         "stk_co_rate": 0,
-        "cash_div": 0.2,
+        "cash_div": 0.1,
         "cash_div_tax": 0.2,
     }
 
@@ -73,6 +73,7 @@ def test_normalize_is_unique_and_uses_announcement_date() -> None:
     assert frame["period_end"][0] == date(2019, 12, 31)
     assert frame["ann_date"][0] == date(2020, 1, 15)
     assert frame["cash_dividend_pre_tax_per_share"][0] == pytest.approx(0.2)
+    assert frame["cash_dividend_after_tax_per_share"][0] == pytest.approx(0.1)
 
 
 def test_collect_month_persists_empty_partition_atomically(tmp_path) -> None:
