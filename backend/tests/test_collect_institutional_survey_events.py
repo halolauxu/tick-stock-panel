@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib.util
+import json
 import stat
 from datetime import date
 from pathlib import Path
@@ -25,6 +26,20 @@ def _load_module():
 
 
 collector = _load_module()
+
+
+class _Response:
+    def __init__(self, payload: dict) -> None:
+        self._payload = json.dumps(payload).encode()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_args) -> None:
+        return None
+
+    def read(self) -> bytes:
+        return self._payload
 
 
 def test_warmup_year_is_allowed_but_earlier_history_is_rejected() -> None:
@@ -75,6 +90,25 @@ def test_request_uses_verified_wide_report_page_size() -> None:
     assert params["pageSize"] == "50"
     assert params["source"] == "WEB"
     assert params["client"] == "WEB"
+
+
+def test_client_disables_persistent_chunked_transport(monkeypatch) -> None:
+    captured = {}
+
+    def fake_urlopen(request, *, timeout):
+        captured["request"] = request
+        captured["timeout"] = timeout
+        return _Response({"success": True, "result": {"data": []}})
+
+    monkeypatch.setattr(collector.urllib.request, "urlopen", fake_urlopen)
+    client = collector.EastmoneySurveyClient(min_interval=0)
+
+    payload = client.fetch(collector._params(2020, 1, 1))
+
+    headers = {key.lower(): value for key, value in captured["request"].headers.items()}
+    assert payload["success"] is True
+    assert headers["connection"] == "close"
+    assert headers["accept-encoding"] == "identity"
 
 
 def test_fetch_month_reuses_valid_page_cache(tmp_path) -> None:

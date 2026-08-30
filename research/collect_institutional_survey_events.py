@@ -83,7 +83,14 @@ class EastmoneySurveyClient:
     def fetch(self, params: dict[str, str]) -> dict[str, Any]:
         request = urllib.request.Request(
             API_URL + "?" + urllib.parse.urlencode(params),
-            headers={"User-Agent": "Mozilla/5.0 research-metadata-client"},
+            headers={
+                "User-Agent": "Mozilla/5.0 research-metadata-client",
+                # The provider intermittently truncates persistent chunked
+                # responses on the production host.  A one-request connection
+                # with an identity body is the stable, lossless transport.
+                "Connection": "close",
+                "Accept-Encoding": "identity",
+            },
         )
         for attempt in range(self.max_attempts):
             wait = self.min_interval - (time.monotonic() - self._last_request)
