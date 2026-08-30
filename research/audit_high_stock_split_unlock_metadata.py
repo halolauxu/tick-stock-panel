@@ -154,7 +154,7 @@ def audit(data_dir: Path) -> dict[str, Any]:
     unlock_paths = expected_unlock_paths(data_dir)
     missing_dividends = [str(path) for path in dividend_paths if not path.is_file()]
     missing_unlocks = [str(path) for path in unlock_paths if not path.is_file()]
-    if missing_dividends or missing_unlocks:
+    if missing_dividends:
         return {
             "status": "DATA_INCOMPLETE",
             "future_returns_read": False,
@@ -164,8 +164,67 @@ def audit(data_dir: Path) -> dict[str, Any]:
         }
 
     dividends = pl.read_parquet(dividend_paths, hive_partitioning=False)
-    unlocks = pl.read_parquet(unlock_paths, hive_partitioning=False)
     proposals = _high_split_proposals(dividends)
+    # The unlock intersection can never exceed the proposal population.  Once
+    # the complete proposal ledger is below the frozen event minimum, missing
+    # later unlock metadata cannot change the decision and should not trigger
+    # unnecessary data collection.
+    if proposals.height < MIN_MATCHED_EVENTS:
+        return {
+            "status": "SAMPLE_SPARSE",
+            "future_returns_read": False,
+            "price_data_read": False,
+            "period": {
+                "development_start": DEVELOPMENT_START,
+                "development_end": DEVELOPMENT_END,
+                "latest_required_unlock_year": UNLOCK_END_YEAR,
+            },
+            "assumptions": {
+                "minimum_split_ratio_per_share": HIGH_SPLIT_RATIO,
+                "upcoming_unlock_days": UPCOMING_UNLOCK_DAYS,
+                "minimum_upcoming_unlock_ratio_pct": MIN_UPCOMING_UNLOCK_RATIO_PCT,
+                "same_symbol_cooldown_days": COOLDOWN_DAYS,
+            },
+            "rows": {
+                "dividend_metadata": dividends.height,
+                "unlock_details": None,
+                "high_split_proposals": proposals.height,
+                "high_split_with_upcoming_unlock": None,
+            },
+            "coverage": {
+                "proposal_symbols": (
+                    proposals["symbol"].n_unique() if proposals.height else 0
+                ),
+                "proposal_signal_days": (
+                    proposals["ann_date"].n_unique() if proposals.height else 0
+                ),
+                "proposal_years": (
+                    proposals["ann_date"].dt.year().n_unique()
+                    if proposals.height
+                    else 0
+                ),
+                "proposal_yearly": _yearly(proposals),
+            },
+            "missing_unlock_partitions": missing_unlocks,
+            "checks": {
+                "all_dividend_metadata_present": True,
+                "proposal_upper_bound_at_least_40": False,
+                "unlock_intersection_not_required_after_upper_bound_failure": True,
+            },
+        }
+    if missing_unlocks:
+        return {
+            "status": "DATA_INCOMPLETE",
+            "future_returns_read": False,
+            "price_data_read": False,
+            "missing_dividend_partitions": [],
+            "missing_unlock_partitions": missing_unlocks,
+            "rows": {
+                "dividend_metadata": dividends.height,
+                "high_split_proposals": proposals.height,
+            },
+        }
+    unlocks = pl.read_parquet(unlock_paths, hive_partitioning=False)
     matched = _attach_upcoming_unlocks(proposals, unlocks)
     years = matched.get_column("ann_date").dt.year().n_unique() if matched.height else 0
     checks = {

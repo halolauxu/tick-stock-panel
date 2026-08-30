@@ -110,6 +110,23 @@ def test_incomplete_metadata_never_opens_outcomes(tmp_path) -> None:
     assert result["price_data_read"] is False
 
 
+def test_complete_sparse_proposal_ledger_stops_before_unlock_collection(
+    tmp_path,
+) -> None:
+    _write_complete_dataset(tmp_path, 10)
+    unlock_root = tmp_path / "event_data" / "share_float"
+    for path in unlock_root.glob("year=*/part.parquet"):
+        path.unlink()
+
+    result = audit_module.audit(tmp_path)
+
+    assert result["status"] == "SAMPLE_SPARSE"
+    assert result["rows"]["high_split_proposals"] == 10
+    assert result["rows"]["unlock_details"] is None
+    assert result["checks"]["proposal_upper_bound_at_least_40"] is False
+    assert result["future_returns_read"] is False
+
+
 def test_sufficient_point_in_time_intersection_qualifies_sample(tmp_path) -> None:
     _write_complete_dataset(tmp_path, 45)
 
