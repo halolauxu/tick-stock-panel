@@ -123,6 +123,22 @@ def test_client_surfaces_provider_error_context(monkeypatch) -> None:
         client.fetch(collector._params(2020, 1, 1))
 
 
+def test_client_normalizes_provider_empty_result(monkeypatch) -> None:
+    def fake_urlopen(_request, *, timeout):
+        del timeout
+        return _Response(
+            {"success": False, "code": 9201, "message": "返回数据为空"}
+        )
+
+    monkeypatch.setattr(collector.urllib.request, "urlopen", fake_urlopen)
+    client = collector.EastmoneySurveyClient(min_interval=0)
+
+    payload = client.fetch(collector._params(2013, 3, 1))
+
+    assert payload["success"] is True
+    assert payload["result"] == {"count": 0, "pages": 0, "data": []}
+
+
 def test_fetch_month_reuses_valid_page_cache(tmp_path) -> None:
     calls = []
 

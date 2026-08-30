@@ -117,6 +117,17 @@ class EastmoneySurveyClient:
                 self._last_request = time.monotonic()
                 if isinstance(payload, dict) and payload.get("success") is True:
                     return payload
+                if (
+                    isinstance(payload, dict)
+                    and payload.get("code") == 9201
+                    and payload.get("message") == "返回数据为空"
+                ):
+                    return {
+                        "success": True,
+                        "code": 0,
+                        "message": "normalized empty result",
+                        "result": {"count": 0, "pages": 0, "data": []},
+                    }
                 message = str(payload.get("message") if isinstance(payload, dict) else "")
                 if "繁忙" not in message:
                     code = payload.get("code") if isinstance(payload, dict) else None
