@@ -58,6 +58,7 @@ def test_probe_requires_two_nonempty_periods() -> None:
     assert result["available"] is True
     assert result["cross_period_ready"] is True
     assert result["critical_fields_complete_in_samples"] is True
+    assert result["critical_fields_usable_in_samples"] is True
 
 
 def test_probe_distinguishes_permission_error_from_empty_period() -> None:
@@ -67,6 +68,8 @@ def test_probe_distinguishes_permission_error_from_empty_period() -> None:
 
     assert result["available"] is False
     assert result["nonempty_requests"] == 0
+    assert result["critical_fields_complete_in_samples"] is False
+    assert result["critical_fields_usable_in_samples"] is False
     assert result["samples"][0]["status"] == "error"
 
 

@@ -36,6 +36,11 @@ TRADE_DATE_REQUESTS = (
     {"trade_date": "20240131"},
     {"trade_date": "20260130"},
 )
+ANN_DATE_REQUESTS = (
+    {"ann_date": "20190131"},
+    {"ann_date": "20240131"},
+    {"ann_date": "20260130"},
+)
 
 SPECS = (
     ProbeSpec(
@@ -55,7 +60,7 @@ SPECS = (
         date_field="ann_date",
         key_fields=("ts_code", "ann_date", "end_date", "type"),
         critical_fields=("ts_code", "ann_date", "end_date", "type"),
-        requests=PERIOD_REQUESTS,
+        requests=ANN_DATE_REQUESTS,
         row_limit=3500,
     ),
     ProbeSpec(
@@ -220,12 +225,20 @@ def probe_spec(client: Any, spec: ProbeSpec) -> dict[str, Any]:
                     "error": _clean_error(error),
                 }
             )
-    critical_complete = all(
+    critical_complete = nonempty_requests > 0 and all(
         sample.get("status") == "ok"
         and all(
             rate == 0.0
             for rate in sample.get("critical_null_rates", {}).values()
             if rate is not None
+        )
+        for sample in samples
+        if sample.get("rows", 0) > 0
+    )
+    critical_usable = nonempty_requests > 0 and all(
+        all(
+            rate is None or rate <= 0.01
+            for rate in sample.get("critical_null_rates", {}).values()
         )
         for sample in samples
         if sample.get("rows", 0) > 0
@@ -237,6 +250,7 @@ def probe_spec(client: Any, spec: ProbeSpec) -> dict[str, Any]:
         "available": successful_requests == len(spec.requests),
         "cross_period_ready": nonempty_requests >= 2,
         "critical_fields_complete_in_samples": critical_complete,
+        "critical_fields_usable_in_samples": critical_usable,
         "samples": samples,
     }
 
@@ -255,7 +269,7 @@ def run(output: Path) -> dict[str, Any]:
         for probe in probes
         if probe["available"]
         and probe["cross_period_ready"]
-        and probe["critical_fields_complete_in_samples"]
+        and probe["critical_fields_usable_in_samples"]
     ]
     payload = {
         "schema_version": "p0-corporate-event-data-audit-v1",
