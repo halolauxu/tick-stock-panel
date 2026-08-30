@@ -1,4 +1,4 @@
-"""Run the frozen development-only shareholder-increase drift event study."""
+"""Run the frozen development-only block-trade price event study."""
 from __future__ import annotations
 
 import argparse
@@ -32,21 +32,20 @@ START = date(2013, 12, 1)
 DEVELOPMENT_START = date(2014, 1, 1)
 DEVELOPMENT_END = date(2020, 12, 31)
 PANEL_END = date(2021, 3, 31)
-HOLD_TRADING_DAYS = 20
-COOLDOWN_DAYS = 180
+HOLD_TRADING_DAYS = 10
+MAX_EXIT_DELAY = 20
+COOLDOWN_DAYS = 30
+MIN_NOTIONAL_CNY = 10_000_000.0
+MIN_DAILY_AMOUNT_SHARE = 0.05
+PREMIUM_THRESHOLD = 0.01
 
-CATEGORIES = (
-    "management_increase",
-    "corporate_increase",
-    "personal_increase",
-    "decrease_control",
-)
-POSITIVE_CATEGORIES = CATEGORIES[:-1]
+CATEGORIES = ("premium_block", "discount_block", "near_close_control")
+POSITIVE_CATEGORIES = CATEGORIES[:2]
 
 
-def load_holder_trades(data_dir: Path) -> pl.DataFrame:
+def load_block_trades(data_dir: Path) -> pl.DataFrame:
     paths = []
-    for path in (data_dir / "event_data" / "holder_trade").glob(
+    for path in (data_dir / "event_data" / "block_trade").glob(
         "year=*/part.parquet"
     ):
         try:
@@ -57,66 +56,61 @@ def load_holder_trades(data_dir: Path) -> pl.DataFrame:
             paths.append(path)
     expected = DEVELOPMENT_END.year - DEVELOPMENT_START.year + 1
     if len(paths) != expected:
-        raise ValueError("all 2014-2020 holder-trade yearly partitions are required")
+        raise ValueError("all 2014-2020 block-trade yearly partitions are required")
     return (
         pl.read_parquet(sorted(paths))
         .filter(
-            pl.col("ann_date").is_between(
+            pl.col("trade_date").is_between(
                 DEVELOPMENT_START, DEVELOPMENT_END, closed="both"
             )
         )
-        .sort(["ann_date", "symbol", "direction", "holder_type"])
+        .sort(["trade_date", "symbol", "price", "volume_shares"])
     )
 
 
-def aggregate_events(details: pl.DataFrame) -> pl.DataFrame:
-    is_increase = pl.col("direction") == "IN"
-    is_decrease = pl.col("direction") == "DE"
+def aggregate_events(
+    details: pl.DataFrame,
+    event_day_panel: pl.DataFrame,
+) -> pl.DataFrame:
     grouped = (
-        details.group_by("symbol", "ann_date")
+        details.group_by("symbol", "trade_date")
         .agg(
-            is_increase.any().alias("has_increase"),
-            is_decrease.any().alias("has_decrease"),
-            (is_increase & (pl.col("holder_type") == "G"))
-            .any()
-            .alias("has_management_increase"),
-            (is_increase & (pl.col("holder_type") == "C"))
-            .any()
-            .alias("has_corporate_increase"),
-            (is_increase & (pl.col("holder_type") == "P"))
-            .any()
-            .alias("has_personal_increase"),
-            pl.when(is_increase)
-            .then(pl.col("change_vol").abs())
-            .otherwise(0.0)
-            .sum()
-            .alias("increase_shares"),
-            pl.when(is_increase)
-            .then(pl.col("change_ratio").abs())
-            .otherwise(0.0)
-            .sum()
-            .alias("increase_float_ratio_pct"),
-            pl.when(is_increase)
-            .then(pl.col("change_vol").abs() * pl.col("avg_price"))
-            .otherwise(0.0)
-            .sum()
-            .alias("increase_notional_cny"),
+            pl.col("notional_cny").sum().alias("block_notional_cny"),
+            pl.col("volume_shares").sum().alias("block_volume_shares"),
+            (
+                (pl.col("price") * pl.col("volume_shares")).sum()
+                / pl.col("volume_shares").sum()
+            ).alias("block_vwap"),
             pl.len().alias("detail_rows"),
         )
-        .filter(pl.col("has_increase") != pl.col("has_decrease"))
+        .join(
+            event_day_panel.rename({"date": "trade_date"}),
+            on=["symbol", "trade_date"],
+            how="left",
+        )
         .with_columns(
-            pl.when(pl.col("has_increase") & pl.col("has_management_increase"))
-            .then(pl.lit("management_increase"))
-            .when(pl.col("has_increase") & pl.col("has_corporate_increase"))
-            .then(pl.lit("corporate_increase"))
-            .when(pl.col("has_increase") & pl.col("has_personal_increase"))
-            .then(pl.lit("personal_increase"))
-            .when(pl.col("has_decrease"))
-            .then(pl.lit("decrease_control"))
-            .otherwise(None)
+            (pl.col("block_vwap") / pl.col("event_raw_close") - 1.0).alias(
+                "discount_premium"
+            ),
+            (pl.col("block_notional_cny") / pl.col("event_daily_amount")).alias(
+                "daily_amount_share"
+            ),
+        )
+        .filter(
+            (pl.col("block_notional_cny") >= MIN_NOTIONAL_CNY)
+            & (pl.col("daily_amount_share") >= MIN_DAILY_AMOUNT_SHARE)
+            & pl.col("event_raw_close").is_not_null()
+            & (pl.col("event_raw_close") > 0)
+        )
+        .with_columns(
+            pl.when(pl.col("discount_premium") >= PREMIUM_THRESHOLD)
+            .then(pl.lit("premium_block"))
+            .when(pl.col("discount_premium") <= -PREMIUM_THRESHOLD)
+            .then(pl.lit("discount_block"))
+            .otherwise(pl.lit("near_close_control"))
             .alias("category")
         )
-        .filter(pl.col("category").is_not_null())
+        .rename({"trade_date": "ann_date"})
         .sort(["symbol", "category", "ann_date"])
     )
     last_kept: dict[tuple[str, str], date] = {}
@@ -143,15 +137,30 @@ def _json_default(value: Any) -> Any:
 
 
 def run(data_dir: Path, output: Path) -> dict[str, Any]:
-    raw_details = load_holder_trades(data_dir)
-    events = aggregate_events(raw_details)
+    raw_details = load_block_trades(data_dir)
     panel = prepare_panel(load_panel(data_dir, START, PANEL_END))
-    trades = build_trades(events, panel, HOLD_TRADING_DAYS)
-    benchmark = build_market_benchmark(panel)
+    event_day_panel = panel.select(
+        "symbol",
+        "date",
+        pl.col("raw_close").alias("event_raw_close"),
+        pl.col("amount").alias("event_daily_amount"),
+    )
+    events = aggregate_events(raw_details, event_day_panel)
+    trades = build_trades(
+        events,
+        panel,
+        holding_trading_days=HOLD_TRADING_DAYS,
+        max_exit_delay=MAX_EXIT_DELAY,
+    )
+    benchmark = build_market_benchmark(panel, HOLD_TRADING_DAYS)
     trades = attach_market_excess(trades, benchmark)
     summaries = {
         category: summarize_category(
-            trades, category, positive_categories=POSITIVE_CATEGORIES
+            trades,
+            category,
+            positive_categories=POSITIVE_CATEGORIES,
+            min_tradable_events=500,
+            min_announcement_days=200,
         )
         for category in CATEGORIES
     }
@@ -169,7 +178,7 @@ def run(data_dir: Path, output: Path) -> dict[str, Any]:
         else None
     )
     payload = {
-        "schema_version": "p0-holder-increase-development-v1",
+        "schema_version": "p0-block-trade-price-development-v1",
         "contract_frozen": "2026-08-30",
         "period": {
             "start": DEVELOPMENT_START,
@@ -179,22 +188,18 @@ def run(data_dir: Path, output: Path) -> dict[str, Any]:
         },
         "assumptions": {
             "holding_trading_days": HOLD_TRADING_DAYS,
+            "max_exit_delay": MAX_EXIT_DELAY,
             "cooldown_calendar_days": COOLDOWN_DAYS,
+            "minimum_block_notional_cny": MIN_NOTIONAL_CNY,
+            "minimum_daily_amount_share": MIN_DAILY_AMOUNT_SHARE,
+            "premium_discount_threshold": PREMIUM_THRESHOLD,
             "position_notional_cny": POSITION_NOTIONAL,
             "daily_participation_rate": DAILY_PARTICIPATION,
-            "benchmark": "same-entry-date eligible A-share 20-day median return",
+            "benchmark": "same-entry-date eligible A-share 10-day median return",
         },
         "data": {
-            "raw_holder_trade_rows": raw_details.height,
-            "aggregated_unique_events": events.height,
-            "mixed_direction_days_excluded": raw_details.select(
-                "symbol", "ann_date", "direction"
-            )
-            .unique()
-            .group_by("symbol", "ann_date")
-            .agg(pl.col("direction").n_unique().alias("directions"))
-            .filter(pl.col("directions") > 1)
-            .height,
+            "raw_block_trade_rows": raw_details.height,
+            "categorized_events": events.height,
             "panel_rows": panel.height,
             "panel_symbols": panel.get_column("symbol").n_unique(),
             "benchmark_entry_dates": benchmark.height,
@@ -207,7 +212,7 @@ def run(data_dir: Path, output: Path) -> dict[str, Any]:
             "next_step": (
                 "freeze_selected_candidate_before_validation"
                 if selected
-                else "terminate_holder_increase_mechanism"
+                else "terminate_block_trade_price_mechanism"
             ),
         },
     }
@@ -235,7 +240,7 @@ def main() -> None:
     parser.add_argument(
         "--output",
         type=Path,
-        default=Path("/app/data/research/p0_holder_increase_development.json"),
+        default=Path("/app/data/research/p0_block_trade_price_development.json"),
     )
     args = parser.parse_args()
     run(args.data_dir, args.output)

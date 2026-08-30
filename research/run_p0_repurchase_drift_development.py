@@ -116,7 +116,7 @@ def categorize_events(events: pl.DataFrame) -> pl.DataFrame:
         keep.append(accepted)
         if accepted:
             last_kept[key] = event_date
-    return categorized.filter(pl.Series("_keep", keep)).sort(
+    return categorized.filter(pl.Series("_keep", keep, dtype=pl.Boolean)).sort(
         ["ann_date", "symbol", "category"]
     )
 

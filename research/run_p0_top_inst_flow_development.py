@@ -145,7 +145,7 @@ def aggregate_events(details: pl.DataFrame) -> pl.DataFrame:
         keep.append(accepted)
         if accepted:
             last_kept[key] = event_date
-    return combined.filter(pl.Series("_keep", keep)).sort(
+    return combined.filter(pl.Series("_keep", keep, dtype=pl.Boolean)).sort(
         ["ann_date", "symbol", "category"]
     )
 
