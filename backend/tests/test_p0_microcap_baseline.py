@@ -115,3 +115,26 @@ def test_gate_requires_validation_and_stress() -> None:
 def test_compound_and_drawdown_are_path_aware() -> None:
     assert microcap._compound([0.10, -0.10]) == pytest.approx(-0.01)
     assert microcap._max_drawdown([0.10, -0.20, 0.05]) == pytest.approx(-0.20)
+
+
+def test_board_symbol_counts_covers_all_supported_boards() -> None:
+    result = microcap.board_symbol_counts(
+        pl.DataFrame(
+            {
+                "symbol": [
+                    "000001.SZ",
+                    "300001.SZ",
+                    "600000.SH",
+                    "688001.SH",
+                    "688001.SH",
+                ]
+            }
+        )
+    )
+
+    assert result == {
+        "chinext": 1,
+        "sh_main": 1,
+        "star": 1,
+        "sz_main": 1,
+    }

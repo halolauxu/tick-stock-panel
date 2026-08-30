@@ -37,6 +37,32 @@ MIN_POSITIVE_EXCESS_YEARS = 2
 SYMBOL_PATTERN = r"^(?:(?:00|30)\d{4}\.SZ|(?:60|68)\d{4}\.SH)$"
 
 
+def board_symbol_counts(frame: pl.DataFrame) -> dict[str, int]:
+    return {
+        row["board"]: row["len"]
+        for row in (
+            frame.select("symbol")
+            .unique()
+            .with_columns(
+                pl.when(pl.col("symbol").str.starts_with("00"))
+                .then(pl.lit("sz_main"))
+                .when(pl.col("symbol").str.starts_with("30"))
+                .then(pl.lit("chinext"))
+                .when(pl.col("symbol").str.starts_with("60"))
+                .then(pl.lit("sh_main"))
+                .when(pl.col("symbol").str.starts_with("68"))
+                .then(pl.lit("star"))
+                .otherwise(pl.lit("unexpected"))
+                .alias("board")
+            )
+            .group_by("board")
+            .len()
+            .sort("board")
+            .to_dicts()
+        )
+    }
+
+
 def period_expr(value: pl.Expr) -> pl.Expr:
     return (
         pl.when(value <= pl.lit(DEVELOPMENT_END))
@@ -121,8 +147,15 @@ def load_share_history(data_dir: Path) -> pl.DataFrame:
 
 def attach_point_in_time_data(panel: pl.DataFrame, data_dir: Path) -> pl.DataFrame:
     research = data_dir / "research"
+    universe_path = research / "historical_stock_universe_all_a.parquet"
+    names_path = research / "historical_stock_names_all_a.parquet"
+    if not universe_path.is_file() or not names_path.is_file():
+        raise ValueError(
+            "all-A PIT security master is required; run "
+            "collect_all_a_pit_security_master.py first"
+        )
     universe = (
-        pl.read_parquet(research / "historical_stock_universe.parquet")
+        pl.read_parquet(universe_path)
         .with_columns(
             pl.col("list_date").cast(pl.Date, strict=False),
             pl.col("delist_date").cast(pl.Date, strict=False),
@@ -130,7 +163,7 @@ def attach_point_in_time_data(panel: pl.DataFrame, data_dir: Path) -> pl.DataFra
         .select("symbol", "list_date", "delist_date")
     )
     names = (
-        pl.read_parquet(research / "historical_stock_names.parquet")
+        pl.read_parquet(names_path)
         .with_columns(
             pl.col("start_date").cast(pl.Date, strict=False),
             pl.col("end_date").cast(pl.Date, strict=False),
@@ -636,8 +669,12 @@ def run(data_dir: Path, output: Path, *, end: date | None = None) -> dict[str, A
     if source.is_empty():
         raise ValueError("no daily data")
     source_rows = source.height
+    source_symbols = source.get_column("symbol").n_unique()
+    source_board_counts = board_symbol_counts(source)
     pit = attach_point_in_time_data(source, data_dir)
     pit_rows = pit.height
+    pit_symbols = pit.get_column("symbol").n_unique()
+    pit_board_counts = board_symbol_counts(pit)
     del source
     gc.collect()
     panel = prepare_panel(pit)
@@ -645,8 +682,12 @@ def run(data_dir: Path, output: Path, *, end: date | None = None) -> dict[str, A
     gc.collect()
     data_summary = {
         "source_rows": source_rows,
+        "source_symbols": source_symbols,
+        "source_board_counts": source_board_counts,
         "pit_share_rows": pit_rows,
-        "symbols": panel.get_column("symbol").n_unique(),
+        "pit_row_retention_rate": pit_rows / source_rows,
+        "symbols": pit_symbols,
+        "pit_board_counts": pit_board_counts,
         "first_date": panel.get_column("date").min(),
         "last_date": panel.get_column("date").max(),
     }
