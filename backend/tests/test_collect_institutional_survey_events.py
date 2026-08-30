@@ -111,6 +111,18 @@ def test_client_disables_persistent_chunked_transport(monkeypatch) -> None:
     assert headers["accept-encoding"] == "identity"
 
 
+def test_client_surfaces_provider_error_context(monkeypatch) -> None:
+    def fake_urlopen(_request, *, timeout):
+        del timeout
+        return _Response({"success": False, "code": 9501, "message": "bad filter"})
+
+    monkeypatch.setattr(collector.urllib.request, "urlopen", fake_urlopen)
+    client = collector.EastmoneySurveyClient(min_interval=0)
+
+    with pytest.raises(ValueError, match=r"code=9501.*bad filter.*NOTICE_DATE"):
+        client.fetch(collector._params(2020, 1, 1))
+
+
 def test_fetch_month_reuses_valid_page_cache(tmp_path) -> None:
     calls = []
 

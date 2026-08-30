@@ -119,7 +119,12 @@ class EastmoneySurveyClient:
                     return payload
                 message = str(payload.get("message") if isinstance(payload, dict) else "")
                 if "繁忙" not in message:
-                    raise ValueError("Eastmoney survey request was not successful")
+                    code = payload.get("code") if isinstance(payload, dict) else None
+                    requested_range = params.get("filter", "")
+                    raise ValueError(
+                        "Eastmoney survey request was not successful: "
+                        f"code={code!r}, message={message!r}, filter={requested_range!r}"
+                    )
             except (
                 ConnectionError,
                 TimeoutError,
