@@ -32,19 +32,25 @@ def commission(gross: float) -> float:
     return max(MIN_COMMISSION, gross * baseline.COMMISSION_PCT)
 
 
-def affordable_shares(raw_open: float, target: float, cash: float) -> int:
+def affordable_shares(
+    raw_open: float,
+    target: float,
+    cash: float,
+    *,
+    lot_size: int = LOT_SIZE,
+) -> int:
     if raw_open <= 0 or target <= 0 or cash <= MIN_COMMISSION:
         return 0
     budget = min(target, cash - MIN_COMMISSION)
     shares = math.floor(
-        budget / (raw_open * (1.0 + baseline.SLIPPAGE_PCT)) / LOT_SIZE
-    ) * LOT_SIZE
+        budget / (raw_open * (1.0 + baseline.SLIPPAGE_PCT)) / lot_size
+    ) * lot_size
     while shares > 0:
         gross = shares * raw_open
         total = gross * (1.0 + baseline.SLIPPAGE_PCT) + commission(gross)
         if total <= cash + 1e-9:
             return shares
-        shares -= LOT_SIZE
+        shares -= lot_size
     return 0
 
 
@@ -285,6 +291,7 @@ def simulate_account(
     target_positions: int = TARGET_POSITIONS,
     action_dates: list[date] | None = None,
     stamp_tax_rate: float | None = None,
+    lot_size: int = LOT_SIZE,
 ) -> dict[str, Any]:
     candidate_groups = _partition_rows(candidates, "entry_date")
     quote_groups = _partition_rows(execution_grid, "entry_date")
@@ -411,7 +418,9 @@ def simulate_account(
                 continue
             quote = quotes.get(symbol)
             raw_open = float(quote["raw_open"]) if quote and quote.get("raw_open") else 0.0
-            shares = affordable_shares(raw_open, target_notional, cash)
+            shares = affordable_shares(
+                raw_open, target_notional, cash, lot_size=lot_size
+            )
             gross = shares * raw_open
             reason = (
                 "zero_lot_or_cash"

@@ -78,6 +78,15 @@ def test_affordable_shares_respects_lot_and_minimum_commission() -> None:
     assert account.commission(gross) == 5.0
 
 
+def test_affordable_shares_supports_convertible_bond_lot() -> None:
+    shares = account.affordable_shares(
+        100.0, 10_500.0, 10_500.0, lot_size=10
+    )
+
+    assert shares == 100
+    assert shares % 10 == 0
+
+
 def test_simulator_backfills_blocked_buy_then_sells_before_next_buy() -> None:
     d0, d1 = date(2024, 1, 5), date(2024, 1, 8)
     d2, d3 = date(2024, 1, 12), date(2024, 1, 15)
