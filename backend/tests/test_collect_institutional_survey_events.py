@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib.util
+import stat
 from datetime import date
 from pathlib import Path
 
@@ -77,3 +78,17 @@ def test_normalize_counts_unique_institutions_and_excludes_noninstitution() -> N
     assert frame["institution_count"][0] == 2
     assert frame["institution_detail_rows"][0] == 3
     assert frame["provider_sum_max"][0] == 3
+
+
+def test_collect_month_writes_world_readable_atomic_partition(tmp_path) -> None:
+    def fetch(_params):
+        return {
+            "result": {"count": 1, "pages": 1, "data": [_row("A")]},
+            "success": True,
+        }
+
+    result = collector.collect_month(fetch, tmp_path, 2020, 1)
+    path = Path(result["path"])
+
+    assert path.exists()
+    assert stat.S_IMODE(path.stat().st_mode) == 0o644

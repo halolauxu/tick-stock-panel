@@ -38,6 +38,7 @@ def _atomic_write(frame: pl.DataFrame, path: Path) -> None:
     temporary = Path(name)
     try:
         frame.write_parquet(temporary, compression="zstd", statistics=True)
+        temporary.chmod(0o644)
         os.replace(temporary, path)
     finally:
         with contextlib.suppress(FileNotFoundError):
