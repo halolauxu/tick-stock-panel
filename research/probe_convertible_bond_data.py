@@ -210,6 +210,10 @@ def run(output: Path) -> dict[str, Any]:
             if latest_rows
             else None
         )
+        sample_daily_row = next(
+            (row for row in latest_rows if row.get("ts_code") == sample_code),
+            None,
+        )
         minute_probe = (
             safe_probe(
                 lambda: client.stock_minutes(
@@ -243,6 +247,38 @@ def run(output: Path) -> dict[str, Any]:
                 (row["trade_time"] for row in minute_rows if row.get("trade_time")),
                 default=None,
             ),
+            "unit_reconciliation": {
+                "daily_volume_hands": (
+                    sample_daily_row.get("vol") if sample_daily_row else None
+                ),
+                "minute_volume_raw_sum": sum(
+                    float(row.get("vol") or 0.0) for row in minute_rows
+                ),
+                "minute_to_daily_volume_ratio": (
+                    sum(float(row.get("vol") or 0.0) for row in minute_rows)
+                    / float(sample_daily_row.get("vol") or 0.0)
+                    if minute_rows
+                    and sample_daily_row
+                    and sample_daily_row.get("vol")
+                    else None
+                ),
+                "daily_amount_cny": (
+                    float(sample_daily_row.get("amount") or 0.0) * 10_000.0
+                    if sample_daily_row
+                    else None
+                ),
+                "minute_amount_raw_sum": sum(
+                    float(row.get("amount") or 0.0) for row in minute_rows
+                ),
+                "minute_to_daily_amount_ratio": (
+                    sum(float(row.get("amount") or 0.0) for row in minute_rows)
+                    / (float(sample_daily_row.get("amount") or 0.0) * 10_000.0)
+                    if minute_rows
+                    and sample_daily_row
+                    and sample_daily_row.get("amount")
+                    else None
+                ),
+            },
         }
 
         price_probe = (
