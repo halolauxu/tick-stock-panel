@@ -38,13 +38,13 @@ def test_run_marks_all_three_sources_ready(tmp_path):
     assert result["decision"]["ready_for_bounded_collection"] == [
         "moneyflow",
         "margin_detail",
-        "stk_auction",
+        "stk_auction_o",
     ]
     assert output.is_file()
 
 
 def test_specs_use_distinct_auction_dates():
-    auction = next(spec for spec in probe.SPECS if spec.api_name == "stk_auction")
+    auction = next(spec for spec in probe.SPECS if spec.api_name == "stk_auction_o")
 
     assert auction.requests == probe.AUCTION_DATES
     assert auction.requests != probe.FLOW_DATES
