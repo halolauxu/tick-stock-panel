@@ -190,7 +190,11 @@ def _cluster_t(frame: pl.DataFrame, column: str) -> float | None:
     return mean / (standard_deviation / math.sqrt(daily.height))
 
 
-def summarize_category(trades: pl.DataFrame, category: str) -> dict[str, Any]:
+def summarize_category(
+    trades: pl.DataFrame,
+    category: str,
+    positive_categories: tuple[str, ...] = POSITIVE_CATEGORIES,
+) -> dict[str, Any]:
     scoped = trades.filter(pl.col("category") == category)
     eligible = scoped.filter(pl.col("universe_eligible"))
     tradable = scoped.filter(pl.col("tradable"))
@@ -258,7 +262,7 @@ def summarize_category(trades: pl.DataFrame, category: str) -> dict[str, Any]:
         "yearly": yearly.to_dicts(),
     }
     result["promotion_passed"] = bool(
-        category in POSITIVE_CATEGORIES
+        category in positive_categories
         and result["tradable_events"] >= 300
         and result["announcement_days"] >= 150
         and result["tradable_rate"] >= 0.90
