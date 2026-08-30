@@ -332,6 +332,7 @@ def build_trades(
     events: pl.DataFrame,
     panel: pl.DataFrame,
     holding_trading_days: int = HOLD_TRADING_DAYS,
+    max_exit_delay: int = MAX_EXIT_DELAY,
 ) -> pl.DataFrame:
     work = map_entry_indices(events, panel, holding_trading_days)
     work = work.join(
@@ -343,7 +344,7 @@ def build_trades(
         on=["symbol", "trade_index"],
         how="left",
     )
-    for delay in range(MAX_EXIT_DELAY + 1):
+    for delay in range(max_exit_delay + 1):
         index_name = f"exit_index_{delay}"
         work = work.with_columns(
             (pl.col("planned_exit_index") + delay).alias(index_name)
@@ -376,7 +377,7 @@ def build_trades(
         )
     )
     sellable = []
-    for delay in range(MAX_EXIT_DELAY + 1):
+    for delay in range(max_exit_delay + 1):
         prefix = f"exit_{delay}"
         sealed_down = (
             (
@@ -408,13 +409,13 @@ def build_trades(
     exit_date = pl.coalesce(
         [
             pl.when(pl.col("exit_delay") == delay).then(pl.col(f"exit_{delay}_date"))
-            for delay in range(MAX_EXIT_DELAY + 1)
+            for delay in range(max_exit_delay + 1)
         ]
     )
     exit_open = pl.coalesce(
         [
             pl.when(pl.col("exit_delay") == delay).then(pl.col(f"exit_{delay}_open"))
-            for delay in range(MAX_EXIT_DELAY + 1)
+            for delay in range(max_exit_delay + 1)
         ]
     )
     return (
