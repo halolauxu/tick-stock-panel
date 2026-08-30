@@ -197,6 +197,31 @@ def simulate_account(
         (row["date"], row["contract"]): row
         for row in contract_daily.to_dicts()
     }
+    price_limit_locks: dict[tuple[date, str], str] = {}
+    lock_columns = {"open", "high", "low", "close", "settle"}
+    if lock_columns.issubset(contract_daily.columns):
+        lock_rows = (
+            contract_daily.sort(["contract", "date"])
+            .with_columns(
+                pl.col("settle")
+                .shift(1)
+                .over("contract")
+                .alias("previous_settle")
+            )
+            .filter(
+                pl.col("previous_settle").is_not_null()
+                & (pl.col("open") == pl.col("high"))
+                & (pl.col("open") == pl.col("low"))
+                & (pl.col("open") == pl.col("close"))
+            )
+            .select("date", "contract", "open", "previous_settle")
+            .to_dicts()
+        )
+        for row in lock_rows:
+            if row["open"] > row["previous_settle"]:
+                price_limit_locks[(row["date"], row["contract"])] = "UP"
+            elif row["open"] < row["previous_settle"]:
+                price_limit_locks[(row["date"], row["contract"])] = "DOWN"
     unit_by_contract = {
         row["contract"]: float(row["per_unit"])
         for row in contracts.select("contract", "per_unit").to_dicts()
@@ -221,7 +246,16 @@ def simulate_account(
         if delta == 0:
             return True, 0.0
         capacity = max(0, math.floor(volume * DAILY_PARTICIPATION))
-        filled = abs(delta) <= capacity
+        lock = price_limit_locks.get((day, contract))
+        if delta > 0 and lock == "UP":
+            status = "REJECTED_LIMIT_UP_LOCK"
+        elif delta < 0 and lock == "DOWN":
+            status = "REJECTED_LIMIT_DOWN_LOCK"
+        elif abs(delta) > capacity:
+            status = "REJECTED_CAPACITY"
+        else:
+            status = "FILLED"
+        filled = status == "FILLED"
         notional = abs(delta) * price * unit
         orders.append(
             {
@@ -230,7 +264,7 @@ def simulate_account(
                 "contract": contract,
                 "delta": delta,
                 "reason": reason,
-                "status": "FILLED" if filled else "REJECTED_CAPACITY",
+                "status": status,
                 "notional": notional,
                 "capacity_contracts": capacity,
             }
@@ -636,6 +670,7 @@ def run(data_dir: Path, output: Path) -> dict[str, Any]:
             "commission_pct": COMMISSION_PCT,
             "slippage_pct": SLIPPAGE_PCT,
             "daily_participation": DAILY_PARTICIPATION,
+            "price_limit_mode": "conservative_full_day_one_price_lock_proxy",
         },
         "data": {
             "series": panel["series"].n_unique(),

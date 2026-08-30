@@ -101,6 +101,52 @@ def test_failed_roll_close_does_not_open_or_overwrite_new_contract() -> None:
     assert result["execution"]["rejections"] == {"REJECTED_CAPACITY": 2}
 
 
+def test_one_price_limit_up_session_rejects_buy() -> None:
+    previous = date(2020, 1, 2)
+    locked = date(2020, 1, 3)
+    signals = pl.DataFrame(
+        {
+            "entry_date": [locked],
+            "series": ["M.DCE"],
+            "target_weight": [1.0],
+        }
+    )
+    mapping = pl.DataFrame(
+        {
+            "date": [previous, locked],
+            "series": ["M.DCE", "M.DCE"],
+            "contract": ["M2005.DCE", "M2005.DCE"],
+        }
+    )
+    contract_daily = pl.DataFrame(
+        {
+            "date": [previous, locked],
+            "contract": ["M2005.DCE", "M2005.DCE"],
+            "open": [100.0, 110.0],
+            "high": [101.0, 110.0],
+            "low": [99.0, 110.0],
+            "close": [100.0, 110.0],
+            "settle": [100.0, 110.0],
+            "volume": [1_000.0, 1_000.0],
+        }
+    )
+    contracts = pl.DataFrame({"contract": ["M2005.DCE"], "per_unit": [1.0]})
+
+    result = study.simulate_account(
+        signals,
+        mapping,
+        contract_daily,
+        contracts,
+        [previous, locked],
+        1_000.0,
+    )
+
+    assert result["execution"]["rejections"] == {
+        "REJECTED_LIMIT_UP_LOCK": 1
+    }
+    assert result["integrity"]["ending_positions"] == 0
+
+
 def test_gate_requires_both_capital_accounts() -> None:
     def account(annualized: float) -> dict:
         return {

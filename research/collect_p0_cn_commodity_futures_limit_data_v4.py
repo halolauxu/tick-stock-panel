@@ -16,7 +16,7 @@ sys.path.insert(0, str(ROOT / "backend"))
 sys.path.insert(0, str(RESEARCH))
 
 from app import secrets_store  # noqa: E402
-from app.plugins.tushare.client import TushareClient  # noqa: E402
+from app.plugins.tushare.client import TushareClient, TushareError  # noqa: E402
 
 import collect_p0_cn_commodity_futures_data as v2  # noqa: E402
 
@@ -77,25 +77,53 @@ def collect(data_dir: Path, output: Path) -> dict[str, Any]:
     client = TushareClient(token)
     rows: list[dict[str, Any]] = []
     try:
-        for series_index, series in enumerate(v2.SERIES, start=1):
-            product = series.split(".", 1)[0]
-            for year in range(v2.START.year, v2.END.year + 1):
-                rows.extend(
-                    client.query(
-                        "ft_limit",
-                        {
-                            "cont": product,
-                            "start_date": f"{year}0101",
-                            "end_date": f"{year}1231",
-                        },
-                        LIMIT_FIELDS,
+        try:
+            for series_index, series in enumerate(v2.SERIES, start=1):
+                product = series.split(".", 1)[0]
+                for year in range(v2.START.year, v2.END.year + 1):
+                    rows.extend(
+                        client.query(
+                            "ft_limit",
+                            {
+                                "cont": product,
+                                "start_date": f"{year}0101",
+                                "end_date": f"{year}1231",
+                            },
+                            LIMIT_FIELDS,
+                        )
                     )
+                print(
+                    f"futures_limit_progress={series_index}/{len(v2.SERIES)} "
+                    f"series={series} rows={len(rows)}",
+                    flush=True,
                 )
+        except TushareError as exc:
+            if "code=40203" not in str(exc):
+                raise
+            payload = {
+                "schema_version": "p0-cn-commodity-futures-limit-data-v4",
+                "contract_frozen": "2026-08-30",
+                "period": {
+                    "start": v2.START,
+                    "end": v2.END,
+                    "validation_returns_read": False,
+                },
+                "status": "DATA_PERMISSION_BLOCKED",
+                "counts": {"limit_rows": 0},
+                "checks": {"ft_limit_permission_available": False},
+                "blocker": "TUSHARE_FT_LIMIT_PERMISSION_REQUIRED",
+            }
+            output.parent.mkdir(parents=True, exist_ok=True)
+            output.write_text(
+                json.dumps(payload, ensure_ascii=False, indent=2, default=str),
+                encoding="utf-8",
+            )
+            payload["sha256"] = hashlib.sha256(output.read_bytes()).hexdigest()
             print(
-                f"futures_limit_progress={series_index}/{len(v2.SERIES)} "
-                f"series={series} rows={len(rows)}",
+                json.dumps(payload, ensure_ascii=False, indent=2, default=str),
                 flush=True,
             )
+            return payload
     finally:
         client.close()
 
