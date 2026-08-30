@@ -32,6 +32,21 @@ MAX_PAGES = 2_000
 # around the 10,000-row boundary. Split oversized months before that boundary.
 SOURCE_PAGE_LIMIT = 200
 MIN_INTERVAL_SECONDS = 1.0
+EVENT_SCHEMA = {
+    "event_id": pl.String,
+    "notice_date": pl.Date,
+    "symbol": pl.String,
+    "institution_count": pl.UInt32,
+    "survey_session_count": pl.UInt32,
+    "institution_detail_rows": pl.UInt32,
+    "provider_sum_max": pl.Int64,
+    "org_types": pl.String,
+    "source_url": pl.String,
+}
+
+
+def _empty_events() -> pl.DataFrame:
+    return pl.DataFrame(schema=EVENT_SCHEMA)
 
 
 def _atomic_write(frame: pl.DataFrame, path: Path) -> None:
@@ -365,7 +380,7 @@ def normalize(rows: list[dict[str, Any]], year: int, month: int) -> pl.DataFrame
             }
         )
     if not normalized:
-        return pl.DataFrame()
+        return _empty_events()
     frame = pl.DataFrame(normalized, infer_schema_length=None).with_columns(
         pl.col("notice_date").str.to_date("%Y-%m-%d", strict=False),
         pl.col("receive_start_date").str.to_date("%Y-%m-%d", strict=False),
@@ -381,7 +396,7 @@ def normalize(rows: list[dict[str, Any]], year: int, month: int) -> pl.DataFrame
         )
     )
     if frame.is_empty():
-        return pl.DataFrame()
+        return _empty_events()
     return (
         frame.group_by("symbol", "notice_date")
         .agg(
@@ -421,8 +436,6 @@ def collect_month(fetch_json, root: Path, year: int, month: int) -> dict[str, An
     cache_dir = root / "_page_cache" / f"year={year}" / f"month={month:02d}"
     rows = fetch_month(fetch_json, year, month, cache_dir=cache_dir)
     frame = normalize(rows, year, month)
-    if frame.is_empty():
-        raise ValueError(f"institutional survey returned no events for {year}-{month:02d}")
     path = root / f"year={year}" / f"month={month:02d}" / "part.parquet"
     _atomic_write(frame, path)
     return {

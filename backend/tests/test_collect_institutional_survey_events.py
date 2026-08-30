@@ -195,3 +195,18 @@ def test_collect_month_writes_world_readable_atomic_partition(tmp_path) -> None:
 
     assert path.exists()
     assert stat.S_IMODE(path.stat().st_mode) == 0o644
+
+
+def test_collect_month_persists_auditable_empty_partition(tmp_path) -> None:
+    def fetch(_params):
+        return {
+            "result": {"count": 0, "pages": 0, "data": []},
+            "success": True,
+        }
+
+    result = collector.collect_month(fetch, tmp_path, 2013, 6)
+    frame = collector.pl.read_parquet(result["path"])
+
+    assert result["raw_rows"] == result["events"] == result["symbols"] == 0
+    assert result["first_notice_date"] is None
+    assert frame.schema == collector.EVENT_SCHEMA
