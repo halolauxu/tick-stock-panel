@@ -117,9 +117,16 @@ def test_gate_requires_both_capital_accounts() -> None:
             },
         }
 
-    accounts = {"cny_200k": account(0.60), "cny_1m": account(0.55)}
+    accounts = {
+        "cny_200k": account(0.60),
+        "cny_300k": account(0.58),
+        "cny_500k": account(0.56),
+        "cny_1m": account(0.55),
+    }
     benchmark = {"annualized": 0.20}
 
     assert study.evaluate_gate(accounts, benchmark)["passed"] is True
     accounts["cny_1m"] = account(0.49)
+    assert study.evaluate_gate(accounts, benchmark)["passed"] is False
+    del accounts["cny_300k"]
     assert study.evaluate_gate(accounts, benchmark)["passed"] is False

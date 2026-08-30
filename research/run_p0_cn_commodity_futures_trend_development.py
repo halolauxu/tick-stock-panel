@@ -15,7 +15,12 @@ import polars as pl
 DEVELOPMENT_START = date(2014, 1, 1)
 DEVELOPMENT_END = date(2020, 12, 31)
 BASE_CASH = 200_000.0
-CAPACITY_CASH = 1_000_000.0
+CAPITAL_LEVELS = {
+    "cny_200k": BASE_CASH,
+    "cny_300k": 300_000.0,
+    "cny_500k": 500_000.0,
+    "cny_1m": 1_000_000.0,
+}
 MOMENTUM_DAYS = 252
 VOLATILITY_DAYS = 20
 VOLATILITY_FLOOR = 0.005
@@ -528,7 +533,9 @@ def benchmark_metrics(panel: pl.DataFrame) -> dict[str, Any]:
 def evaluate_gate(
     accounts: dict[str, dict[str, Any]], benchmark: dict[str, Any]
 ) -> dict[str, Any]:
-    checks: dict[str, bool] = {}
+    checks: dict[str, bool] = {
+        "all_frozen_capital_levels_present": set(accounts) == set(CAPITAL_LEVELS)
+    }
     for name, result in accounts.items():
         metrics = result["metrics"]
         annual = metrics.get("annualized")
@@ -594,26 +601,17 @@ def run(data_dir: Path, output: Path) -> dict[str, Any]:
     signals = build_signals(panel, schedule)
     all_dates = panel["date"].unique().sort().to_list()
     accounts = {
-        "cny_200k": summarize_account(
+        name: summarize_account(
             simulate_account(
                 signals,
                 mapping,
                 contract_daily,
                 contracts,
                 all_dates,
-                BASE_CASH,
+                cash,
             )
-        ),
-        "cny_1m": summarize_account(
-            simulate_account(
-                signals,
-                mapping,
-                contract_daily,
-                contracts,
-                all_dates,
-                CAPACITY_CASH,
-            )
-        ),
+        )
+        for name, cash in CAPITAL_LEVELS.items()
     }
     benchmark = benchmark_metrics(panel)
     decision = evaluate_gate(accounts, benchmark)
@@ -628,7 +626,7 @@ def run(data_dir: Path, output: Path) -> dict[str, Any]:
         },
         "assumptions": {
             "base_cash_cny": BASE_CASH,
-            "capacity_cash_cny": CAPACITY_CASH,
+            "capital_levels_cny": CAPITAL_LEVELS,
             "momentum_days": MOMENTUM_DAYS,
             "volatility_days": VOLATILITY_DAYS,
             "volatility_floor": VOLATILITY_FLOOR,
