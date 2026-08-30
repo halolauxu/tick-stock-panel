@@ -91,6 +91,25 @@ def evaluate_result(stats: dict[str, Any]) -> dict[str, Any]:
     return {"passed": all(checks.values()), "checks": checks}
 
 
+def _json_default(value: Any) -> Any:
+    if isinstance(value, date):
+        return value.isoformat()
+    raise TypeError(f"unsupported JSON value: {type(value).__name__}")
+
+
+def _write_json(path: Path, payload: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps(
+            payload,
+            ensure_ascii=False,
+            indent=2,
+            default=_json_default,
+        ),
+        encoding="utf-8",
+    )
+
+
 def build_service(
     data_dir: Path, research_dir: Path
 ) -> tuple[StrategyEngine, StrategyBacktestService]:
@@ -125,6 +144,7 @@ def run(data_dir: Path, research_dir: Path, output: Path) -> dict[str, Any]:
     results: dict[str, Any] = {}
     promoted = []
     pit_context: dict[str, Any] | None = None
+    checkpoint = output.with_suffix(".partial.json")
     for strategy_id, config in zip(strategy_ids, configs, strict=True):
         loader = common._prepared(service, [config])
         prepared = None
@@ -151,6 +171,23 @@ def run(data_dir: Path, research_dir: Path, output: Path) -> dict[str, Any]:
             results[strategy_id] = {"stats": stats, "decision": decision}
             if decision["passed"]:
                 promoted.append(strategy_id)
+            _write_json(
+                checkpoint,
+                {
+                    "schema_version": (
+                        "p0-builtin-strategy-development-screen-checkpoint-v1"
+                    ),
+                    "contract_frozen": "2026-08-30",
+                    "period": {
+                        "start": DEVELOPMENT_START,
+                        "end": DEVELOPMENT_END,
+                        "validation_read": False,
+                        "known_stress_read": False,
+                    },
+                    "completed_strategy_ids": list(results),
+                    "results": results,
+                },
+            )
         finally:
             if prepared is not None:
                 prepared.compute_cache.close()
@@ -176,10 +213,7 @@ def run(data_dir: Path, research_dir: Path, output: Path) -> dict[str, Any]:
         "promoted_to_independent_validation": promoted,
         "strict_qualified_count": 0,
     }
-    output.parent.mkdir(parents=True, exist_ok=True)
-    output.write_text(
-        json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8"
-    )
+    _write_json(output, payload)
     digest = hashlib.sha256(output.read_bytes()).hexdigest()
     print(
         json.dumps(
@@ -189,10 +223,11 @@ def run(data_dir: Path, research_dir: Path, output: Path) -> dict[str, Any]:
                 "promoted_to_independent_validation": promoted,
                 "output": str(output),
                 "sha256": digest,
-            },
-            ensure_ascii=False,
-            indent=2,
-        ),
+                },
+                ensure_ascii=False,
+                indent=2,
+                default=_json_default,
+            ),
         flush=True,
     )
     return payload

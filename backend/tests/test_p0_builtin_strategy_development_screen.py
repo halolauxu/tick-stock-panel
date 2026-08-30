@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib.util
+from datetime import date
 from pathlib import Path
 
 SCRIPT = (
@@ -69,3 +70,13 @@ def test_screen_gate_requires_return_risk_quality_and_sample_size() -> None:
 
     assert passed["passed"] is True
     assert failed["passed"] is False
+
+
+def test_json_writer_serializes_point_in_time_dates(tmp_path: Path) -> None:
+    output = tmp_path / "result.json"
+
+    study._write_json(output, {"last_date": date(2020, 12, 31)})
+
+    assert output.read_text(encoding="utf-8").strip().endswith(
+        '"2020-12-31"\n}'
+    )
