@@ -53,6 +53,7 @@ def _synthetic_panel(*, entry_open_limit: bool, exit_open_limit_down: bool) -> p
             "_global_index": [0, 1, 2, 3],
             "open": raw_opens,
             "raw_open": raw_opens,
+            "raw_close": [10.0, 10.0, 9.0, 11.0],
             "close": [10.0, 10.0, 9.0, 11.0],
             "volume": [100.0] * 4,
             "amount": [20_000_000.0] * 4,

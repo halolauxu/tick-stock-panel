@@ -85,7 +85,12 @@ def historical_stamp_tax_expr(value: pl.Expr) -> pl.Expr:
     )
 
 
-def load_daily_panel(data_dir: Path, end: date | None = None) -> pl.DataFrame:
+def load_daily_panel(
+    data_dir: Path,
+    end: date | None = None,
+    *,
+    start: date = START,
+) -> pl.DataFrame:
     paths = sorted((data_dir / "kline_daily_enriched").glob("date=*/part.parquet"))
     if not paths:
         return pl.DataFrame()
@@ -105,7 +110,7 @@ def load_daily_panel(data_dir: Path, end: date | None = None) -> pl.DataFrame:
             "raw_low",
         )
         .filter(
-            (pl.col("date") >= pl.lit(START))
+            (pl.col("date") >= pl.lit(start))
             & pl.col("symbol").str.contains(MAIN_BOARD_PATTERN)
         )
     )
@@ -271,6 +276,7 @@ def prepare_market_panel(panel: pl.DataFrame) -> pl.DataFrame:
         "_is_excluded",
         "open",
         "close",
+        "raw_close",
         "raw_open",
         "volume",
         "amount",
@@ -420,6 +426,7 @@ def build_events(panel: pl.DataFrame, daily: pl.DataFrame) -> pl.DataFrame:
             "name",
             "_global_index",
             "close",
+            pl.col("raw_close").alias("signal_raw_close"),
             pl.col("amount").alias("signal_day_amount"),
             "event_type",
         )
@@ -457,6 +464,7 @@ def attach_event_outcomes(
         pl.col("_global_index").alias("_target_index"),
         "date",
         "open",
+        "raw_close",
         "raw_open",
         "volume",
         "amount",
@@ -480,6 +488,7 @@ def attach_event_outcomes(
         "_event_id",
         pl.col("date").alias("entry_date"),
         pl.col("open").alias("entry_price"),
+        pl.col("raw_close").alias("entry_raw_close"),
         pl.col("raw_open").alias("entry_raw_price"),
         pl.col("volume").alias("entry_volume"),
         pl.col("amount").alias("entry_day_amount"),
@@ -543,6 +552,7 @@ def attach_event_outcomes(
             .group_by("_event_id", maintain_order=True)
             .agg(
                 pl.col("open").first().alias(f"exit_price_h{hold}"),
+                pl.col("raw_open").first().alias(f"exit_raw_price_h{hold}"),
                 pl.col("date").first().alias(f"exit_date_h{hold}"),
                 pl.col("_offset").first().cast(pl.Int32).alias(f"exit_offset_h{hold}"),
             )
@@ -952,6 +962,7 @@ def run(data_dir: Path, output: Path, *, end: date | None = None) -> dict[str, A
         "date",
         "_global_index",
         "open",
+        "raw_close",
         "raw_open",
         "volume",
         "amount",
