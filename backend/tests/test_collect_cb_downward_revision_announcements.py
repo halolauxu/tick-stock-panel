@@ -60,3 +60,20 @@ def test_fetch_year_accepts_cninfo_off_by_one_page_count() -> None:
         }
 
     assert len(collector.fetch_year(fetch, 2020)) == 31
+
+
+def test_collect_year_records_empty_year_without_fabricating_partition(
+    tmp_path: Path,
+) -> None:
+    def fetch(_payload: dict[str, str]) -> dict:
+        return {
+            "announcements": [],
+            "totalAnnouncement": 0,
+            "totalpages": 0,
+        }
+
+    result = collector.collect_year(fetch, tmp_path, 2017)
+
+    assert result["events"] == 0
+    assert result["path"] is None
+    assert list(tmp_path.rglob("*.parquet")) == []

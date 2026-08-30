@@ -117,7 +117,17 @@ def collect_year(fetch_json, root: Path, year: int) -> dict[str, Any]:
     rows = fetch_year(fetch_json, year)
     frame = normalize(rows, year)
     if frame.is_empty():
-        raise ValueError(f"CNInfo returned no usable downward revisions for {year}")
+        return {
+            "year": year,
+            "path": None,
+            "raw_rows": len(rows),
+            "events": 0,
+            "symbols": 0,
+            "announcement_days": 0,
+            "by_phase": {},
+            "first_ann_date": None,
+            "last_ann_date": None,
+        }
     path = root / f"year={year}" / "part.parquet"
     _atomic_write(frame, path)
     by_phase = {
