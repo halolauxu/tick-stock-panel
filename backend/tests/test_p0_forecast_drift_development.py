@@ -136,3 +136,41 @@ def test_trade_builder_executes_next_open_and_fixed_ten_day_exit() -> None:
     assert result["exit_delay"][0] == 0
     assert result["tradable"][0] is True
     assert result["net_return"][0] < 0
+
+
+def test_suspended_entry_remains_in_execution_denominator() -> None:
+    start = date(2020, 1, 1)
+    dates = [start + timedelta(days=offset) for offset in range(20)]
+    base = {
+        "symbol": ["A"] * len(dates),
+        "date": dates,
+        "trade_index": list(range(len(dates))),
+        "raw_open": [100.0] * len(dates),
+        "raw_high": [101.0] * len(dates),
+        "raw_low": [99.0] * len(dates),
+        "raw_close": [100.0] * len(dates),
+        "open": [100.0] * len(dates),
+        "amount": [50_000_000.0] * len(dates),
+        "volume": [1_000.0] * len(dates),
+        "excluded_name": [False] * len(dates),
+        "limit_up_price": [110.0] * len(dates),
+        "limit_down_price": [90.0] * len(dates),
+    }
+    panel = pl.DataFrame(base)
+    suspended_prior = panel.filter(pl.col("trade_index") == 1).with_columns(
+        pl.lit("B").alias("symbol")
+    )
+    panel = pl.concat([panel, suspended_prior])
+    events = pl.DataFrame(
+        {
+            "symbol": ["B"],
+            "ann_date": [date(2020, 1, 2)],
+            "category": ["turnaround"],
+        }
+    )
+
+    result = study.build_trades(events, panel)
+
+    assert result["universe_eligible"][0] is True
+    assert result["entry_valid"][0] is False
+    assert result["tradable"][0] is False

@@ -341,9 +341,7 @@ def build_trades(events: pl.DataFrame, panel: pl.DataFrame) -> pl.DataFrame:
 
     universe_eligible = (
         pl.col("prior_date").is_not_null()
-        & pl.col("entry_date").is_not_null()
         & ~pl.col("prior_excluded_name").fill_null(True)
-        & ~pl.col("entry_excluded_name").fill_null(True)
         & pl.col("prior_raw_close").is_between(3.0, 300.0, closed="both")
         & (pl.col("prior_amount") >= 20_000_000.0)
     )
@@ -353,6 +351,8 @@ def build_trades(events: pl.DataFrame, panel: pl.DataFrame) -> pl.DataFrame:
     ).fill_null(True)
     entry_valid = (
         universe_eligible
+        & pl.col("entry_date").is_not_null()
+        & ~pl.col("entry_excluded_name").fill_null(True)
         & (pl.col("entry_volume").fill_null(0) > 0)
         & (pl.col("entry_open").fill_null(0) > 0)
         & ~entry_sealed
