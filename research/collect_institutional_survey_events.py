@@ -28,6 +28,9 @@ REPORT_NAME = "RPT_ORG_SURVEY"
 # repeated "server busy" responses.
 PAGE_SIZE = 50
 MAX_PAGES = 2_000
+# The endpoint reports deeper page counts but consistently returns code 9701
+# around the 10,000-row boundary. Split oversized months before that boundary.
+SOURCE_PAGE_LIMIT = 200
 MIN_INTERVAL_SECONDS = 1.0
 
 
@@ -116,8 +119,7 @@ def _month_bounds(year: int, month: int) -> tuple[date, date]:
     return date(year, month, 1), date(year, month, monthrange(year, month)[1])
 
 
-def _params(year: int, month: int, page: int) -> dict[str, str]:
-    start, end = _month_bounds(year, month)
+def _range_params(start: date, end: date, page: int) -> dict[str, str]:
     return {
         "reportName": REPORT_NAME,
         "columns": (
@@ -136,6 +138,11 @@ def _params(year: int, month: int, page: int) -> dict[str, str]:
         "source": "WEB",
         "client": "WEB",
     }
+
+
+def _params(year: int, month: int, page: int) -> dict[str, str]:
+    start, end = _month_bounds(year, month)
+    return _range_params(start, end, page)
 
 
 def _page_rows(payload: dict[str, Any]) -> tuple[list[dict[str, Any]], int, int]:
@@ -209,16 +216,21 @@ def _read_page_cache(
     return [dict(row) for row in rows] if len(rows) == expected_rows else None
 
 
-def fetch_month(
+def _fetch_bounded_range(
     fetch_json,
     year: int,
     month: int,
+    start: date,
+    end: date,
     *,
     cache_dir: Path | None = None,
+    first_page: tuple[list[dict[str, Any]], int, int] | None = None,
 ) -> list[dict[str, Any]]:
-    first, count, pages = _page_rows(fetch_json(_params(year, month, 1)))
+    first, count, pages = first_page or _page_rows(
+        fetch_json(_range_params(start, end, 1))
+    )
     expected_pages = math.ceil(count / PAGE_SIZE) if count else 0
-    if pages != expected_pages or pages > MAX_PAGES:
+    if pages != expected_pages or pages > SOURCE_PAGE_LIMIT:
         raise ValueError("Eastmoney survey page count is inconsistent")
     if cache_dir is not None:
         _write_page_cache(
@@ -246,7 +258,7 @@ def fetch_month(
         )
         if current is None:
             current, current_count, current_pages = _page_rows(
-                fetch_json(_params(year, month, page))
+                fetch_json(_range_params(start, end, page))
             )
             if current_count != count or current_pages != pages:
                 raise ValueError("Eastmoney survey pagination changed during collection")
@@ -263,6 +275,55 @@ def fetch_month(
         rows.extend(current)
     if len(rows) != count:
         raise ValueError(f"survey pagination incomplete: expected {count}, got {len(rows)}")
+    return rows
+
+
+def fetch_month(
+    fetch_json,
+    year: int,
+    month: int,
+    *,
+    cache_dir: Path | None = None,
+) -> list[dict[str, Any]]:
+    start, end = _month_bounds(year, month)
+    first_page = _page_rows(fetch_json(_range_params(start, end, 1)))
+    _, count, pages = first_page
+    expected_pages = math.ceil(count / PAGE_SIZE) if count else 0
+    if pages != expected_pages or pages > MAX_PAGES:
+        raise ValueError("Eastmoney survey month count is inconsistent")
+    if pages <= SOURCE_PAGE_LIMIT:
+        return _fetch_bounded_range(
+            fetch_json,
+            year,
+            month,
+            start,
+            end,
+            cache_dir=cache_dir,
+            first_page=first_page,
+        )
+
+    rows: list[dict[str, Any]] = []
+    for day_number in range(1, end.day + 1):
+        current_date = date(year, month, day_number)
+        day_cache = (
+            cache_dir / f"day={current_date.isoformat()}"
+            if cache_dir is not None
+            else None
+        )
+        rows.extend(
+            _fetch_bounded_range(
+                fetch_json,
+                year,
+                month,
+                current_date,
+                current_date,
+                cache_dir=day_cache,
+            )
+        )
+    if len(rows) != count:
+        raise ValueError(
+            f"survey daily shards incomplete: expected {count}, got {len(rows)}"
+        )
     return rows
 
 

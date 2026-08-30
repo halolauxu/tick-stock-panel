@@ -99,6 +99,44 @@ def test_fetch_month_reuses_valid_page_cache(tmp_path) -> None:
     assert calls == ["1"]
 
 
+def test_fetch_month_splits_source_deep_pagination_into_daily_shards(
+    monkeypatch, tmp_path
+) -> None:
+    monkeypatch.setattr(collector, "SOURCE_PAGE_LIMIT", 2)
+
+    def fetch(params):
+        filter_value = params["filter"]
+        page = int(params["pageNumber"])
+        if "2020-01-01')(NOTICE_DATE<='2020-01-31" in filter_value:
+            return {
+                "result": {"count": 101, "pages": 3, "data": [_row("month")] * 50},
+                "success": True,
+            }
+        if "2020-01-01')(NOTICE_DATE<='2020-01-01" in filter_value:
+            rows = [_row(f"day1-{page}-{index}") for index in range(50)]
+            if page == 2:
+                rows = rows[:1]
+            return {
+                "result": {"count": 51, "pages": 2, "data": rows},
+                "success": True,
+            }
+        if "2020-01-02')(NOTICE_DATE<='2020-01-02" in filter_value:
+            return {
+                "result": {
+                    "count": 50,
+                    "pages": 1,
+                    "data": [_row(f"day2-{index}") for index in range(50)],
+                },
+                "success": True,
+            }
+        return {"result": {"count": 0, "pages": 0, "data": []}, "success": True}
+
+    rows = collector.fetch_month(fetch, 2020, 1, cache_dir=tmp_path)
+
+    assert len(rows) == 101
+    assert (tmp_path / "day=2020-01-01" / "page=0002.json").is_file()
+
+
 def test_normalize_counts_unique_institutions_and_excludes_noninstitution() -> None:
     rows = [_row("A"), _row("A"), _row("B"), _row("person", object_type="002")]
 
