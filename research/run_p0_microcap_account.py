@@ -283,6 +283,7 @@ def simulate_account(
     *,
     initial_cash: float = INITIAL_CASH,
     target_positions: int = TARGET_POSITIONS,
+    action_dates: list[date] | None = None,
 ) -> dict[str, Any]:
     candidate_groups = _partition_rows(candidates, "entry_date")
     quote_groups = _partition_rows(execution_grid, "entry_date")
@@ -296,10 +297,14 @@ def simulate_account(
     position_id = 0
     max_cash_error = 0.0
 
-    for entry_date in sorted(candidate_groups):
-        candidate_rows = candidate_groups[entry_date].sort(
-            ["cap_rank", "symbol"]
-        ).to_dicts()
+    scheduled_dates = action_dates or sorted(candidate_groups)
+    for entry_date in scheduled_dates:
+        candidate_frame = candidate_groups.get(entry_date)
+        candidate_rows = (
+            candidate_frame.sort(["cap_rank", "symbol"]).to_dicts()
+            if candidate_frame is not None
+            else []
+        )
         quote_frame = quote_groups.get(entry_date, pl.DataFrame())
         quotes = {
             row["symbol"]: row
