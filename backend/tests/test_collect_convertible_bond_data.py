@@ -74,6 +74,28 @@ def test_minute_volume_is_already_hands_and_amount_is_cny() -> None:
     assert frame["amount_cny"][0] == 5_045_000.0
 
 
+def test_shenzhen_minute_volume_is_bonds_and_converts_to_hands() -> None:
+    frame = collector.normalize_minute(
+        [
+            {
+                "ts_code": "123001.SZ",
+                "trade_time": "2026-08-28 09:30:00",
+                "open": 101.0,
+                "high": 101.0,
+                "low": 100.9,
+                "close": 100.9,
+                "vol": 500.0,
+                "amount": 504_500.0,
+            }
+        ],
+        date(2026, 8, 1),
+        date(2026, 8, 28),
+    )
+
+    assert frame["volume_hands"][0] == 50.0
+    assert frame["amount_cny"][0] == 504_500.0
+
+
 def test_date_partitions_follow_local_trading_calendar(tmp_path: Path) -> None:
     root = tmp_path / "kline_daily_enriched"
     for value in ("2026-08-03", "2026-08-04", "invalid"):

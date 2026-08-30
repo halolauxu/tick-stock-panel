@@ -102,7 +102,10 @@ def normalize_minute(rows: list[dict], start: date, end: date) -> pl.DataFrame:
             pl.col("datetime")
             .cast(pl.Utf8)
             .str.to_datetime("%Y-%m-%d %H:%M:%S", strict=False),
-            pl.col("volume_hands").cast(pl.Float64, strict=False),
+            pl.when(pl.col("symbol").str.ends_with(".SZ"))
+            .then(pl.col("volume_hands").cast(pl.Float64, strict=False) / 10.0)
+            .otherwise(pl.col("volume_hands").cast(pl.Float64, strict=False))
+            .alias("volume_hands"),
             pl.col("amount_cny").cast(pl.Float64, strict=False),
         )
         .filter(
