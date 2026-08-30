@@ -74,3 +74,13 @@ def test_summary_does_not_promote_small_sample() -> None:
 
     assert result["verdict"] == "TERMINATE"
     assert result["checks"]["at_least_200_tradable_events"] is False
+
+
+def test_stamp_tax_rate_is_scalar_and_effective_dated() -> None:
+    old = study.stamp_tax_rate(date(2023, 8, 25))
+    current = study.stamp_tax_rate(date(2023, 8, 28))
+
+    assert isinstance(old, float)
+    assert isinstance(current, float)
+    assert old == study.STAMP_TAX_OLD
+    assert current == study.STAMP_TAX_CURRENT

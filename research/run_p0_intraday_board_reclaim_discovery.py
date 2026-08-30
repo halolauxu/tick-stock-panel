@@ -23,7 +23,9 @@ from research import run_p0_emotion_limit_up_study as emotion  # noqa: E402
 from research.run_p0_forecast_drift_development import (  # noqa: E402
     COMMISSION_PCT,
     SLIPPAGE_PCT,
-    historical_stamp_tax,
+    STAMP_TAX_CURRENT,
+    STAMP_TAX_CUT,
+    STAMP_TAX_OLD,
 )
 
 CONTEXT_START = date(2025, 7, 1)
@@ -38,6 +40,10 @@ MAX_EXIT_DELAY = 20
 MIN_PREVIOUS_AMOUNT = 50_000_000.0
 MIN_BREAK_PCT_OF_LIMIT = 0.98
 MIN_RECLAIM_PCT_OF_LIMIT = 0.99
+
+
+def stamp_tax_rate(day: date) -> float:
+    return STAMP_TAX_OLD if day < STAMP_TAX_CUT else STAMP_TAX_CURRENT
 
 
 def prepare_context(data_dir: Path) -> pl.DataFrame:
@@ -291,7 +297,7 @@ def attach_exits(
             exit_gross = shares * float(row["exit_open"])
             entry_cost = entry_gross * (COMMISSION_PCT + SLIPPAGE_PCT)
             exit_cost = exit_gross * (
-                COMMISSION_PCT + SLIPPAGE_PCT + historical_stamp_tax(row["exit_date"])
+                COMMISSION_PCT + SLIPPAGE_PCT + stamp_tax_rate(row["exit_date"])
             )
             row["net_return"] = (exit_gross - exit_cost) / (entry_gross + entry_cost) - 1.0
         else:
