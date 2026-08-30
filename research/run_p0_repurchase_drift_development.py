@@ -37,7 +37,7 @@ CATEGORIES = (
     "termination_control",
 )
 POSITIVE_CATEGORIES = CATEGORIES[:-1]
-PROPOSAL_LABELS = ("董事会预案", "董事会通过", "股东大会通过")
+PROPOSAL_LABELS = ("预案", "董事会预案", "董事会通过", "股东大会通过")
 
 
 def load_repurchase_events(data_dir: Path) -> pl.DataFrame:

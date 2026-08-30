@@ -21,7 +21,7 @@
 `proc` 标签先按以下固定顺序映射，不能看收益后改关键词：
 
 1. `termination_control`：包含“停止”或“终止”；
-2. `proposal_approved`：等于“董事会预案”“董事会通过”或“股东大会通过”；
+2. `proposal_approved`：等于“预案”“董事会预案”“董事会通过”或“股东大会通过”；
 3. `implementation`：等于“实施”；
 4. `completion`：等于“完成”；
 5. 其余标签只报告数量，不参与收益检验。

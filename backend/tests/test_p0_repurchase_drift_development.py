@@ -42,6 +42,7 @@ def test_process_categories_are_frozen_and_termination_has_priority() -> None:
     events = pl.DataFrame(
         [
             _event("A", date(2020, 1, 1), "股东大会通过"),
+            _event("F", date(2020, 1, 1), "预案"),
             _event("B", date(2020, 1, 1), "实施"),
             _event("C", date(2020, 1, 1), "完成"),
             _event("D", date(2020, 1, 1), "停止实施"),
@@ -57,6 +58,7 @@ def test_process_categories_are_frozen_and_termination_has_priority() -> None:
         "B": "implementation",
         "C": "completion",
         "D": "termination_control",
+        "F": "proposal_approved",
     }
 
 
