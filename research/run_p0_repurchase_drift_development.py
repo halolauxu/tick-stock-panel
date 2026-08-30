@@ -121,7 +121,10 @@ def categorize_events(events: pl.DataFrame) -> pl.DataFrame:
     )
 
 
-def build_market_benchmark(panel: pl.DataFrame) -> pl.DataFrame:
+def build_market_benchmark(
+    panel: pl.DataFrame,
+    holding_trading_days: int = HOLD_TRADING_DAYS,
+) -> pl.DataFrame:
     entry = panel.select(
         "symbol",
         "trade_index",
@@ -133,7 +136,7 @@ def build_market_benchmark(panel: pl.DataFrame) -> pl.DataFrame:
     )
     exit_prices = panel.select(
         "symbol",
-        (pl.col("trade_index") - HOLD_TRADING_DAYS).alias("trade_index"),
+        (pl.col("trade_index") - holding_trading_days).alias("trade_index"),
         pl.col("open").alias("benchmark_exit_open"),
     )
     return (
@@ -194,6 +197,8 @@ def summarize_category(
     trades: pl.DataFrame,
     category: str,
     positive_categories: tuple[str, ...] = POSITIVE_CATEGORIES,
+    min_tradable_events: int = 300,
+    min_announcement_days: int = 150,
 ) -> dict[str, Any]:
     scoped = trades.filter(pl.col("category") == category)
     eligible = scoped.filter(pl.col("universe_eligible"))
@@ -263,8 +268,8 @@ def summarize_category(
     }
     result["promotion_passed"] = bool(
         category in positive_categories
-        and result["tradable_events"] >= 300
-        and result["announcement_days"] >= 150
+        and result["tradable_events"] >= min_tradable_events
+        and result["announcement_days"] >= min_announcement_days
         and result["tradable_rate"] >= 0.90
         and result["benchmark_coverage"] >= 0.99
         and result["entry_capacity_feasible_rate"] >= 0.95
