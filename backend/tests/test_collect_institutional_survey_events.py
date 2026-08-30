@@ -68,6 +68,28 @@ def test_request_uses_verified_wide_report_page_size() -> None:
     assert params["client"] == "WEB"
 
 
+def test_fetch_month_reuses_valid_page_cache(tmp_path) -> None:
+    calls = []
+
+    def fetch(params):
+        calls.append(params["pageNumber"])
+        page = int(params["pageNumber"])
+        rows = [_row(f"{page}-{index}") for index in range(collector.PAGE_SIZE)]
+        if page == 3:
+            rows = rows[:1]
+        return {
+            "result": {"count": 101, "pages": 3, "data": rows},
+            "success": True,
+        }
+
+    first = collector.fetch_month(fetch, 2020, 1, cache_dir=tmp_path)
+    calls.clear()
+    second = collector.fetch_month(fetch, 2020, 1, cache_dir=tmp_path)
+
+    assert len(first) == len(second) == 101
+    assert calls == ["1"]
+
+
 def test_normalize_counts_unique_institutions_and_excludes_noninstitution() -> None:
     rows = [_row("A"), _row("A"), _row("B"), _row("person", object_type="002")]
 

@@ -45,6 +45,23 @@ def _atomic_write(frame: pl.DataFrame, path: Path) -> None:
             temporary.unlink()
 
 
+def _atomic_write_json(payload: dict[str, Any], path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    handle, name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+    os.close(handle)
+    temporary = Path(name)
+    try:
+        temporary.write_text(
+            json.dumps(payload, ensure_ascii=False, separators=(",", ":")),
+            encoding="utf-8",
+        )
+        temporary.chmod(0o644)
+        os.replace(temporary, path)
+    finally:
+        with contextlib.suppress(FileNotFoundError):
+            temporary.unlink()
+
+
 class EastmoneySurveyClient:
     def __init__(
         self,
@@ -133,18 +150,116 @@ def _page_rows(payload: dict[str, Any]) -> tuple[list[dict[str, Any]], int, int]
     )
 
 
-def fetch_month(fetch_json, year: int, month: int) -> list[dict[str, Any]]:
+def _page_cache_path(cache_dir: Path, page: int) -> Path:
+    return cache_dir / f"page={page:04d}.json"
+
+
+def _write_page_cache(
+    cache_dir: Path,
+    *,
+    year: int,
+    month: int,
+    page: int,
+    count: int,
+    pages: int,
+    rows: list[dict[str, Any]],
+) -> None:
+    _atomic_write_json(
+        {
+            "year": year,
+            "month": month,
+            "page": page,
+            "count": count,
+            "pages": pages,
+            "rows": rows,
+        },
+        _page_cache_path(cache_dir, page),
+    )
+
+
+def _read_page_cache(
+    cache_dir: Path,
+    *,
+    year: int,
+    month: int,
+    page: int,
+    count: int,
+    pages: int,
+) -> list[dict[str, Any]] | None:
+    path = _page_cache_path(cache_dir, page)
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (FileNotFoundError, OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return None
+    if not isinstance(payload, dict) or any(
+        payload.get(key) != value
+        for key, value in {
+            "year": year,
+            "month": month,
+            "page": page,
+            "count": count,
+            "pages": pages,
+        }.items()
+    ):
+        return None
+    rows = payload.get("rows")
+    if not isinstance(rows, list) or any(not isinstance(row, dict) for row in rows):
+        return None
+    expected_rows = PAGE_SIZE if page < pages else count - PAGE_SIZE * (pages - 1)
+    return [dict(row) for row in rows] if len(rows) == expected_rows else None
+
+
+def fetch_month(
+    fetch_json,
+    year: int,
+    month: int,
+    *,
+    cache_dir: Path | None = None,
+) -> list[dict[str, Any]]:
     first, count, pages = _page_rows(fetch_json(_params(year, month, 1)))
     expected_pages = math.ceil(count / PAGE_SIZE) if count else 0
     if pages != expected_pages or pages > MAX_PAGES:
         raise ValueError("Eastmoney survey page count is inconsistent")
+    if cache_dir is not None:
+        _write_page_cache(
+            cache_dir,
+            year=year,
+            month=month,
+            page=1,
+            count=count,
+            pages=pages,
+            rows=first,
+        )
     rows = list(first)
     for page in range(2, pages + 1):
-        current, current_count, current_pages = _page_rows(
-            fetch_json(_params(year, month, page))
+        current = (
+            _read_page_cache(
+                cache_dir,
+                year=year,
+                month=month,
+                page=page,
+                count=count,
+                pages=pages,
+            )
+            if cache_dir is not None
+            else None
         )
-        if current_count != count or current_pages != pages:
-            raise ValueError("Eastmoney survey pagination changed during collection")
+        if current is None:
+            current, current_count, current_pages = _page_rows(
+                fetch_json(_params(year, month, page))
+            )
+            if current_count != count or current_pages != pages:
+                raise ValueError("Eastmoney survey pagination changed during collection")
+            if cache_dir is not None:
+                _write_page_cache(
+                    cache_dir,
+                    year=year,
+                    month=month,
+                    page=page,
+                    count=count,
+                    pages=pages,
+                    rows=current,
+                )
         rows.extend(current)
     if len(rows) != count:
         raise ValueError(f"survey pagination incomplete: expected {count}, got {len(rows)}")
@@ -235,7 +350,8 @@ def normalize(rows: list[dict[str, Any]], year: int, month: int) -> pl.DataFrame
 
 
 def collect_month(fetch_json, root: Path, year: int, month: int) -> dict[str, Any]:
-    rows = fetch_month(fetch_json, year, month)
+    cache_dir = root / "_page_cache" / f"year={year}" / f"month={month:02d}"
+    rows = fetch_month(fetch_json, year, month, cache_dir=cache_dir)
     frame = normalize(rows, year, month)
     if frame.is_empty():
         raise ValueError(f"institutional survey returned no events for {year}-{month:02d}")
@@ -245,6 +361,7 @@ def collect_month(fetch_json, root: Path, year: int, month: int) -> dict[str, An
         "year": year,
         "month": month,
         "path": str(path),
+        "page_cache": str(cache_dir),
         "raw_rows": len(rows),
         "events": frame.height,
         "symbols": frame.get_column("symbol").n_unique(),
