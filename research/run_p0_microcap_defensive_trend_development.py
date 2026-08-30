@@ -41,8 +41,6 @@ def load_daily(data_dir: Path) -> pl.DataFrame:
             "volume",
             "amount",
             "raw_close",
-            "momentum_60d",
-            "annual_vol_20d",
         )
         .filter(
             (pl.col("date") >= pl.lit(baseline.START))
@@ -50,6 +48,28 @@ def load_daily(data_dir: Path) -> pl.DataFrame:
             & pl.col("symbol").str.contains(baseline.SYMBOL_PATTERN)
         )
         .collect(engine="streaming")
+    )
+
+
+def attach_defensive_factors(frame: pl.DataFrame) -> pl.DataFrame:
+    """Compute the frozen factors from information available by each close."""
+    return (
+        frame.sort(["symbol", "date"])
+        .with_columns(
+            (pl.col("close") / pl.col("close").shift(60).over("symbol") - 1.0).alias(
+                "momentum_60d"
+            ),
+            pl.col("close").pct_change().over("symbol").alias("_factor_daily_return"),
+        )
+        .with_columns(
+            (
+                pl.col("_factor_daily_return")
+                .rolling_std(window_size=20, min_samples=20)
+                .over("symbol")
+                * math.sqrt(252.0)
+            ).alias("annual_vol_20d")
+        )
+        .drop("_factor_daily_return")
     )
 
 
@@ -198,7 +218,7 @@ def _json_default(value: Any) -> Any:
 
 
 def run(data_dir: Path, output: Path) -> dict[str, Any]:
-    source = load_daily(data_dir)
+    source = attach_defensive_factors(load_daily(data_dir))
     if source.is_empty():
         raise ValueError("no enriched daily data")
     account_dates = [

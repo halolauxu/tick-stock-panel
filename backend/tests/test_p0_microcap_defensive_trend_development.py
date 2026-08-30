@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 import importlib.util
-from datetime import date
+import math
+from datetime import date, timedelta
 from pathlib import Path
 
 import polars as pl
@@ -24,6 +25,28 @@ def _load_module():
 
 
 study = _load_module()
+
+
+def test_frozen_factors_are_causal_and_use_only_past_closes() -> None:
+    closes = [100.0 + index for index in range(61)]
+    frame = pl.DataFrame(
+        {
+            "symbol": ["A"] * 61,
+            "date": [date(2020, 1, 1) + timedelta(days=index) for index in range(61)],
+            "close": closes,
+        }
+    )
+
+    factors = study.attach_defensive_factors(frame)
+    last = factors.row(-1, named=True)
+    expected_returns = [closes[index] / closes[index - 1] - 1 for index in range(41, 61)]
+
+    assert math.isclose(last["momentum_60d"], 0.60, rel_tol=1e-12)
+    assert math.isclose(
+        last["annual_vol_20d"],
+        float(pl.Series(expected_returns).std()) * math.sqrt(252.0),
+        rel_tol=1e-12,
+    )
 
 
 def test_defensive_filter_keeps_positive_trend_and_lower_half_volatility() -> None:

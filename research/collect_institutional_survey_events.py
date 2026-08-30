@@ -28,7 +28,7 @@ REPORT_NAME = "RPT_ORG_SURVEY"
 # repeated "server busy" responses.
 PAGE_SIZE = 50
 MAX_PAGES = 2_000
-MIN_INTERVAL_SECONDS = 0.12
+MIN_INTERVAL_SECONDS = 1.0
 
 
 def _atomic_write(frame: pl.DataFrame, path: Path) -> None:
@@ -50,8 +50,8 @@ class EastmoneySurveyClient:
         *,
         timeout: float = 30.0,
         min_interval: float = MIN_INTERVAL_SECONDS,
-        max_attempts: int = 5,
-        retry_base_seconds: float = 0.5,
+        max_attempts: int = 8,
+        retry_base_seconds: float = 1.0,
     ) -> None:
         self.timeout = timeout
         self.min_interval = min_interval
@@ -88,8 +88,9 @@ class EastmoneySurveyClient:
                 if attempt + 1 >= self.max_attempts:
                     raise
             if attempt + 1 >= self.max_attempts:
-                raise ValueError("Eastmoney survey request remained busy")
-            time.sleep(self.retry_base_seconds * (2**attempt))
+                page = params.get("pageNumber", "?")
+                raise ValueError(f"Eastmoney survey page {page} remained busy")
+            time.sleep(min(30.0, self.retry_base_seconds * (2**attempt)))
         raise RuntimeError("unreachable survey retry state")
 
 
@@ -104,7 +105,7 @@ def _params(year: int, month: int, page: int) -> dict[str, str]:
         "columns": (
             "SECUCODE,NOTICE_DATE,RECEIVE_START_DATE,RECEIVE_END_DATE,"
             "RECEIVE_OBJECT_TYPE,RECEIVE_OBJECT,OBJECT_CODE,SUM,ORG_TYPE,"
-            "ORG_NAME,NUMBERNEW,URL"
+            "URL"
         ),
         "filter": (
             f"(NOTICE_DATE>='{start.isoformat()}')"
