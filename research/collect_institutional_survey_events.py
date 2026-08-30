@@ -22,7 +22,11 @@ import polars as pl
 
 API_URL = "https://datacenter-web.eastmoney.com/api/data/v1/get"
 REPORT_NAME = "RPT_ORG_SURVEY"
-PAGE_SIZE = 500
+# This wide report returns Eastmoney code 9701 consistently at 100+ rows/page.
+# Fifty rows is the largest page size verified from both the workstation and the
+# production host; keep it fixed so a collection cannot silently degrade into
+# repeated "server busy" responses.
+PAGE_SIZE = 50
 MAX_PAGES = 2_000
 MIN_INTERVAL_SECONDS = 0.12
 
@@ -110,6 +114,8 @@ def _params(year: int, month: int, page: int) -> dict[str, str]:
         "pageSize": str(PAGE_SIZE),
         "sortColumns": "NOTICE_DATE",
         "sortTypes": "1",
+        "source": "WEB",
+        "client": "WEB",
     }
 
 

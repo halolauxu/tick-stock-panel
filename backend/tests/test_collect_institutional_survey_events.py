@@ -46,17 +46,25 @@ def test_fetch_month_reads_exact_pages() -> None:
         calls.append(params["pageNumber"])
         page = int(params["pageNumber"])
         rows = [_row(f"{page}-{index}") for index in range(collector.PAGE_SIZE)]
-        if page == 2:
+        if page == 3:
             rows = rows[:1]
         return {
-            "result": {"count": 501, "pages": 2, "data": rows},
+            "result": {"count": 101, "pages": 3, "data": rows},
             "success": True,
         }
 
     rows = collector.fetch_month(fetch, 2020, 1)
 
-    assert len(rows) == 501
-    assert calls == ["1", "2"]
+    assert len(rows) == 101
+    assert calls == ["1", "2", "3"]
+
+
+def test_request_uses_verified_wide_report_page_size() -> None:
+    params = collector._params(2020, 1, 1)
+
+    assert params["pageSize"] == "50"
+    assert params["source"] == "WEB"
+    assert params["client"] == "WEB"
 
 
 def test_normalize_counts_unique_institutions_and_excludes_noninstitution() -> None:
