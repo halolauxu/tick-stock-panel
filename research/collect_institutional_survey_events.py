@@ -371,9 +371,13 @@ def collect_month(fetch_json, root: Path, year: int, month: int) -> dict[str, An
     }
 
 
+def validate_period(year: int, month: int) -> None:
+    if year < 2013 or year > 2026 or month not in range(1, 13):
+        raise ValueError("collection must be one valid 2013-2026 month")
+
+
 def run(data_dir: Path, year: int, month: int) -> dict[str, Any]:
-    if year < 2014 or year > 2026 or month not in range(1, 13):
-        raise ValueError("collection must be one valid 2014-2026 month")
+    validate_period(year, month)
     client = EastmoneySurveyClient()
     result = collect_month(
         client.fetch,

@@ -5,6 +5,8 @@ import stat
 from datetime import date
 from pathlib import Path
 
+import pytest
+
 SCRIPT = (
     Path(__file__).resolve().parents[2]
     / "research"
@@ -23,6 +25,13 @@ def _load_module():
 
 
 collector = _load_module()
+
+
+def test_warmup_year_is_allowed_but_earlier_history_is_rejected() -> None:
+    collector.validate_period(2013, 1)
+
+    with pytest.raises(ValueError, match="2013-2026"):
+        collector.validate_period(2012, 12)
 
 
 def _row(object_code: str, *, object_type: str = "001") -> dict:
