@@ -253,6 +253,14 @@ def _worker_entry(task: dict[str, Any], event_queue, cancel_event) -> None:
             "task_elapsed_ms": round((time.perf_counter() - started) * 1000, 1),
         }
         _attach_worker_metrics(kind, result, metrics)
+        # Release DuckDB and storage resources before publishing the terminal
+        # result.  Large Alpha jobs can otherwise deliver their queue payload
+        # while the child is still blocked in database shutdown, causing the
+        # parent to discard an already-computed result after its exit grace.
+        if store is not None:
+            with suppress(Exception):
+                store.db.close()
+            store = None
         event_queue.put({"type": "result", "payload": result})
     except BaseException as exc:
         with suppress(Exception):
