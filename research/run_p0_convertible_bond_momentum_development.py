@@ -38,6 +38,7 @@ MIN_PRICE = 80.0
 MAX_PRICE = 150.0
 MIN_CONVERSION_PREMIUM = -10.0
 MAX_CONVERSION_PREMIUM = 80.0
+ORDINARY_CB_PREFIXES = ["110", "113", "123", "127", "128"]
 
 
 def prepare_panel(daily: pl.DataFrame, master: pl.DataFrame) -> pl.DataFrame:
@@ -46,13 +47,13 @@ def prepare_panel(daily: pl.DataFrame, master: pl.DataFrame) -> pl.DataFrame:
     )
     return (
         daily.join(
-            master.select(
-                "symbol", "cb_type", "list_date", "maturity_date"
-            ),
+            master.select("symbol", "list_date", "maturity_date"),
             on="symbol",
             how="inner",
         )
-        .filter(pl.col("cb_type") == "CB")
+        .filter(
+            pl.col("symbol").str.slice(0, 3).is_in(ORDINARY_CB_PREFIXES)
+        )
         .join(dates, on="date", how="left")
         .sort(["symbol", "date"])
         .with_columns(
@@ -242,6 +243,7 @@ def run(data_dir: Path, output: Path) -> dict[str, Any]:
             "minimum_listing_days": MIN_LISTING_DAYS,
             "minimum_maturity_days": MIN_MATURITY_DAYS,
             "minimum_mean_amount_cny": MIN_MEAN_AMOUNT,
+            "ordinary_cb_prefixes": ORDINARY_CB_PREFIXES,
             "price_range": [MIN_PRICE, MAX_PRICE],
             "conversion_premium_range": [
                 MIN_CONVERSION_PREMIUM,

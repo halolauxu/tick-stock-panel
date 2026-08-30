@@ -41,7 +41,6 @@ def test_momentum_uses_exactly_prior_twenty_closes_and_excludes_eb() -> None:
     master = pl.DataFrame(
         {
             "symbol": ["110001.SH", "132001.SH"],
-            "cb_type": ["CB", "EB"],
             "list_date": [date(2018, 1, 1)] * 2,
             "maturity_date": [date(2025, 1, 1)] * 2,
         }
