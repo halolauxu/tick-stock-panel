@@ -46,6 +46,29 @@ def test_master_uses_real_contract_and_positive_unit() -> None:
     assert result["per_unit"][0] == 10.0
 
 
+def test_master_keeps_pre_rename_methanol_contract() -> None:
+    rows = [
+        {
+            "ts_code": "ME1501.ZCE",
+            "symbol": "ME1501",
+            "exchange": "CZCE",
+            "name": "甲醇1501",
+            "fut_code": "ME",
+            "per_unit": 10.0,
+            "trade_unit": "吨",
+            "quote_unit": "元/吨",
+            "list_date": "20140102",
+            "delist_date": "20150115",
+            "d_month": "201501",
+            "last_ddate": "20150120",
+        }
+    ]
+
+    result = study.normalize_master(rows)
+
+    assert result["contract"].to_list() == ["ME1501.ZCE"]
+
+
 def test_daily_and_mapping_normalize_same_key() -> None:
     daily = study.normalize_daily(
         [

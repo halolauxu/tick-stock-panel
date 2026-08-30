@@ -42,7 +42,6 @@ SERIES = (
     "OI.ZCE",
 )
 EXCHANGES = ("SHFE", "DCE", "CZCE")
-ROOT_CODES = tuple(symbol.split(".")[0] for symbol in SERIES)
 MASTER_FIELDS = (
     "ts_code",
     "symbol",
@@ -91,8 +90,7 @@ def normalize_master(rows: list[dict[str, Any]]) -> pl.DataFrame:
             ],
         )
         .filter(
-            pl.col("fut_code").is_in(ROOT_CODES)
-            & pl.col("list_date").is_not_null()
+            pl.col("list_date").is_not_null()
             & (pl.col("list_date") <= pl.lit(END))
             & (
                 pl.col("delist_date").is_null()
@@ -203,6 +201,8 @@ def collect(data_dir: Path, output: Path) -> dict[str, Any]:
     finally:
         client.close()
 
+    mapped_contracts = set(mapping["contract"].drop_nulls().to_list())
+    master = master.filter(pl.col("contract").is_in(mapped_contracts))
     joined = daily.join(mapping, on=["series", "date"], how="left")
     counts = (
         joined.group_by("series")
@@ -230,7 +230,6 @@ def collect(data_dir: Path, output: Path) -> dict[str, Any]:
     negative_rows = daily.filter(
         (pl.col("volume") < 0) | (pl.col("oi") < 0)
     ).height
-    mapped_contracts = set(mapping["contract"].drop_nulls().to_list())
     master_contracts = set(master["contract"].to_list())
     missing_contracts = sorted(mapped_contracts - master_contracts)
     invalid_units = master.filter(
@@ -259,7 +258,7 @@ def collect(data_dir: Path, output: Path) -> dict[str, Any]:
     _atomic_parquet(daily, root / "continuous_daily.parquet")
     _atomic_parquet(mapping, root / "main_mapping.parquet")
     payload = {
-        "schema_version": "p0-cn-commodity-futures-data-v1",
+        "schema_version": "p0-cn-commodity-futures-data-v2",
         "contract_frozen": "2026-08-30",
         "period": {
             "start": START,
