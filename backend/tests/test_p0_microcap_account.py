@@ -157,6 +157,33 @@ def test_blocked_exit_keeps_position_and_prevents_replacement() -> None:
     )
 
 
+def test_simulator_can_disable_stamp_tax_for_etf_account() -> None:
+    d0, d1 = date(2024, 1, 5), date(2024, 1, 8)
+    d2, d3 = date(2024, 1, 12), date(2024, 1, 15)
+    candidates = _candidates(
+        [(d0, d1, "A.SZ", 1), (d2, d3, "B.SZ", 1)]
+    )
+    execution = pl.DataFrame(
+        [
+            _quote(d1, "A.SZ"),
+            _quote(d1, "B.SZ"),
+            _quote(d3, "A.SZ"),
+            _quote(d3, "B.SZ"),
+        ]
+    )
+
+    result = account.simulate_account(
+        candidates,
+        execution,
+        initial_cash=30_000.0,
+        target_positions=1,
+        stamp_tax_rate=0.0,
+    )
+
+    sell = next(row for row in result["trades"] if row["side"] == "SELL")
+    assert sell["stamp_tax"] == 0.0
+
+
 def test_daily_equity_uses_stale_mark_without_future_backfill() -> None:
     d1, d2, d3 = date(2024, 1, 8), date(2024, 1, 9), date(2024, 1, 10)
     simulation = {

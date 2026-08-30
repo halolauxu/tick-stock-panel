@@ -284,6 +284,7 @@ def simulate_account(
     initial_cash: float = INITIAL_CASH,
     target_positions: int = TARGET_POSITIONS,
     action_dates: list[date] | None = None,
+    stamp_tax_rate: float | None = None,
 ) -> dict[str, Any]:
     candidate_groups = _partition_rows(candidates, "entry_date")
     quote_groups = _partition_rows(execution_grid, "entry_date")
@@ -347,11 +348,16 @@ def simulate_account(
                 continue
             gross = position["units"] * float(quote["open"])
             commission_fee = commission(gross)
-            stamp_tax = gross * (
-                baseline.STAMP_TAX_OLD
-                if entry_date < baseline.STAMP_TAX_CUT
-                else baseline.STAMP_TAX_CURRENT
+            effective_stamp_tax = (
+                stamp_tax_rate
+                if stamp_tax_rate is not None
+                else (
+                    baseline.STAMP_TAX_OLD
+                    if entry_date < baseline.STAMP_TAX_CUT
+                    else baseline.STAMP_TAX_CURRENT
+                )
             )
+            stamp_tax = gross * effective_stamp_tax
             slippage = gross * baseline.SLIPPAGE_PCT
             cash_delta = gross - commission_fee - stamp_tax - slippage
             cash += cash_delta
