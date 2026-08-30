@@ -212,10 +212,59 @@ def test_main_board_st_uses_five_percent_limit_and_cannot_be_new_buy() -> None:
 
     assert quotes["limit_up_price"][1] == pytest.approx(10.5)
     assert quotes["limit_down_price"][1] == pytest.approx(9.5)
-    candidate = {"signal_amount": 1_000_000.0}
     quote = _quote(days[1], "000001.SZ", excluded_name=True)
-    assert account._buy_rejection(candidate, quote, 10_000.0) == (
+    assert account._buy_rejection(quote, 10_000.0) == (
         "became_risk_warning"
     )
     position = {"units": 1_000.0}
     assert account._sell_rejection(position, quote) is None
+
+
+def test_execution_rate_excludes_signal_day_capacity_skips() -> None:
+    summary = account.execution_summary(
+        [
+            {
+                "side": "BUY",
+                "status": "PRETRADE_SKIPPED",
+                "reason": "signal_capacity",
+            },
+            {"side": "BUY", "status": "FILLED", "reason": None},
+            {"side": "SELL", "status": "FILLED", "reason": None},
+        ]
+    )
+
+    assert summary["buy"]["orders"] == 1
+    assert summary["buy"]["filled"] == 1
+    assert summary["buy"]["execution_rate"] == 1.0
+    assert summary["buy"]["pretrade_skipped"] == 1
+
+
+def test_gate_uses_independently_started_validation_and_stress_accounts() -> None:
+    def result(period: str) -> dict:
+        return {
+            "metrics": {
+                "period": period,
+                "account_annualized": 0.20,
+                "annualized_excess": 0.12,
+                "positive_account_years": 2,
+            },
+            "execution": {
+                "buy": {"execution_rate": 0.90},
+                "sell": {"execution_rate": 0.90},
+            },
+            "integrity": {
+                "ending_unresolved_positions": 0,
+                "max_cash_reconciliation_error": 0.0,
+            },
+        }
+
+    independent = {
+        "validation": result("validation"),
+        "known_stress": result("known_stress"),
+    }
+
+    assert account.evaluate_gate(independent)["verdict"] == "CONTINUE_TO_ESCAPE"
+    independent["known_stress"]["metrics"]["account_annualized"] = 0.10
+    decision = account.evaluate_gate(independent)
+    assert decision["verdict"] == "DOWNGRADE"
+    assert "known_stress_annualized" in decision["failures"]

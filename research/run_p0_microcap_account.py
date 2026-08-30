@@ -254,7 +254,6 @@ def _sell_rejection(position: dict[str, Any], quote: dict[str, Any] | None) -> s
 
 
 def _buy_rejection(
-    candidate: dict[str, Any],
     quote: dict[str, Any] | None,
     gross: float,
 ) -> str | None:
@@ -270,9 +269,8 @@ def _buy_rejection(
         return "missing_open"
     if limit_up is not None and raw_open >= limit_up - 0.005:
         return "limit_up"
-    capacity = min(
-        float(candidate.get("signal_amount") or 0.0),
-        float(quote.get("entry_amount") or 0.0),
+    capacity = float(
+        quote.get("entry_amount") or 0.0
     ) * baseline.DAILY_PARTICIPATION
     if gross > capacity:
         return "insufficient_capacity"
@@ -382,14 +380,32 @@ def simulate_account(
             symbol = candidate["symbol"]
             if symbol in positions or symbol in sold_today:
                 continue
+            signal_capacity = float(
+                candidate.get("signal_amount") or 0.0
+            ) * baseline.DAILY_PARTICIPATION
+            if target_notional > signal_capacity:
+                orders.append(
+                    {
+                        "date": entry_date,
+                        "signal_date": candidate["date"],
+                        "symbol": symbol,
+                        "side": "BUY",
+                        "status": "PRETRADE_SKIPPED",
+                        "reason": "signal_capacity",
+                        "rank": candidate["cap_rank"],
+                        "target_notional": target_notional,
+                        "signal_capacity": signal_capacity,
+                    }
+                )
+                continue
             quote = quotes.get(symbol)
             raw_open = float(quote["raw_open"]) if quote and quote.get("raw_open") else 0.0
             shares = affordable_shares(raw_open, target_notional, cash)
             gross = shares * raw_open
-            reason = "zero_lot_or_cash" if shares <= 0 else _buy_rejection(
-                candidate,
-                quote,
-                gross,
+            reason = (
+                "zero_lot_or_cash"
+                if shares <= 0
+                else _buy_rejection(quote, gross)
             )
             order = {
                 "date": entry_date,
@@ -629,7 +645,13 @@ def account_period_metrics(
 def execution_summary(orders: list[dict[str, Any]]) -> dict[str, Any]:
     by_side: dict[str, Any] = {}
     for side in ("BUY", "SELL"):
-        scoped = [row for row in orders if row["side"] == side]
+        side_rows = [row for row in orders if row["side"] == side]
+        pretrade = [
+            row for row in side_rows if row["status"] == "PRETRADE_SKIPPED"
+        ]
+        scoped = [
+            row for row in side_rows if row["status"] != "PRETRADE_SKIPPED"
+        ]
         filled = sum(row["status"] == "FILLED" for row in scoped)
         reasons = Counter(
             row["reason"] for row in scoped if row.get("reason") is not None
@@ -638,21 +660,133 @@ def execution_summary(orders: list[dict[str, Any]]) -> dict[str, Any]:
             "orders": len(scoped),
             "filled": filled,
             "execution_rate": filled / len(scoped) if scoped else 1.0,
+            "pretrade_skipped": len(pretrade),
+            "pretrade_skip_reasons": dict(
+                sorted(Counter(row["reason"] for row in pretrade).items())
+            ),
             "rejection_reasons": dict(sorted(reasons.items())),
         }
     return by_side
 
 
-def evaluate_gate(
-    metrics: list[dict[str, Any]],
-    execution: dict[str, Any],
-    integrity: dict[str, Any],
+def account_summary(
+    simulation: dict[str, Any],
+    daily: pl.DataFrame,
 ) -> dict[str, Any]:
-    by_period = {row["period"]: row for row in metrics}
+    trades = simulation["trades"]
+    return {
+        "ending_equity": daily.get_column("equity")[-1],
+        "ending_cash": simulation["ending_cash"],
+        "ending_positions": len(simulation["ending_positions"]),
+        "mean_cash_ratio": daily.get_column("cash_ratio").mean(),
+        "max_position_count": daily.get_column("position_count").max(),
+        "trade_count": len(trades),
+        "total_gross_turnover": sum(float(row["gross"]) for row in trades),
+        "total_costs": sum(
+            float(row.get("commission") or 0.0)
+            + float(row.get("stamp_tax") or 0.0)
+            + float(row.get("slippage") or 0.0)
+            for row in trades
+        ),
+    }
+
+
+def worst_weeks(daily: pl.DataFrame) -> list[dict[str, Any]]:
+    return (
+        daily.with_columns(pl.col("date").dt.strftime("%G-%V").alias("week"))
+        .group_by("week", maintain_order=True)
+        .agg(
+            pl.col("date").max().alias("date"),
+            pl.col("equity").last().alias("equity"),
+        )
+        .sort("date")
+        .with_columns(
+            (pl.col("equity") / pl.col("equity").shift(1) - 1.0).alias(
+                "weekly_return"
+            )
+        )
+        .drop_nulls("weekly_return")
+        .sort("weekly_return")
+        .head(10)
+        .to_dicts()
+    )
+
+
+def period_dates(all_dates: list[date], period: str) -> list[date]:
+    if period == "development":
+        return [day for day in all_dates if day <= baseline.DEVELOPMENT_END]
+    if period == "validation":
+        return [
+            day
+            for day in all_dates
+            if baseline.DEVELOPMENT_END < day <= baseline.VALIDATION_END
+        ]
+    return [day for day in all_dates if day > baseline.VALIDATION_END]
+
+
+def run_independent_account(
+    period: str,
+    candidates: pl.DataFrame,
+    execution_grid: pl.DataFrame,
+    quotes: pl.DataFrame,
+    all_dates: list[date],
+    weekly_market: pl.DataFrame,
+) -> dict[str, Any]:
+    scoped_dates = period_dates(all_dates, period)
+    first_date = scoped_dates[0]
+    last_date = scoped_dates[-1]
+    scoped_candidates = candidates.filter(
+        (pl.col("entry_date") >= pl.lit(first_date))
+        & (pl.col("entry_date") <= pl.lit(last_date))
+    )
+    scoped_grid = execution_grid.filter(
+        (pl.col("entry_date") >= pl.lit(first_date))
+        & (pl.col("entry_date") <= pl.lit(last_date))
+    )
+    simulation = simulate_account(scoped_candidates, scoped_grid)
+    daily, stale = build_daily_equity(simulation, quotes, scoped_dates)
+    metric = next(
+        row
+        for row in account_period_metrics(daily, weekly_market)
+        if row["period"] == period
+    )
+    integrity = {
+        **stale,
+        "max_cash_reconciliation_error": simulation[
+            "max_cash_reconciliation_error"
+        ],
+    }
+    return {
+        "period": period,
+        "first_date": first_date,
+        "last_date": last_date,
+        "metrics": metric,
+        "execution": execution_summary(simulation["orders"]),
+        "integrity": integrity,
+        "account": account_summary(simulation, daily),
+        "daily_equity": daily.select(
+            "date",
+            "equity",
+            "cash",
+            "position_value",
+            "position_count",
+            "stale_positions",
+            "cash_ratio",
+        ).to_dicts(),
+        "rebalance_snapshots": simulation["snapshots"],
+        "orders": simulation["orders"],
+        "worst_weeks": worst_weeks(daily),
+    }
+
+
+def evaluate_gate(
+    independent_accounts: dict[str, dict[str, Any]],
+) -> dict[str, Any]:
     passed = True
     failures = []
     for period in ("validation", "known_stress"):
-        row = by_period[period]
+        account = independent_accounts[period]
+        row = account["metrics"]
         checks = {
             f"{period}_annualized": (row.get("account_annualized") or -99.0)
             >= 0.15,
@@ -661,18 +795,19 @@ def evaluate_gate(
         }
         failures.extend(name for name, ok in checks.items() if not ok)
         passed = passed and all(checks.values())
-    for side in ("buy", "sell"):
-        ok = execution[side]["execution_rate"] >= 0.80
-        if not ok:
-            failures.append(f"{side}_execution_rate")
-        passed = passed and ok
-    integrity_ok = (
-        integrity["ending_unresolved_positions"] == 0
-        and integrity["max_cash_reconciliation_error"] <= 0.01
-    )
-    if not integrity_ok:
-        failures.append("account_integrity")
-    passed = passed and integrity_ok
+        for side in ("buy", "sell"):
+            ok = account["execution"][side]["execution_rate"] >= 0.80
+            if not ok:
+                failures.append(f"{period}_{side}_execution_rate")
+            passed = passed and ok
+        integrity = account["integrity"]
+        integrity_ok = (
+            integrity["ending_unresolved_positions"] == 0
+            and integrity["max_cash_reconciliation_error"] <= 0.01
+        )
+        if not integrity_ok:
+            failures.append(f"{period}_account_integrity")
+        passed = passed and integrity_ok
     return {
         "verdict": "CONTINUE_TO_ESCAPE" if passed else "DOWNGRADE",
         "passed": passed,
@@ -731,61 +866,11 @@ def run(data_dir: Path, output: Path, *, end: date | None = None) -> dict[str, A
             "max_cash_reconciliation_error"
         ],
     }
-    decision = evaluate_gate(metrics, execution, integrity)
-    weekly_equity = (
-        daily.with_columns(pl.col("date").dt.strftime("%G-%V").alias("week"))
-        .group_by("week", maintain_order=True)
-        .agg(
-            pl.col("date").max().alias("date"),
-            pl.col("equity").last().alias("equity"),
-        )
-        .sort("date")
-        .with_columns(
-            (pl.col("equity") / pl.col("equity").shift(1) - 1.0).alias(
-                "weekly_return"
-            )
-        )
-    )
-    trades = simulation["trades"]
-    total_gross = sum(float(row["gross"]) for row in trades)
-    total_fees = sum(
-        float(row.get("commission") or 0.0)
-        + float(row.get("stamp_tax") or 0.0)
-        + float(row.get("slippage") or 0.0)
-        for row in trades
-    )
-    payload = {
-        "schema_version": "p0-microcap-account-v1",
-        "contract": {
-            "initial_cash": INITIAL_CASH,
-            "target_positions": TARGET_POSITIONS,
-            "lot_size": LOT_SIZE,
-            "minimum_commission": MIN_COMMISSION,
-            "daily_participation": baseline.DAILY_PARTICIPATION,
-            "signal": "weekly_pit_total_market_cap_bottom_decile",
-            "execution": "next_trade_day_open_sells_before_buys",
-        },
-        "data": {
-            "first_date": all_dates[0],
-            "last_date": all_dates[-1],
-            "trading_days": len(all_dates),
-            "candidate_symbols": len(candidate_symbols),
-            "signal_rows": candidates.height,
-            "rebalance_days": candidates.get_column("entry_date").n_unique(),
-        },
+    continuous_account = {
         "period_metrics": metrics,
         "execution": execution,
         "integrity": integrity,
-        "account": {
-            "ending_equity": daily.get_column("equity")[-1],
-            "ending_cash": simulation["ending_cash"],
-            "ending_positions": len(simulation["ending_positions"]),
-            "mean_cash_ratio": daily.get_column("cash_ratio").mean(),
-            "max_position_count": daily.get_column("position_count").max(),
-            "trade_count": len(trades),
-            "total_gross_turnover": total_gross,
-            "total_costs": total_fees,
-        },
+        "account": account_summary(simulation, daily),
         "daily_equity": daily.select(
             "date",
             "equity",
@@ -797,12 +882,43 @@ def run(data_dir: Path, output: Path, *, end: date | None = None) -> dict[str, A
         ).to_dicts(),
         "rebalance_snapshots": simulation["snapshots"],
         "orders": simulation["orders"],
-        "worst_weeks": (
-            weekly_equity.drop_nulls("weekly_return")
-            .sort("weekly_return")
-            .head(10)
-            .to_dicts()
-        ),
+        "worst_weeks": worst_weeks(daily),
+    }
+    independent_accounts = {
+        period: run_independent_account(
+            period,
+            candidates,
+            execution_grid,
+            quotes,
+            all_dates,
+            weekly_market,
+        )
+        for period in ("development", "validation", "known_stress")
+    }
+    decision = evaluate_gate(independent_accounts)
+    payload = {
+        "schema_version": "p0-microcap-account-v2",
+        "contract": {
+            "initial_cash": INITIAL_CASH,
+            "target_positions": TARGET_POSITIONS,
+            "lot_size": LOT_SIZE,
+            "minimum_commission": MIN_COMMISSION,
+            "daily_participation": baseline.DAILY_PARTICIPATION,
+            "signal": "weekly_pit_total_market_cap_bottom_decile",
+            "execution": "next_trade_day_open_sells_before_buys",
+            "validation": "independent_cny_300k_accounts_by_period",
+            "signal_capacity": "pretrade_skip_not_open_order",
+        },
+        "data": {
+            "first_date": all_dates[0],
+            "last_date": all_dates[-1],
+            "trading_days": len(all_dates),
+            "candidate_symbols": len(candidate_symbols),
+            "signal_rows": candidates.height,
+            "rebalance_days": candidates.get_column("entry_date").n_unique(),
+        },
+        "continuous_account": continuous_account,
+        "independent_accounts": independent_accounts,
         "decision": decision,
     }
     output.parent.mkdir(parents=True, exist_ok=True)
@@ -814,10 +930,21 @@ def run(data_dir: Path, output: Path, *, end: date | None = None) -> dict[str, A
         json.dumps(
             {
                 "data": payload["data"],
-                "period_metrics": metrics,
-                "execution": execution,
-                "integrity": integrity,
-                "account": payload["account"],
+                "continuous_account": {
+                    "period_metrics": metrics,
+                    "execution": execution,
+                    "integrity": integrity,
+                    "account": continuous_account["account"],
+                },
+                "independent_accounts": {
+                    period: {
+                        "metrics": result["metrics"],
+                        "execution": result["execution"],
+                        "integrity": result["integrity"],
+                        "account": result["account"],
+                    }
+                    for period, result in independent_accounts.items()
+                },
                 "decision": decision,
                 "output": str(output),
             },
