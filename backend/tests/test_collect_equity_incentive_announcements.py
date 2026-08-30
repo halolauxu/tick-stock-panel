@@ -2,7 +2,10 @@
 from __future__ import annotations
 
 import importlib.util
+import io
+import json
 from datetime import date, datetime
+from http.client import IncompleteRead
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -90,3 +93,31 @@ def test_normalize_uses_beijing_date_strips_html_and_deduplicates() -> None:
     assert frame["ann_date"][0] == date(2019, 1, 2)
     assert frame["symbol"][0] == "300001.SZ"
     assert frame["title"][0] == "限制性股票激励计划（草案）"
+
+
+def test_client_retries_incomplete_chunk_without_changing_payload(monkeypatch) -> None:
+    calls = []
+
+    def urlopen(request, *, timeout):
+        calls.append((request.data, timeout))
+        if len(calls) == 1:
+            raise IncompleteRead(b'{"totalAnnouncement":')
+        payload = {
+            "totalAnnouncement": 0,
+            "totalpages": 0,
+            "announcements": [],
+        }
+        return io.BytesIO(json.dumps(payload).encode("utf-8"))
+
+    monkeypatch.setattr(collector.urllib.request, "urlopen", urlopen)
+    client = collector.CNInfoClient(
+        min_interval=0,
+        max_attempts=2,
+        retry_base_seconds=0,
+    )
+
+    result = client.fetch(collector._payload(2019, 1))
+
+    assert result["totalAnnouncement"] == 0
+    assert len(calls) == 2
+    assert calls[0] == calls[1]

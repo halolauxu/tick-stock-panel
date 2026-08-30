@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import contextlib
 import html
+import http.client
 import json
 import math
 import os
@@ -13,9 +14,10 @@ import tempfile
 import time
 import urllib.parse
 import urllib.request
-from datetime import datetime, timezone
+from collections.abc import Callable
+from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any
 from zoneinfo import ZoneInfo
 
 import polars as pl
@@ -46,16 +48,20 @@ def _atomic_write(frame: pl.DataFrame, path: Path) -> None:
 
 class CNInfoClient:
     def __init__(
-        self, *, timeout: float = 30.0, min_interval: float = MIN_INTERVAL_SECONDS
+        self,
+        *,
+        timeout: float = 30.0,
+        min_interval: float = MIN_INTERVAL_SECONDS,
+        max_attempts: int = 4,
+        retry_base_seconds: float = 0.5,
     ) -> None:
         self.timeout = timeout
         self.min_interval = min_interval
+        self.max_attempts = max_attempts
+        self.retry_base_seconds = retry_base_seconds
         self._last_request = 0.0
 
     def fetch(self, payload: dict[str, str]) -> dict[str, Any]:
-        wait = self.min_interval - (time.monotonic() - self._last_request)
-        if wait > 0:
-            time.sleep(wait)
         request = urllib.request.Request(
             API_URL,
             data=urllib.parse.urlencode(payload).encode("utf-8"),
@@ -65,9 +71,27 @@ class CNInfoClient:
                 "Content-Type": "application/x-www-form-urlencoded",
             },
         )
-        with urllib.request.urlopen(request, timeout=self.timeout) as response:
-            result = json.load(response)
-        self._last_request = time.monotonic()
+        result: Any = None
+        for attempt in range(self.max_attempts):
+            wait = self.min_interval - (time.monotonic() - self._last_request)
+            if wait > 0:
+                time.sleep(wait)
+            try:
+                with urllib.request.urlopen(request, timeout=self.timeout) as response:
+                    result = json.load(response)
+                self._last_request = time.monotonic()
+                break
+            except (
+                ConnectionError,
+                TimeoutError,
+                http.client.IncompleteRead,
+                json.JSONDecodeError,
+                urllib.error.URLError,
+            ):
+                self._last_request = time.monotonic()
+                if attempt + 1 >= self.max_attempts:
+                    raise
+                time.sleep(self.retry_base_seconds * (2**attempt))
         if not isinstance(result, dict):
             raise ValueError("CNInfo announcement response is not an object")
         return result
@@ -151,7 +175,7 @@ def _announcement_date(value: Any) -> str | None:
     except (TypeError, ValueError):
         return None
     return (
-        datetime.fromtimestamp(timestamp_ms / 1000.0, tz=timezone.utc)
+        datetime.fromtimestamp(timestamp_ms / 1000.0, tz=UTC)
         .astimezone(ZoneInfo("Asia/Shanghai"))
         .date()
         .isoformat()
