@@ -177,12 +177,21 @@ def collect(data_dir: Path, output: Path) -> dict[str, Any]:
     finally:
         client.close()
 
-    daily_symbols = daily.get_column("symbol").n_unique() if daily.height else 0
-    adj_symbols = (
-        adjustments.get_column("symbol").n_unique() if adjustments.height else 0
+    daily_symbol_values = (
+        set(daily.get_column("symbol").unique().to_list()) if daily.height else set()
     )
+    adjustment_symbol_values = (
+        set(adjustments.get_column("symbol").unique().to_list())
+        if adjustments.height
+        else set()
+    )
+    daily_symbols = len(daily_symbol_values)
+    adj_symbols = len(adjustment_symbol_values)
+    adjusted_daily_symbols = len(daily_symbol_values & adjustment_symbol_values)
     daily_coverage = daily_symbols / master.height
-    adjustment_coverage = adj_symbols / daily_symbols if daily_symbols else 0.0
+    adjustment_coverage = (
+        adjusted_daily_symbols / daily_symbols if daily_symbols else 0.0
+    )
     invalid_ohlc = daily.filter(
         (pl.col("open") <= 0)
         | (pl.col("high") <= 0)
@@ -219,6 +228,7 @@ def collect(data_dir: Path, output: Path) -> dict[str, Any]:
             "daily_symbols": daily_symbols,
             "adjustment_rows": adjustments.height,
             "adjustment_symbols": adj_symbols,
+            "adjusted_daily_symbols": adjusted_daily_symbols,
             "daily_coverage": daily_coverage,
             "adjustment_coverage": adjustment_coverage,
             "invalid_ohlcv_rows": invalid_ohlc,
