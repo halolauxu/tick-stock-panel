@@ -253,7 +253,7 @@ def build_execution_quotes(
 def _quote_rejection(quote: dict[str, Any] | None, *, side: str, gross: float) -> str | None:
     if quote is None or quote.get("raw_open") is None:
         return "missing_market_data"
-    if quote.get("is_excluded_name"):
+    if side == "BUY" and quote.get("is_excluded_name"):
         return "risk_warning"
     if not quote.get("volume") or quote["volume"] <= 0:
         return "suspended"
@@ -552,6 +552,9 @@ def _json_default(value: Any) -> Any:
 
 def run(data_dir: Path, output: Path) -> dict[str, Any]:
     source = load_daily(data_dir)
+    execution_panel = account.prepare_quote_panel(
+        account.attach_quote_names(source, data_dir)
+    )
     panel = prepare_alpha_panel(source, data_dir)
     del source
     gc.collect()
@@ -562,7 +565,7 @@ def run(data_dir: Path, output: Path) -> dict[str, Any]:
         values = formulas.compute_alpha101(context, alpha_id)
         candidates = select_candidates(alpha_id, values, eligible, amount, dates, symbols)
         candidates = attach_execution_dates_and_benchmark(candidates, context, eligible, dates)
-        quotes = build_execution_quotes(candidates, panel, dates)
+        quotes = build_execution_quotes(candidates, execution_panel, dates)
         scaling: dict[str, dict[str, Any]] = {}
         for capital in CAPITALS:
             simulation = simulate_daily_account(

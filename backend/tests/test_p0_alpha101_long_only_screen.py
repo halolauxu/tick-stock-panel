@@ -120,6 +120,7 @@ def _quote(
     limit_up: float = 11.0,
     limit_down: float = 9.0,
     volume: float = 1_000_000.0,
+    excluded_name: bool = False,
 ) -> dict:
     return {
         "date": day,
@@ -132,7 +133,7 @@ def _quote(
         "amount": raw_open * volume,
         "limit_up_price": limit_up,
         "limit_down_price": limit_down,
-        "is_excluded_name": False,
+        "is_excluded_name": excluded_name,
     }
 
 
@@ -258,6 +259,42 @@ def test_daily_executor_never_fills_after_frozen_exit_delay_limit() -> None:
     assert [trade["side"] for trade in result["trades"]] == ["BUY"]
     assert result["completed_trades"] == []
     assert result["unresolved_exits"] == 1
+
+
+def test_daily_executor_can_sell_position_after_name_becomes_st() -> None:
+    d0, d1, d2 = date(2014, 1, 2), date(2014, 1, 3), date(2014, 1, 6)
+    candidates = pl.DataFrame(
+        {
+            "alpha_id": [1],
+            "signal_date": [d0],
+            "entry_date": [d1],
+            "planned_exit_date": [d2],
+            "symbol": ["A.SZ"],
+            "rank": [1],
+            "alpha_value": [1.0],
+            "signal_amount": [100_000_000.0],
+            "benchmark_return": [0.0],
+        }
+    )
+    quotes = pl.DataFrame(
+        [
+            _quote(d1, "A.SZ"),
+            _quote(
+                d2,
+                "A.SZ",
+                raw_open=9.8,
+                limit_down=9.5,
+                excluded_name=True,
+            ),
+        ]
+    )
+
+    result = screen.simulate_daily_account(
+        candidates, quotes, [d1, d2], initial_cash=200_000.0
+    )
+
+    assert [trade["side"] for trade in result["trades"]] == ["BUY", "SELL"]
+    assert result["unresolved_exits"] == 0
 
 
 def test_holm_bonferroni_adjusts_all_31_formulas() -> None:
