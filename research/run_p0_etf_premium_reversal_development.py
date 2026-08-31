@@ -432,7 +432,7 @@ def run(data_dir: Path, output: Path) -> dict[str, Any]:
     master = pl.read_parquet(price_root / "master.parquet").filter(
         pl.col("fund_type") == "股票型"
     )
-    daily = daily.filter(pl.col("symbol").is_in(master["symbol"]))
+    daily = daily.filter(pl.col("symbol").is_in(master["symbol"].to_list()))
     nav = _load_nav(nav_root)
     panel = prepare_panel(daily, adjustments, master)
     schedule = weekly_schedule(panel)
