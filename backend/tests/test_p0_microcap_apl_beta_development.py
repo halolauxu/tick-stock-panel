@@ -64,22 +64,6 @@ def test_daily_annualized_uses_252_trading_days() -> None:
     assert result == pytest.approx((1.0 + daily_return) ** 252 - 1.0)
 
 
-def test_include_initial_cash_return_reconciles_full_equity_path() -> None:
-    daily = pl.DataFrame(
-        {
-            "date": [date(2020, 1, 2), date(2020, 1, 3)],
-            "equity": [110.0, 121.0],
-            "daily_return": [None, 0.1],
-        }
-    )
-
-    result = study._include_initial_cash_return(daily, 100.0)
-
-    returns = result.get_column("daily_return").to_list()
-    assert returns == pytest.approx([0.1, 0.1])
-    assert study.baseline._compound(returns) == pytest.approx(0.21)
-
-
 def test_build_candidates_uses_microcap_decile_then_lowest_apl_beta() -> None:
     signal_date, entry_date = date(2020, 1, 31), date(2020, 2, 3)
     observations = pl.DataFrame(

@@ -484,7 +484,6 @@ def summarize_account(
     simulation: dict[str, Any], quotes: pl.DataFrame, trading_dates: list[date], initial_cash: float
 ) -> dict[str, Any]:
     daily, stale = account.build_daily_equity(simulation, quotes, trading_dates, initial_cash=initial_cash)
-    daily = _include_initial_cash_return(daily, initial_cash)
     returns = daily.get_column("daily_return").drop_nulls().to_list()
     yearly = []
     for year in range(2014, 2021):
@@ -535,23 +534,6 @@ def summarize_account(
         "ending_equity": ending_equity,
         "completed_positions": len(completed),
     }
-
-
-def _include_initial_cash_return(
-    daily: pl.DataFrame, initial_cash: float
-) -> pl.DataFrame:
-    if daily.is_empty():
-        return daily
-    return (
-        daily.with_row_index("_row")
-        .with_columns(
-            pl.when(pl.col("_row") == 0)
-            .then(pl.col("equity") / initial_cash - 1.0)
-            .otherwise(pl.col("daily_return"))
-            .alias("daily_return")
-        )
-        .drop("_row")
-    )
 
 
 def _daily_annualized(values: list[float]) -> float | None:

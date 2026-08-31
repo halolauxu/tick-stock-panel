@@ -224,6 +224,7 @@ def test_daily_equity_uses_stale_mark_without_future_backfill() -> None:
     )
 
     assert daily["equity"].to_list() == [2_000.0, 2_000.0, 2_200.0]
+    assert daily["daily_return"].to_list() == pytest.approx([0.0, 0.0, 0.1])
     assert integrity["stale_position_days"] == 1
     assert integrity["longest_stale_trading_days"] == 1
     assert integrity["ending_unresolved_positions"] == 0

@@ -582,9 +582,11 @@ def build_daily_equity(
             (pl.col("cash") + pl.col("position_value")).alias("equity")
         )
         .with_columns(
-            (pl.col("equity") / pl.col("equity").shift(1) - 1.0).alias(
-                "daily_return"
-            ),
+            (
+                pl.col("equity")
+                / pl.col("equity").shift(1).fill_null(initial_cash)
+                - 1.0
+            ).alias("daily_return"),
             (pl.col("cash") / pl.col("equity")).alias("cash_ratio"),
         )
     )
