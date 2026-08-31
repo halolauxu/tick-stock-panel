@@ -36,6 +36,7 @@ DEVELOPMENT_START = date(2014, 1, 1)
 DEVELOPMENT_END = date(2020, 12, 31)
 PANEL_END = date(2021, 3, 31)
 HOLD_TRADING_DAYS = 20
+MAX_EXIT_DELAY = 20
 LOOKBACK_DAYS = 365
 COOLDOWN_DAYS = 60
 MIN_INSTITUTIONS = 10
@@ -213,7 +214,12 @@ def run(data_dir: Path, output: Path) -> dict[str, Any]:
     if events.is_empty():
         raise ValueError("institutional-survey attention filter produced no events")
     panel = prepare_panel(load_panel(data_dir, PANEL_START, PANEL_END))
-    trades = build_trades(events, panel, HOLD_TRADING_DAYS)
+    trades = build_trades(
+        events,
+        panel,
+        HOLD_TRADING_DAYS,
+        max_exit_delay=MAX_EXIT_DELAY,
+    )
     benchmark = build_market_benchmark(panel, HOLD_TRADING_DAYS)
     trades = attach_market_excess(trades, benchmark)
     summary = summarize(trades)
@@ -233,6 +239,7 @@ def run(data_dir: Path, output: Path) -> dict[str, Any]:
             "lookback_calendar_days": LOOKBACK_DAYS,
             "cooldown_calendar_days": COOLDOWN_DAYS,
             "holding_trading_days": HOLD_TRADING_DAYS,
+            "maximum_exit_delay_trading_days": MAX_EXIT_DELAY,
             "position_notional_cny": POSITION_NOTIONAL,
             "daily_participation_rate": DAILY_PARTICIPATION,
             "decision_clock": "notice date treated as after-close; next trading open entry",

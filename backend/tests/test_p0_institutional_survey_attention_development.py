@@ -66,3 +66,57 @@ def test_gate_requires_sample_return_stability_capacity_and_integrity() -> None:
     assert study.evaluate_gate(result) is True
     result["mean_net_return"] = 0.0299
     assert study.evaluate_gate(result) is False
+
+
+def test_run_uses_frozen_twenty_day_exit_delay(monkeypatch, tmp_path) -> None:
+    raw = pl.DataFrame(
+        {
+            "event_id": ["survey-000001.SZ-20140101"],
+            "symbol": ["000001.SZ"],
+            "notice_date": [date(2014, 1, 1)],
+            "institution_count": [10],
+        }
+    )
+    events = raw.with_columns(
+        pl.col("notice_date").alias("ann_date"),
+        pl.lit(study.CATEGORY).alias("category"),
+    )
+    panel = pl.DataFrame({"symbol": ["000001.SZ"]})
+    captured = {}
+
+    monkeypatch.setattr(study, "load_survey_events", lambda _data_dir: raw)
+    monkeypatch.setattr(study, "select_attention_spikes", lambda _raw: events)
+    monkeypatch.setattr(study, "load_panel", lambda *_args: panel)
+    monkeypatch.setattr(study, "prepare_panel", lambda frame: frame)
+
+    def fake_build_trades(
+        _events,
+        _panel,
+        holding_trading_days,
+        *,
+        max_exit_delay,
+    ):
+        captured["holding_trading_days"] = holding_trading_days
+        captured["max_exit_delay"] = max_exit_delay
+        return pl.DataFrame()
+
+    monkeypatch.setattr(study, "build_trades", fake_build_trades)
+    monkeypatch.setattr(
+        study, "build_market_benchmark", lambda _panel, _holding_days: pl.DataFrame()
+    )
+    monkeypatch.setattr(
+        study, "attach_market_excess", lambda trades, _benchmark: trades
+    )
+    monkeypatch.setattr(
+        study,
+        "summarize",
+        lambda _trades: {"promotion_passed": False},
+    )
+
+    payload = study.run(tmp_path, tmp_path / "result.json")
+
+    assert captured == {
+        "holding_trading_days": 20,
+        "max_exit_delay": 20,
+    }
+    assert payload["assumptions"]["maximum_exit_delay_trading_days"] == 20
