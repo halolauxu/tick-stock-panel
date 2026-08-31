@@ -151,14 +151,23 @@ def attach_point_in_time_security(panel: pl.DataFrame, data_dir: Path) -> pl.Dat
         )
         .with_columns(
             (
-                pl.col("name").is_null()
-                | (
-                    pl.col("end_date").is_not_null()
-                    & (pl.col("date") > pl.col("end_date"))
+                pl.col("name").is_not_null()
+                & (
+                    pl.col("end_date").is_null()
+                    | (pl.col("date") <= pl.col("end_date"))
                 )
-                | polars_is_risk_warning_name(pl.col("name").fill_null(""))
-                | pl.col("name").fill_null("").str.contains("退", literal=True)
-                | pl.col("name").fill_null("").str.contains("重新上市", literal=True)
+            ).alias("name_status_known")
+        )
+        .with_columns(
+            (
+                pl.col("name_status_known")
+                & (
+                    polars_is_risk_warning_name(pl.col("name").fill_null(""))
+                    | pl.col("name").fill_null("").str.contains("退", literal=True)
+                    | pl.col("name")
+                    .fill_null("")
+                    .str.contains("重新上市", literal=True)
+                )
             ).alias("excluded_name")
         )
         .drop("delist_date", "start_date", "end_date")
@@ -224,6 +233,7 @@ def prepare_panel(panel: pl.DataFrame) -> pl.DataFrame:
         "limit_up_price",
         "limit_down_price",
         "excluded_name",
+        "name_status_known",
         "_adjacent",
     )
 
@@ -269,6 +279,7 @@ def build_first_open_events(panel: pl.DataFrame) -> pl.DataFrame:
             "raw_open",
             "raw_close",
             "amount",
+            "name_status_known",
         )
         .sort(["signal_date", "symbol"])
     )
@@ -874,6 +885,9 @@ def run(data_dir: Path, output: Path, artifact_dir: Path) -> dict[str, Any]:
             "development_account_days": end_index - start_index + 1,
             "first_open_events": events.height,
             "first_open_symbols": events["symbol"].n_unique(),
+            "first_open_events_with_unknown_name_status": events.filter(
+                ~pl.col("name_status_known")
+            ).height,
             "ranked": ranked_counts,
         },
         "benchmark": benchmark,

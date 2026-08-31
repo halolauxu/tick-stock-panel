@@ -13,6 +13,43 @@ sys.path.insert(0, str(ROOT))
 from research import run_p0_ipo_first_open_wshape_development as study  # noqa: E402
 
 
+def test_missing_pit_name_is_unknown_not_a_fabricated_risk_warning(
+    tmp_path: Path,
+) -> None:
+    research = tmp_path / "research"
+    research.mkdir()
+    pl.DataFrame(
+        {
+            "symbol": ["000001.SZ"],
+            "list_date": [date(2014, 6, 16)],
+            "delist_date": pl.Series([None], dtype=pl.Date),
+        }
+    ).write_parquet(research / "historical_stock_universe_all_a.parquet")
+    pl.DataFrame(
+        schema={
+            "symbol": pl.String,
+            "name": pl.String,
+            "start_date": pl.Date,
+            "end_date": pl.Date,
+        }
+    ).write_parquet(research / "historical_stock_names_all_a.parquet")
+    source = pl.DataFrame(
+        {
+            "symbol": ["000001.SZ"],
+            "date": [date(2014, 6, 16)],
+            "open": [10.0],
+            "close": [10.0],
+            "volume": [100.0],
+            "amount": [1_000.0],
+            "raw_close": [10.0],
+            "consecutive_limit_ups": pl.Series([0], dtype=pl.UInt32),
+        }
+    )
+    row = study.attach_point_in_time_security(source, tmp_path).row(0, named=True)
+    assert row["name_status_known"] is False
+    assert row["excluded_name"] is False
+
+
 def _panel_rows(
     symbol: str,
     *,
@@ -35,6 +72,7 @@ def _panel_rows(
                 "consecutive_limit_ups": index,
                 "list_date": start,
                 "excluded_name": False,
+                "name_status_known": True,
             }
         )
     prior = closes[-1]
@@ -52,6 +90,7 @@ def _panel_rows(
             "consecutive_limit_ups": 0,
             "list_date": start,
             "excluded_name": False,
+            "name_status_known": True,
         }
     )
     return rows
