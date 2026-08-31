@@ -56,6 +56,14 @@ def test_compute_apl_betas_recovers_partial_regression_coefficient() -> None:
     ]
 
 
+def test_daily_annualized_uses_252_trading_days() -> None:
+    daily_return = 0.001
+
+    result = study._daily_annualized([daily_return] * 252)
+
+    assert result == pytest.approx((1.0 + daily_return) ** 252 - 1.0)
+
+
 def test_build_candidates_uses_microcap_decile_then_lowest_apl_beta() -> None:
     signal_date, entry_date = date(2020, 1, 31), date(2020, 2, 3)
     observations = pl.DataFrame(

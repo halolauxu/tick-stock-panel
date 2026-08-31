@@ -499,7 +499,7 @@ def summarize_account(
     planned = sum(row["side"] == "BUY" for row in simulation["orders"])
     capacity_skips = sum(row.get("reason") in {"signal_capacity", "insufficient_capacity"} for row in simulation["orders"] if row["side"] == "BUY")
     return {
-        "annualized": baseline._annualized(returns),
+        "annualized": _daily_annualized(returns),
         "total_return": baseline._compound(returns),
         "max_drawdown": baseline._max_drawdown(returns),
         "positive_years": sum((row["return"] or 0.0) > 0 for row in yearly),
@@ -513,6 +513,14 @@ def summarize_account(
         "ending_equity": float(daily.get_column("equity")[-1]),
         "completed_positions": len(completed),
     }
+
+
+def _daily_annualized(values: list[float]) -> float | None:
+    valid = [float(value) for value in values if value is not None and math.isfinite(value)]
+    total = baseline._compound(valid)
+    if total is None or total <= -1.0:
+        return None
+    return (1.0 + total) ** (252.0 / len(valid)) - 1.0
 
 
 def evaluate_gate(candidate: dict[str, Any], control: dict[str, Any], signal_months: int) -> dict[str, Any]:
