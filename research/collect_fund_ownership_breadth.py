@@ -59,7 +59,7 @@ def available_after(year: int, quarter: int) -> date:
     if quarter == 3:
         return date(year, 10, 31)
     if quarter == 4:
-        return date(year + 1, 4, 30)
+        return date(year + 1, 3, 31)
     raise ValueError("quarter must be 1..4")
 
 

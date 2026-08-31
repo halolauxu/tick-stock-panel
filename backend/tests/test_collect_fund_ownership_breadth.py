@@ -46,7 +46,7 @@ def test_availability_uses_conservative_disclosure_deadline() -> None:
     assert collector.available_after(2020, 1) == date(2020, 4, 30)
     assert collector.available_after(2020, 2) == date(2020, 8, 31)
     assert collector.available_after(2020, 3) == date(2020, 10, 31)
-    assert collector.available_after(2020, 4) == date(2021, 4, 30)
+    assert collector.available_after(2020, 4) == date(2021, 3, 31)
 
 
 def test_normalize_converts_units_and_market_share() -> None:
