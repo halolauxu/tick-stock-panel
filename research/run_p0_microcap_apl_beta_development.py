@@ -507,6 +507,18 @@ def summarize_account(
             "daily return chain does not reconcile to ending equity: "
             f"compounded={total_return}, expected={expected_total}"
         )
+    unresolved_exit_details = sorted(
+        (
+            {
+                "symbol": row["symbol"],
+                "entry_date": row["start_date"],
+                "exit_due_date": row.get("exit_due_date"),
+                "terminal_exit_failure": row.get("terminal_exit_failure"),
+            }
+            for row in simulation["ending_positions"]
+        ),
+        key=lambda row: (row["symbol"], row["entry_date"]),
+    )
     return {
         "annualized": _daily_annualized(returns),
         "total_return": total_return,
@@ -515,7 +527,8 @@ def summarize_account(
         "yearly": yearly,
         "execution": execution,
         "capacity_feasibility_rate": 1.0 - capacity_skips / planned if planned else 0.0,
-        "unresolved_exits": len(simulation["ending_positions"]),
+        "unresolved_exits": len(unresolved_exit_details),
+        "unresolved_exit_details": unresolved_exit_details,
         "max_cash_reconciliation_error": simulation["max_cash_reconciliation_error"],
         "max_positive_profit_contribution": max(profit_by_symbol.values(), default=0.0) / total_positive if total_positive > 0 else None,
         "stale": stale,
