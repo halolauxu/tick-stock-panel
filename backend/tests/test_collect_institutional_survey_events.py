@@ -89,6 +89,8 @@ def test_request_uses_verified_wide_report_page_size() -> None:
 
     assert params["pageSize"] == "50"
     assert collector.SOURCE_PAGE_LIMIT == 100
+    assert params["sortColumns"] == "NOTICE_DATE,SECUCODE,OBJECT_CODE,URL"
+    assert params["sortTypes"] == "1,1,1,1"
     assert params["source"] == "WEB"
     assert params["client"] == "WEB"
 
@@ -197,7 +199,52 @@ def test_fetch_month_splits_source_deep_pagination_into_daily_shards(
     rows = collector.fetch_month(fetch, 2020, 1, cache_dir=tmp_path)
 
     assert len(rows) == 101
-    assert (tmp_path / "day=2020-01-01" / "page=0002.json").is_file()
+    assert (
+        tmp_path
+        / "day=2020-01-01"
+        / "stable-ascending"
+        / "page=0002.json"
+    ).is_file()
+
+
+def test_daily_shard_over_page_limit_uses_bidirectional_stable_paging(
+    monkeypatch, tmp_path
+) -> None:
+    monkeypatch.setattr(collector, "SOURCE_PAGE_LIMIT", 2)
+
+    canonical = [_row(f"row-{index:03d}") for index in range(101)]
+
+    def fetch(params):
+        filter_value = params["filter"]
+        page = int(params["pageNumber"])
+        if "2020-01-01')(NOTICE_DATE<='2020-01-31" in filter_value:
+            return {
+                "result": {"count": 101, "pages": 3, "data": canonical[:50]},
+                "success": True,
+            }
+        if "2020-01-01')(NOTICE_DATE<='2020-01-01" not in filter_value:
+            return {"result": {"count": 0, "pages": 0, "data": []}, "success": True}
+        descending = params["sortTypes"].startswith("-1")
+        ordered = list(reversed(canonical)) if descending else canonical
+        start = (page - 1) * collector.PAGE_SIZE
+        return {
+            "result": {
+                "count": 101,
+                "pages": 3,
+                "data": ordered[start : start + collector.PAGE_SIZE],
+            },
+            "success": True,
+        }
+
+    rows = collector.fetch_month(fetch, 2020, 1, cache_dir=tmp_path)
+
+    assert len(rows) == 101
+    assert {row["OBJECT_CODE"] for row in rows} == {
+        row["OBJECT_CODE"] for row in canonical
+    }
+    day_cache = tmp_path / "day=2020-01-01"
+    assert (day_cache / "ascending" / "page=0002.json").is_file()
+    assert (day_cache / "descending" / "page=0002.json").is_file()
 
 
 def test_normalize_counts_unique_institutions_and_excludes_noninstitution() -> None:

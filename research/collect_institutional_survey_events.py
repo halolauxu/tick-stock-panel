@@ -14,6 +14,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from calendar import monthrange
+from collections import Counter
 from datetime import date
 from pathlib import Path
 from typing import Any
@@ -172,8 +173,8 @@ def _range_params(start: date, end: date, page: int) -> dict[str, str]:
         ),
         "pageNumber": str(page),
         "pageSize": str(PAGE_SIZE),
-        "sortColumns": "NOTICE_DATE",
-        "sortTypes": "1",
+        "sortColumns": "NOTICE_DATE,SECUCODE,OBJECT_CODE,URL",
+        "sortTypes": "1,1,1,1",
         "source": "WEB",
         "client": "WEB",
     }
@@ -269,11 +270,24 @@ def _fetch_bounded_range(
         fetch_json(_range_params(start, end, 1))
     )
     expected_pages = math.ceil(count / PAGE_SIZE) if count else 0
-    if pages != expected_pages or pages > SOURCE_PAGE_LIMIT:
+    if pages != expected_pages:
         raise ValueError("Eastmoney survey page count is inconsistent")
-    if cache_dir is not None:
+    if pages > SOURCE_PAGE_LIMIT:
+        return _fetch_bidirectional_range(
+            fetch_json,
+            year,
+            month,
+            start,
+            end,
+            count=count,
+            pages=pages,
+            first=first,
+            cache_dir=cache_dir,
+        )
+    stable_cache = cache_dir / "stable-ascending" if cache_dir is not None else None
+    if stable_cache is not None:
         _write_page_cache(
-            cache_dir,
+            stable_cache,
             year=year,
             month=month,
             page=1,
@@ -285,14 +299,14 @@ def _fetch_bounded_range(
     for page in range(2, pages + 1):
         current = (
             _read_page_cache(
-                cache_dir,
+                stable_cache,
                 year=year,
                 month=month,
                 page=page,
                 count=count,
                 pages=pages,
             )
-            if cache_dir is not None
+            if stable_cache is not None
             else None
         )
         if current is None:
@@ -301,9 +315,9 @@ def _fetch_bounded_range(
             )
             if current_count != count or current_pages != pages:
                 raise ValueError("Eastmoney survey pagination changed during collection")
-            if cache_dir is not None:
+            if stable_cache is not None:
                 _write_page_cache(
-                    cache_dir,
+                    stable_cache,
                     year=year,
                     month=month,
                     page=page,
@@ -314,6 +328,97 @@ def _fetch_bounded_range(
         rows.extend(current)
     if len(rows) != count:
         raise ValueError(f"survey pagination incomplete: expected {count}, got {len(rows)}")
+    return rows
+
+
+def _fetch_bidirectional_range(
+    fetch_json,
+    year: int,
+    month: int,
+    start: date,
+    end: date,
+    *,
+    count: int,
+    pages: int,
+    first: list[dict[str, Any]],
+    cache_dir: Path | None,
+) -> list[dict[str, Any]]:
+    if pages > SOURCE_PAGE_LIMIT * 2:
+        raise ValueError("Eastmoney survey range exceeds bidirectional page coverage")
+
+    def collect_direction(descending: bool) -> list[dict[str, Any]]:
+        direction = "descending" if descending else "ascending"
+        direction_cache = cache_dir / direction if cache_dir is not None else None
+        rows: list[dict[str, Any]] = []
+        for page in range(1, SOURCE_PAGE_LIMIT + 1):
+            current = (
+                _read_page_cache(
+                    direction_cache,
+                    year=year,
+                    month=month,
+                    page=page,
+                    count=count,
+                    pages=pages,
+                )
+                if direction_cache is not None
+                else None
+            )
+            if current is None:
+                if not descending and page == 1:
+                    current = first
+                else:
+                    params = _range_params(start, end, page)
+                    params["sortTypes"] = (
+                        "-1,-1,-1,-1" if descending else "1,1,1,1"
+                    )
+                    current, current_count, current_pages = _page_rows(
+                        fetch_json(params)
+                    )
+                    if current_count != count or current_pages != pages:
+                        raise ValueError(
+                            "Eastmoney survey pagination changed during collection"
+                        )
+                if direction_cache is not None:
+                    _write_page_cache(
+                        direction_cache,
+                        year=year,
+                        month=month,
+                        page=page,
+                        count=count,
+                        pages=pages,
+                        rows=current,
+                    )
+            rows.extend(current)
+        return rows
+
+    ascending = collect_direction(False)
+    descending = collect_direction(True)
+
+    def fingerprint(row: dict[str, Any]) -> str:
+        return json.dumps(row, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
+    examples: dict[str, dict[str, Any]] = {}
+    ascending_counts: Counter[str] = Counter()
+    descending_counts: Counter[str] = Counter()
+    for row in ascending:
+        key = fingerprint(row)
+        examples[key] = row
+        ascending_counts[key] += 1
+    for row in descending:
+        key = fingerprint(row)
+        examples[key] = row
+        descending_counts[key] += 1
+    merged_counts = ascending_counts | descending_counts
+    rows = [
+        dict(examples[key])
+        for key in sorted(merged_counts)
+        for _ in range(merged_counts[key])
+    ]
+    if len(rows) != count:
+        raise ValueError(
+            "bidirectional survey pagination did not reconstruct the exact row count: "
+            f"expected {count}, got {len(rows)}"
+        )
     return rows
 
 
