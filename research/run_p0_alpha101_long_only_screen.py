@@ -196,6 +196,8 @@ def attach_execution_dates_and_benchmark(
     context: formulas.Alpha101Context,
     eligible: np.ndarray,
     dates: list[date],
+    *,
+    max_exit_delay: int = MAX_EXIT_DELAY,
 ) -> pl.DataFrame:
     calendar = pl.DataFrame({"signal_date": dates}).with_columns(
         pl.col("signal_date").shift(-1).alias("entry_date"),
@@ -213,10 +215,14 @@ def attach_execution_dates_and_benchmark(
                 "benchmark_return": float(np.median(returns[valid])) if valid.any() else None,
             }
         )
+    liquidation_cutoff = dates[-(max_exit_delay + 1)]
     return (
         candidates.join(calendar, on="signal_date", how="left")
         .join(pl.DataFrame(gross_benchmark), on="signal_date", how="left")
-        .filter(pl.col("planned_exit_date") <= DEVELOPMENT_END)
+        .filter(
+            pl.col("planned_exit_date")
+            <= min(DEVELOPMENT_END, liquidation_cutoff)
+        )
         .drop_nulls(["entry_date", "planned_exit_date", "benchmark_return"])
         .sort(["entry_date", "rank", "symbol"])
     )

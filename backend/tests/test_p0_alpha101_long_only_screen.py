@@ -85,7 +85,11 @@ def test_attach_execution_dates_uses_next_two_market_days() -> None:
     )
 
     result = screen.attach_execution_dates_and_benchmark(
-        candidates, context, np.ones(prices.shape, dtype=bool), dates
+        candidates,
+        context,
+        np.ones(prices.shape, dtype=bool),
+        dates,
+        max_exit_delay=0,
     )
 
     assert result.select(
@@ -97,6 +101,15 @@ def test_attach_execution_dates_uses_next_two_market_days() -> None:
             "benchmark_return": pytest.approx(0.1),
         }
     ]
+
+    no_liquidation_window = screen.attach_execution_dates_and_benchmark(
+        candidates,
+        context,
+        np.ones(prices.shape, dtype=bool),
+        dates,
+        max_exit_delay=1,
+    )
+    assert no_liquidation_window.is_empty()
 
 
 def _quote(
