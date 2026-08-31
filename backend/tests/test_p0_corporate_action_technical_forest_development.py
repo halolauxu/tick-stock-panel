@@ -28,6 +28,11 @@ def _business_dates(start: date, count: int) -> list[date]:
     return output
 
 
+def test_evidence_commit_prefers_explicit_runtime_commit(monkeypatch) -> None:
+    monkeypatch.setenv("RESEARCH_GIT_COMMIT", "59e932b-full-sha")
+    assert study.implementation_git_commit() == "59e932b-full-sha"
+
+
 def test_active_pool_maps_after_close_and_weekend_without_future_data() -> None:
     dates = _business_dates(date(2020, 1, 2), 25)
     calendar = pl.DataFrame({"date": dates}).with_row_index("trade_index")

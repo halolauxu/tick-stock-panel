@@ -6,6 +6,8 @@ import argparse
 import hashlib
 import json
 import math
+import os
+import subprocess
 import sys
 from bisect import bisect_left
 from collections import Counter, defaultdict
@@ -101,6 +103,20 @@ def _json_default(value: Any) -> Any:
 
 def _sha256(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def implementation_git_commit() -> str:
+    configured = os.environ.get("RESEARCH_GIT_COMMIT", "").strip()
+    if configured:
+        return configured
+    try:
+        return subprocess.check_output(
+            ["git", "-C", str(ROOT), "rev-parse", "HEAD"],
+            text=True,
+            stderr=subprocess.DEVNULL,
+        ).strip()
+    except (OSError, subprocess.CalledProcessError):
+        return "unknown"
 
 
 def load_positive_events(data_dir: Path) -> pl.DataFrame:
@@ -1080,6 +1096,7 @@ def run(data_dir: Path, output: Path, artifact_dir: Path) -> dict[str, Any]:
     payload = {
         "schema_version": "p0-corporate-action-technical-forest-development-v1",
         "contract_frozen": "2026-08-31",
+        "implementation_git_commit": implementation_git_commit(),
         "period": {
             "event_start": EVENT_START,
             "account_start": DEVELOPMENT_START,
