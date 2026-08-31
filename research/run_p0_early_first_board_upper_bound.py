@@ -49,6 +49,26 @@ def commission(notional: float) -> float:
     return max(5.0, round(notional * COMMISSION_PCT, 2))
 
 
+def add_universe_eligibility(panel: pl.DataFrame) -> pl.DataFrame:
+    """Use only columns retained by the shared market-panel contract."""
+    return panel.with_columns(
+        pl.col("amount").shift(1).over("symbol").alias("previous_amount"),
+        (pl.col("close") / pl.col("raw_close")).alias("adj_factor"),
+    ).with_columns(
+        (
+            pl.col("daily_return").is_not_null()
+            & ~pl.col("_is_excluded")
+            & ~pl.col("_promotion_pool")
+            & (pl.col("limit_up_price") / 1.10).is_between(
+                3.0,
+                100.0,
+                closed="both",
+            )
+            & (pl.col("previous_amount") >= MIN_PREVIOUS_AMOUNT)
+        ).alias("universe_eligible")
+    )
+
+
 def prepare_context(data_dir: Path) -> pl.DataFrame:
     raw = emotion.load_daily_panel(
         data_dir,
@@ -57,18 +77,7 @@ def prepare_context(data_dir: Path) -> pl.DataFrame:
     )
     pit = emotion.attach_point_in_time_universe(raw, data_dir)
     panel = emotion.prepare_market_panel(pit).sort(["symbol", "date"])
-    return panel.with_columns(
-        pl.col("amount").shift(1).over("symbol").alias("previous_amount"),
-        (pl.col("close") / pl.col("raw_close")).alias("adj_factor"),
-    ).with_columns(
-        (
-            pl.col("_adjacent")
-            & ~pl.col("_is_excluded")
-            & ~pl.col("_prev_limit_up")
-            & pl.col("_reference_close").is_between(3.0, 100.0, closed="both")
-            & (pl.col("previous_amount") >= MIN_PREVIOUS_AMOUNT)
-        ).alias("universe_eligible")
-    )
+    return add_universe_eligibility(panel)
 
 
 def detect_early_first_board(

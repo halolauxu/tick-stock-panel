@@ -82,6 +82,30 @@ def test_commission_respects_five_yuan_minimum() -> None:
     assert study.commission(100_000.0) == 20.0
 
 
+def test_universe_eligibility_uses_retained_market_panel_columns() -> None:
+    panel = pl.DataFrame(
+        {
+            "symbol": ["000001.SZ", "000001.SZ", "000002.SZ", "000002.SZ"],
+            "amount": [60_000_000.0, 70_000_000.0, 60_000_000.0, 70_000_000.0],
+            "close": [10.0, 10.5, 10.0, 10.5],
+            "raw_close": [10.0, 10.5, 10.0, 10.5],
+            "daily_return": [None, 0.05, None, 0.05],
+            "_is_excluded": [False, False, False, False],
+            "_promotion_pool": [False, False, False, True],
+            "limit_up_price": [11.0, 11.55, 11.0, 11.55],
+        }
+    )
+
+    result = study.add_universe_eligibility(panel)
+
+    assert result.get_column("universe_eligible").to_list() == [
+        False,
+        True,
+        False,
+        False,
+    ]
+
+
 def test_account_uses_next_day_window_and_finishes_flat() -> None:
     first = date(2025, 8, 27)
     second = date(2025, 8, 28)
