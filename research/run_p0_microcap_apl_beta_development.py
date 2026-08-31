@@ -484,6 +484,7 @@ def summarize_account(
     simulation: dict[str, Any], quotes: pl.DataFrame, trading_dates: list[date], initial_cash: float
 ) -> dict[str, Any]:
     daily, stale = account.build_daily_equity(simulation, quotes, trading_dates, initial_cash=initial_cash)
+    daily = _include_initial_cash_return(daily, initial_cash)
     returns = daily.get_column("daily_return").drop_nulls().to_list()
     yearly = []
     for year in range(2014, 2021):
@@ -498,9 +499,17 @@ def summarize_account(
     execution = account.execution_summary(simulation["orders"])
     planned = sum(row["side"] == "BUY" for row in simulation["orders"])
     capacity_skips = sum(row.get("reason") in {"signal_capacity", "insufficient_capacity"} for row in simulation["orders"] if row["side"] == "BUY")
+    ending_equity = float(daily.get_column("equity")[-1])
+    total_return = baseline._compound(returns)
+    expected_total = ending_equity / initial_cash - 1.0
+    if total_return is None or abs(total_return - expected_total) > 1e-9:
+        raise ValueError(
+            "daily return chain does not reconcile to ending equity: "
+            f"compounded={total_return}, expected={expected_total}"
+        )
     return {
         "annualized": _daily_annualized(returns),
-        "total_return": baseline._compound(returns),
+        "total_return": total_return,
         "max_drawdown": baseline._max_drawdown(returns),
         "positive_years": sum((row["return"] or 0.0) > 0 for row in yearly),
         "yearly": yearly,
@@ -510,9 +519,26 @@ def summarize_account(
         "max_cash_reconciliation_error": simulation["max_cash_reconciliation_error"],
         "max_positive_profit_contribution": max(profit_by_symbol.values(), default=0.0) / total_positive if total_positive > 0 else None,
         "stale": stale,
-        "ending_equity": float(daily.get_column("equity")[-1]),
+        "ending_equity": ending_equity,
         "completed_positions": len(completed),
     }
+
+
+def _include_initial_cash_return(
+    daily: pl.DataFrame, initial_cash: float
+) -> pl.DataFrame:
+    if daily.is_empty():
+        return daily
+    return (
+        daily.with_row_index("_row")
+        .with_columns(
+            pl.when(pl.col("_row") == 0)
+            .then(pl.col("equity") / initial_cash - 1.0)
+            .otherwise(pl.col("daily_return"))
+            .alias("daily_return")
+        )
+        .drop("_row")
+    )
 
 
 def _daily_annualized(values: list[float]) -> float | None:
