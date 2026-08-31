@@ -65,7 +65,12 @@ FUND_FIELDS = (
 )
 
 
-def normalize_master(rows: list[dict[str, Any]]) -> pl.DataFrame:
+def normalize_master(
+    rows: list[dict[str, Any]],
+    *,
+    start: date = START,
+    end: date = END,
+) -> pl.DataFrame:
     if not rows:
         return pl.DataFrame()
     return (
@@ -85,15 +90,20 @@ def normalize_master(rows: list[dict[str, Any]]) -> pl.DataFrame:
         )
         .filter(
             (pl.col("opt_code") == OPTION_CODE)
-            & (pl.col("list_date") <= END)
-            & (pl.col("delist_date") >= START)
+            & (pl.col("list_date") <= end)
+            & (pl.col("delist_date") >= start)
         )
         .unique("contract", keep="last")
         .sort(["maturity_date", "exercise_price", "call_put", "contract"])
     )
 
 
-def normalize_fund(rows: list[dict[str, Any]]) -> pl.DataFrame:
+def normalize_fund(
+    rows: list[dict[str, Any]],
+    *,
+    start: date = START,
+    end: date = END,
+) -> pl.DataFrame:
     if not rows:
         return pl.DataFrame()
     return (
@@ -106,14 +116,18 @@ def normalize_fund(rows: list[dict[str, Any]]) -> pl.DataFrame:
                 for column in ("open", "high", "low", "close", "pre_close", "volume", "amount")
             ],
         )
-        .filter(pl.col("date").is_between(START, END, closed="both"))
+        .filter(pl.col("date").is_between(start, end, closed="both"))
         .unique("date", keep="last")
         .sort("date")
     )
 
 
 def normalize_options(
-    rows: list[dict[str, Any]], allowed_contracts: set[str]
+    rows: list[dict[str, Any]],
+    allowed_contracts: set[str],
+    *,
+    start: date = START,
+    end: date = END,
 ) -> pl.DataFrame:
     schema = {
         "contract": pl.Utf8,
@@ -162,7 +176,7 @@ def normalize_options(
         )
         .filter(
             pl.col("contract").is_in(allowed_contracts)
-            & pl.col("date").is_between(START, END, closed="both")
+            & pl.col("date").is_between(start, end, closed="both")
         )
         .select(*schema)
         .unique(["contract", "date"], keep="last")
