@@ -319,7 +319,7 @@ def _period_observations(daily: pl.DataFrame, *, frequency: str) -> list[dict[st
         grouped[key] = row
     ends = sorted(grouped.values(), key=lambda row: row["date"])
     output: list[dict[str, Any]] = []
-    for current, target in zip(ends, ends[1:], strict=True):
+    for current, target in zip(ends, ends[1:]):
         output.append(
             {
                 "signal_date": current["date"],

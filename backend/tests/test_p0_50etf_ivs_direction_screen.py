@@ -132,6 +132,20 @@ def test_recursive_forecast_never_uses_unfinished_label() -> None:
     )
 
 
+def test_period_observations_pair_each_period_with_the_next_period() -> None:
+    daily = pl.DataFrame(
+        {
+            "date": [date(2024, 1, 5), date(2024, 1, 12), date(2024, 1, 19)],
+            "ivs": [-0.1, -0.2, -0.3],
+            "underlying_close": [2.0, 2.1, 2.2],
+        }
+    )
+    result = study._period_observations(daily, frequency="weekly")
+    assert len(result) == 2
+    assert result[0]["signal_date"] == date(2024, 1, 5)
+    assert result[0]["target_date"] == date(2024, 1, 12)
+
+
 def test_weekly_timing_respects_next_open_lots_costs_and_ledger() -> None:
     dates = _business_dates(date(2019, 1, 4), 7)
     forecasts = [
