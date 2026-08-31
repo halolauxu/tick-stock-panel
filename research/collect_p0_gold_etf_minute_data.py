@@ -20,6 +20,9 @@ from app.plugins.tushare.client import TushareClient  # noqa: E402
 
 START = date(2025, 8, 1)
 END = date(2026, 8, 28)
+DEV_END = date(2025, 12, 31)
+VALIDATION_START = date(2026, 1, 1)
+VALIDATION_END = date(2026, 4, 30)
 SYMBOLS = ("518880.SH", "518800.SH", "159934.SZ", "159937.SZ")
 MINUTE_FIELDS = (
     "ts_code",
@@ -233,14 +236,33 @@ def collect(data_dir: Path, output: Path) -> dict[str, Any]:
     finally:
         client.close()
     minutes = pl.concat(minute_frames, how="vertical_relaxed")
+    phases = {
+        "development": minutes.filter(pl.col("datetime").dt.date() <= DEV_END),
+        "validation": minutes.filter(
+            pl.col("datetime").dt.date().is_between(
+                VALIDATION_START,
+                VALIDATION_END,
+                closed="both",
+            )
+        ),
+        "pressure": minutes.filter(pl.col("datetime").dt.date() > VALIDATION_END),
+    }
+    for phase, frame in phases.items():
+        for symbol in SYMBOLS:
+            _atomic_parquet(
+                frame.filter(pl.col("symbol") == symbol),
+                root / "phases" / phase / f"symbol={symbol}" / "part.parquet",
+            )
     payload = {
         "schema_version": "p0-gold-etf-minute-data-v1",
         "contract_frozen": "2026-08-31",
         "period": {"start": START, "end": END},
         "symbols": list(SYMBOLS),
         **audit(minutes, daily),
+        "phase_rows": {phase: frame.height for phase, frame in phases.items()},
         "artifacts": {
             "minute_root": str(root / "minute"),
+            "phase_root": str(root / "phases"),
             "daily": str(root / "daily.parquet"),
         },
     }
