@@ -217,7 +217,7 @@ def attach_execution_dates_and_benchmark(
         candidates.join(calendar, on="signal_date", how="left")
         .join(pl.DataFrame(gross_benchmark), on="signal_date", how="left")
         .filter(pl.col("planned_exit_date") <= DEVELOPMENT_END)
-        .drop_nulls("entry_date", "planned_exit_date", "benchmark_return")
+        .drop_nulls(["entry_date", "planned_exit_date", "benchmark_return"])
         .sort(["entry_date", "rank", "symbol"])
     )
 

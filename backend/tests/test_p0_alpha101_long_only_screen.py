@@ -58,6 +58,47 @@ def test_select_candidates_is_causal_eligible_and_symbol_deterministic() -> None
     ]
 
 
+def test_attach_execution_dates_uses_next_two_market_days() -> None:
+    dates = [
+        date(2014, 1, 2),
+        date(2014, 1, 3),
+        date(2014, 1, 6),
+    ]
+    candidates = pl.DataFrame(
+        {
+            "alpha_id": [1],
+            "signal_date": [dates[0]],
+            "symbol": ["A.SZ"],
+            "rank": [1],
+            "alpha_value": [1.0],
+            "signal_amount": [100_000_000.0],
+        }
+    )
+    prices = np.array([[10.0], [10.0], [11.0]], dtype=np.float32)
+    context = screen.formulas.Alpha101Context.from_arrays(
+        open=prices,
+        high=prices * 1.01,
+        low=prices * 0.99,
+        close=prices,
+        volume=np.full_like(prices, 1_000_000.0),
+        amount=np.full_like(prices, 1_000_000_000.0),
+    )
+
+    result = screen.attach_execution_dates_and_benchmark(
+        candidates, context, np.ones(prices.shape, dtype=bool), dates
+    )
+
+    assert result.select(
+        "entry_date", "planned_exit_date", "benchmark_return"
+    ).to_dicts() == [
+        {
+            "entry_date": dates[1],
+            "planned_exit_date": dates[2],
+            "benchmark_return": pytest.approx(0.1),
+        }
+    ]
+
+
 def _quote(
     day: date,
     symbol: str,
