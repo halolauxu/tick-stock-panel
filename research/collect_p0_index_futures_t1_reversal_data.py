@@ -24,6 +24,7 @@ SERIES_TO_INDEX = {
     "IH.CFX": "000016.SH",
     "IC.CFX": "000905.SH",
 }
+CONTRACT_MULTIPLIERS = {"IF": 300.0, "IH": 300.0, "IC": 200.0}
 FUTURE_FIELDS = (
     "ts_code",
     "trade_date",
@@ -133,6 +134,10 @@ def normalize_master(rows: list[dict[str, Any]]) -> pl.DataFrame:
         .with_columns(
             pl.col("contract").cast(pl.Utf8).str.strip_chars(),
             pl.col("per_unit").cast(pl.Float64, strict=False),
+            pl.col("fut_code")
+            .replace_strict(CONTRACT_MULTIPLIERS, default=None)
+            .cast(pl.Float64)
+            .alias("contract_multiplier"),
             *[
                 pl.col(column)
                 .cast(pl.Utf8)
@@ -193,7 +198,8 @@ def audit(
         "active_index_prices_valid": index_invalid == 0,
         "mapped_contracts_in_master": not missing_contracts,
         "mapped_contract_multipliers_valid": master_rows.filter(
-            pl.col("per_unit").is_null() | (pl.col("per_unit") <= 0)
+            pl.col("contract_multiplier").is_null()
+            | (pl.col("contract_multiplier") <= 0)
         ).is_empty(),
     }
     return {

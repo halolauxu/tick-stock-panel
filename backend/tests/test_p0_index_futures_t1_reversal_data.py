@@ -75,3 +75,33 @@ def test_normalize_mapping_keeps_one_contract_per_series_day() -> None:
 
     assert result.height == 1
     assert result["contract"][0] == "IF2002.CFX"
+
+
+def test_normalize_master_uses_exchange_contract_multiplier_not_per_unit() -> None:
+    result = study.normalize_master(
+        [
+            {
+                "ts_code": "IF2001.CFX",
+                "symbol": "IF2001",
+                "exchange": "CFFEX",
+                "name": "IF2001",
+                "fut_code": "IF",
+                "per_unit": 1,
+                "list_date": "20190101",
+                "delist_date": "20200117",
+            },
+            {
+                "ts_code": "IC2001.CFX",
+                "symbol": "IC2001",
+                "exchange": "CFFEX",
+                "name": "IC2001",
+                "fut_code": "IC",
+                "per_unit": 1,
+                "list_date": "20190101",
+                "delist_date": "20200117",
+            },
+        ]
+    )
+
+    multipliers = dict(zip(result["fut_code"], result["contract_multiplier"], strict=True))
+    assert multipliers == {"IC": 200.0, "IF": 300.0}
