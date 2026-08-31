@@ -122,3 +122,21 @@ def test_execution_bar_audit_requires_exact_minutes_and_positive_amount() -> Non
     result = study.attach_execution_bar_audit(events, minutes)
 
     assert result.item(0, "execution_bars_usable") is True
+
+
+def test_compatible_partition_scan_ignores_new_runtime_columns(tmp_path: Path) -> None:
+    first = tmp_path / "first.parquet"
+    second = tmp_path / "second.parquet"
+    pl.DataFrame(
+        {"symbol": ["000001.SZ"], "close": [10.0]}
+    ).write_parquet(first)
+    pl.DataFrame(
+        {"symbol": ["000001.SZ"], "close": [10.1], "quote_ts": [123]}
+    ).write_parquet(second)
+
+    result = study.scan_compatible_partitions(
+        [first, second], ["symbol", "close"]
+    ).collect()
+
+    assert result.columns == ["symbol", "close"]
+    assert result.height == 2

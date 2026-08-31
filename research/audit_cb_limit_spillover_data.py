@@ -243,6 +243,18 @@ def _partition_paths(root: Path, dataset: str, start: date, end: date) -> list[P
     return lead._partition_paths(root, dataset, start, end)
 
 
+def scan_compatible_partitions(
+    paths: list[Path],
+    columns: list[str],
+) -> pl.LazyFrame:
+    """Read evolving daily partitions through one explicit research schema."""
+    return pl.scan_parquet(
+        paths,
+        missing_columns="insert",
+        extra_columns="ignore",
+    ).select(columns)
+
+
 def _json_default(value: Any) -> Any:
     if isinstance(value, (date, datetime, time)):
         return value.isoformat()
@@ -266,7 +278,10 @@ def run(data_dir: Path, output: Path) -> dict[str, Any]:
     universe = lead.build_causal_universe(basic, cb_daily)
     stock_symbols = universe.get_column("stock_symbol").unique().to_list()
     stock_daily = (
-        pl.scan_parquet(stock_daily_paths)
+        scan_compatible_partitions(
+            stock_daily_paths,
+            ["symbol", "date", "close"],
+        )
         .filter(pl.col("symbol").is_in(stock_symbols))
         .collect()
     )
@@ -275,7 +290,10 @@ def run(data_dir: Path, output: Path) -> dict[str, Any]:
     )
     reference = build_stock_limit_reference(stock_daily, names)
     stock_minute = (
-        pl.scan_parquet(stock_minute_paths)
+        scan_compatible_partitions(
+            stock_minute_paths,
+            ["symbol", "datetime", "close", "amount"],
+        )
         .filter(pl.col("symbol").is_in(stock_symbols))
         .collect()
     )
