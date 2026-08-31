@@ -176,6 +176,20 @@ def audit(events: pl.DataFrame, partition_count: int) -> dict[str, Any]:
             != pl.col("partition_quarter")
         )
     ).height
+    period_year = pl.col("period_end").dt.year()
+    period_month = pl.col("period_end").dt.month()
+    expected_availability = (
+        pl.when(period_month == 3)
+        .then(pl.date(period_year, 4, 30))
+        .when(period_month == 6)
+        .then(pl.date(period_year, 8, 31))
+        .when(period_month == 9)
+        .then(pl.date(period_year, 10, 31))
+        .otherwise(pl.date(period_year + 1, 3, 31))
+    )
+    availability_mismatch = events.filter(
+        pl.col("available_after") != expected_availability
+    ).height
     quality = quarter_quality(events)
     incomplete_periods = quality.filter(~pl.col("complete")).get_column(
         "period_end"
@@ -213,6 +227,7 @@ def audit(events: pl.DataFrame, partition_count: int) -> dict[str, Any]:
         and invalid_symbols == 0
         and invalid_counts == 0
         and partition_mismatch == 0
+        and availability_mismatch == 0
     )
     latest_only_partial = incomplete_periods == [date(2026, 6, 30)]
     development_sample = candidates["share_growth_50pct_count_plus_10"]["yearly"]
@@ -248,6 +263,7 @@ def audit(events: pl.DataFrame, partition_count: int) -> dict[str, Any]:
             "invalid_symbols": invalid_symbols,
             "invalid_counts": invalid_counts,
             "partition_mismatch": partition_mismatch,
+            "availability_mismatch": availability_mismatch,
             "incomplete_periods": incomplete_periods,
             "quarterly_quality": quality.to_dicts(),
         },
