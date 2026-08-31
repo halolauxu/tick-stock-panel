@@ -19,8 +19,8 @@ SPEC.loader.exec_module(collector)
 def test_expected_months_are_contiguous() -> None:
     months = collector.expected_months()
     assert months[0] == "2007-12"
-    assert months[-1] == "2012-12"
-    assert len(months) == 61
+    assert months[-1] == "2013-08"
+    assert len(months) == 69
 
 
 def test_month_end_trading_dates_uses_last_open_day() -> None:
@@ -32,7 +32,7 @@ def test_month_end_trading_dates_uses_last_open_day() -> None:
         rows.append({"cal_date": month.replace("-", "") + "01", "is_open": 1})
     values = collector.month_end_trading_dates(rows)
     assert values[0] == date(2007, 12, 28)
-    assert len(values) == 61
+    assert len(values) == 69
 
 
 def test_normalize_month_joins_exact_adjustment_factor() -> None:

@@ -23,7 +23,7 @@ from app.plugins.tushare.client import TushareClient  # noqa: E402
 from app.plugins.tushare.provider import get_api_key  # noqa: E402
 
 START_DATE = date(2007, 12, 1)
-END_DATE = date(2012, 12, 31)
+END_DATE = date(2013, 8, 31)
 CALENDAR_FIELDS = ("exchange", "cal_date", "is_open", "pretrade_date")
 MONTHLY_FIELDS = (
     "ts_code",

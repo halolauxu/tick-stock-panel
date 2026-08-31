@@ -57,6 +57,36 @@ def test_scores_use_five_prior_same_months_and_exclude_target_year() -> None:
     assert january_2013["other_month_score"] > january_2013["same_month_score"]
 
 
+def test_monthly_history_prefers_complete_warmup_overlap() -> None:
+    raw_source = pl.DataFrame(
+        {
+            "symbol": ["600000.SH", "600000.SH"],
+            "date": [date(2013, 8, 29), date(2013, 9, 30)],
+            "close": [10.0, 11.0],
+        }
+    )
+    warmup = pl.DataFrame(
+        {
+            "symbol": ["600000.SH", "600000.SH"],
+            "month_end": [date(2013, 7, 31), date(2013, 8, 30)],
+            "adjusted_close": [8.0, 10.0],
+        }
+    )
+    history = study.build_monthly_return_history(raw_source, warmup)
+    august = (
+        history.filter((pl.col("year") == 2013) & (pl.col("month") == 8))
+        .get_column("monthly_return")
+        .item()
+    )
+    september = (
+        history.filter((pl.col("year") == 2013) & (pl.col("month") == 9))
+        .get_column("monthly_return")
+        .item()
+    )
+    assert august == pytest.approx(0.25)
+    assert september == pytest.approx(0.10)
+
+
 def test_candidates_use_only_top_decile_for_requested_score() -> None:
     count = 100
     ranked = pl.DataFrame(

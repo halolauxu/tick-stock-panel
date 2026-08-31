@@ -121,7 +121,7 @@ def build_monthly_return_history(
     )
     return (
         pl.concat([warmup_returns, current_returns], how="vertical")
-        .unique(subset=["symbol", "year", "month"], keep="last")
+        .unique(subset=["symbol", "year", "month"], keep="first")
         .sort(["symbol", "year", "month"])
     )
 
