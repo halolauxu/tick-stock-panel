@@ -150,6 +150,33 @@ def test_candidate_ranking_never_substitutes_below_frozen_top_ten() -> None:
     ]
 
 
+def test_quote_lookup_keeps_adjusted_close_for_position_valuation() -> None:
+    dates = _business_dates(date(2020, 1, 2), 3)
+    panel = pl.DataFrame(
+        {
+            "symbol": ["A"] * 3,
+            "date": dates,
+            "name": ["A"] * 3,
+            "open": [10.0, 10.1, 10.2],
+            "high": [10.2, 10.3, 10.4],
+            "low": [9.8, 9.9, 10.0],
+            "close": [10.05, 10.15, 10.25],
+            "raw_open": [10.0, 10.1, 10.2],
+            "raw_high": [10.2, 10.3, 10.4],
+            "raw_low": [9.8, 9.9, 10.0],
+            "raw_close": [10.05, 10.15, 10.25],
+            "amount": [100_000_000.0] * 3,
+            "volume": [1_000_000.0] * 3,
+            "excluded_name": [False] * 3,
+        }
+    )
+    ranked = pl.DataFrame({"symbol": ["A"], "entry_index": [1]})
+    lookup, calendar_dates = study.build_quote_lookup(panel, [ranked])
+    assert calendar_dates == dates
+    assert lookup[("A", 1)]["close"] == pytest.approx(10.15)
+    assert lookup[("A", 1)]["exact_quote"] is True
+
+
 def _quote(index: int, raw_open: float = 10.0, *, limit_up: bool = False) -> dict:
     return {
         "date": date(2020, 1, 2) + timedelta(days=index),

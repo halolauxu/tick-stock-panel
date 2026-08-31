@@ -555,7 +555,15 @@ def build_quote_lookup(
     panel: pl.DataFrame,
     ranked_frames: list[pl.DataFrame],
 ) -> tuple[dict[tuple[str, int], dict[str, Any]], list[date]]:
-    execution = prepare_panel(panel)
+    adjusted_marks = attach_trade_index(panel).select(
+        "symbol", "trade_index", "close"
+    )
+    execution = prepare_panel(panel).join(
+        adjusted_marks,
+        on=["symbol", "trade_index"],
+        how="left",
+        validate="1:1",
+    )
     calendar = execution.select("date", "trade_index").unique().sort("trade_index")
     all_dates = calendar.get_column("date").to_list()
     required: list[dict[str, Any]] = []
@@ -631,7 +639,13 @@ def simulate_account(
             if trade_index < position["planned_exit_index"] or position.get("unresolved"):
                 continue
             quote = quote_lookup.get((symbol, trade_index))
-            reason = _sell_rejection(position, quote)
+            reason = (
+                "missing_adjusted_price"
+                if quote
+                and quote.get("exact_quote")
+                and (quote.get("open") is None or quote.get("close") is None)
+                else _sell_rejection(position, quote)
+            )
             delay = trade_index - int(position["planned_exit_index"])
             if reason:
                 unresolved = delay >= MAX_EXIT_DELAY
@@ -694,6 +708,12 @@ def simulate_account(
             shares = affordable_shares(raw_open, target_notional, cash)
             gross = shares * raw_open
             reason = "zero_lot_or_cash" if shares <= 0 else _buy_rejection(quote, gross)
+            if (
+                reason is None
+                and quote
+                and (quote.get("open") is None or quote.get("close") is None)
+            ):
+                reason = "missing_adjusted_price"
             order = {
                 "date": trade_date,
                 "trade_index": trade_index,
