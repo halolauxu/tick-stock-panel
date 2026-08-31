@@ -160,6 +160,27 @@ def test_december_2016_ipo_is_not_dropped_from_development() -> None:
     assert events["symbol"].to_list() == ["600001.SH"]
 
 
+def test_suspension_gap_does_not_erase_prior_limit_up_streak() -> None:
+    rows = _panel_rows("000001.SZ", first_open_return=0.06)
+    rows[-1]["date"] = rows[-1]["date"] + timedelta(days=1)
+    event_date = rows[-1]["date"]
+    rows.append(
+        {
+            **rows[0],
+            "symbol": "600001.SH",
+            "date": event_date - timedelta(days=1),
+            "list_date": event_date - timedelta(days=1),
+        }
+    )
+    panel = study.prepare_panel(pl.DataFrame(rows, infer_schema_length=None))
+    target = panel.filter((pl.col("symbol") == "000001.SZ") & (pl.col("date") == event_date)).row(
+        0, named=True
+    )
+    assert target["_adjacent"] is False
+    events = study.build_first_open_events(panel)
+    assert events["symbol"].to_list() == ["000001.SZ"]
+
+
 def _quote(
     symbol: str,
     day: date,

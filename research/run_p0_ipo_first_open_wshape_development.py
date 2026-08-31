@@ -198,13 +198,9 @@ def prepare_panel(panel: pl.DataFrame) -> pl.DataFrame:
     )
     factor_changed = (pl.col("_factor") - pl.col("_prior_factor")).abs() > 1e-6
     work = work.with_columns(
-        pl.when(pl.col("_adjacent"))
-        .then(
-            pl.when(factor_changed)
-            .then(pl.col("_prior_close"))
-            .otherwise(pl.col("_prior_raw_close"))
-        )
-        .otherwise(None)
+        pl.when(factor_changed)
+        .then(pl.col("_prior_close"))
+        .otherwise(pl.col("_prior_raw_close"))
         .alias("reference_close"),
         (pl.col("close") / pl.col("open") - 1.0).alias("intraday_return"),
     ).with_columns(
@@ -249,7 +245,6 @@ def build_first_open_events(panel: pl.DataFrame) -> pl.DataFrame:
         & pl.col("listing_trade_index").is_between(
             1, MAX_LISTING_TRADING_DAYS - 1, closed="both"
         )
-        & pl.col("_adjacent")
         & (pl.col("prior_consecutive_limit_ups") >= MIN_PRIOR_LIMIT_UPS)
         & ~pl.col("excluded_name")
         & (pl.col("volume").fill_null(0) > 0)
