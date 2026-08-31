@@ -34,6 +34,13 @@ MAX_PAGES = 2_000
 # the provider's observed unstable deep-pagination range.
 SOURCE_PAGE_LIMIT = 100
 MIN_INTERVAL_SECONDS = 1.0
+PAGE_CACHE_SCHEMA_VERSION = 2
+SORT_COLUMNS = (
+    "NOTICE_DATE,SECUCODE,URL,OBJECT_CODE,RECEIVE_START_DATE,"
+    "RECEIVE_END_DATE,RECEIVE_OBJECT_TYPE,RECEIVE_OBJECT,ORG_TYPE,SUM"
+)
+SORT_TYPES_ASC = ",".join(["1"] * 10)
+SORT_TYPES_DESC = ",".join(["-1"] * 10)
 EVENT_SCHEMA = {
     "event_id": pl.String,
     "notice_date": pl.Date,
@@ -130,7 +137,9 @@ class EastmoneySurveyClient:
                         "message": "normalized empty result",
                         "result": {"count": 0, "pages": 0, "data": []},
                     }
-                message = str(payload.get("message") if isinstance(payload, dict) else "")
+                message = str(
+                    payload.get("message") if isinstance(payload, dict) else ""
+                )
                 if "繁忙" not in message:
                     code = payload.get("code") if isinstance(payload, dict) else None
                     requested_range = params.get("filter", "")
@@ -168,13 +177,12 @@ def _range_params(start: date, end: date, page: int) -> dict[str, str]:
             "URL"
         ),
         "filter": (
-            f"(NOTICE_DATE>='{start.isoformat()}')"
-            f"(NOTICE_DATE<='{end.isoformat()}')"
+            f"(NOTICE_DATE>='{start.isoformat()}')(NOTICE_DATE<='{end.isoformat()}')"
         ),
         "pageNumber": str(page),
         "pageSize": str(PAGE_SIZE),
-        "sortColumns": "NOTICE_DATE,SECUCODE,OBJECT_CODE,URL",
-        "sortTypes": "1,1,1,1",
+        "sortColumns": SORT_COLUMNS,
+        "sortTypes": SORT_TYPES_ASC,
         "source": "WEB",
         "client": "WEB",
     }
@@ -192,8 +200,10 @@ def _page_rows(payload: dict[str, Any]) -> tuple[list[dict[str, Any]], int, int]
     rows = result.get("data") or []
     if not isinstance(rows, list) or any(not isinstance(row, dict) for row in rows):
         raise ValueError("Eastmoney survey rows are malformed")
-    return [dict(row) for row in rows], int(result.get("count") or 0), int(
-        result.get("pages") or 0
+    return (
+        [dict(row) for row in rows],
+        int(result.get("count") or 0),
+        int(result.get("pages") or 0),
     )
 
 
@@ -210,9 +220,13 @@ def _write_page_cache(
     count: int,
     pages: int,
     rows: list[dict[str, Any]],
+    sort_types: str,
 ) -> None:
     _atomic_write_json(
         {
+            "cache_schema_version": PAGE_CACHE_SCHEMA_VERSION,
+            "sort_columns": SORT_COLUMNS,
+            "sort_types": sort_types,
             "year": year,
             "month": month,
             "page": page,
@@ -232,6 +246,7 @@ def _read_page_cache(
     page: int,
     count: int,
     pages: int,
+    sort_types: str,
 ) -> list[dict[str, Any]] | None:
     path = _page_cache_path(cache_dir, page)
     try:
@@ -241,6 +256,9 @@ def _read_page_cache(
     if not isinstance(payload, dict) or any(
         payload.get(key) != value
         for key, value in {
+            "cache_schema_version": PAGE_CACHE_SCHEMA_VERSION,
+            "sort_columns": SORT_COLUMNS,
+            "sort_types": sort_types,
             "year": year,
             "month": month,
             "page": page,
@@ -294,6 +312,7 @@ def _fetch_bounded_range(
             count=count,
             pages=pages,
             rows=first,
+            sort_types=SORT_TYPES_ASC,
         )
     rows = list(first)
     for page in range(2, pages + 1):
@@ -305,6 +324,7 @@ def _fetch_bounded_range(
                 page=page,
                 count=count,
                 pages=pages,
+                sort_types=SORT_TYPES_ASC,
             )
             if stable_cache is not None
             else None
@@ -314,7 +334,9 @@ def _fetch_bounded_range(
                 fetch_json(_range_params(start, end, page))
             )
             if current_count != count or current_pages != pages:
-                raise ValueError("Eastmoney survey pagination changed during collection")
+                raise ValueError(
+                    "Eastmoney survey pagination changed during collection"
+                )
             if stable_cache is not None:
                 _write_page_cache(
                     stable_cache,
@@ -324,10 +346,13 @@ def _fetch_bounded_range(
                     count=count,
                     pages=pages,
                     rows=current,
+                    sort_types=SORT_TYPES_ASC,
                 )
         rows.extend(current)
     if len(rows) != count:
-        raise ValueError(f"survey pagination incomplete: expected {count}, got {len(rows)}")
+        raise ValueError(
+            f"survey pagination incomplete: expected {count}, got {len(rows)}"
+        )
     return rows
 
 
@@ -359,6 +384,7 @@ def _fetch_bidirectional_range(
                     page=page,
                     count=count,
                     pages=pages,
+                    sort_types=(SORT_TYPES_DESC if descending else SORT_TYPES_ASC),
                 )
                 if direction_cache is not None
                 else None
@@ -369,7 +395,7 @@ def _fetch_bidirectional_range(
                 else:
                     params = _range_params(start, end, page)
                     params["sortTypes"] = (
-                        "-1,-1,-1,-1" if descending else "1,1,1,1"
+                        SORT_TYPES_DESC if descending else SORT_TYPES_ASC
                     )
                     current, current_count, current_pages = _page_rows(
                         fetch_json(params)
@@ -387,6 +413,7 @@ def _fetch_bidirectional_range(
                         count=count,
                         pages=pages,
                         rows=current,
+                        sort_types=(SORT_TYPES_DESC if descending else SORT_TYPES_ASC),
                     )
             rows.extend(current)
         return rows
@@ -395,7 +422,9 @@ def _fetch_bidirectional_range(
     descending = collect_direction(True)
 
     def fingerprint(row: dict[str, Any]) -> str:
-        return json.dumps(row, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        return json.dumps(
+            row, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+        )
 
     examples: dict[str, dict[str, Any]] = {}
     ascending_counts: Counter[str] = Counter()
@@ -527,8 +556,16 @@ def normalize(rows: list[dict[str, Any]], year: int, month: int) -> pl.DataFrame
             .n_unique()
             .alias("survey_session_count"),
             pl.col("provider_sum").max().alias("provider_sum_max"),
-            pl.col("org_type").drop_nulls().unique().sort().str.join("|").alias("org_types"),
-            pl.col("source_url").filter(pl.col("source_url") != "").first().alias("source_url"),
+            pl.col("org_type")
+            .drop_nulls()
+            .unique()
+            .sort()
+            .str.join("|")
+            .alias("org_types"),
+            pl.col("source_url")
+            .filter(pl.col("source_url") != "")
+            .first()
+            .alias("source_url"),
             pl.len().alias("institution_detail_rows"),
         )
         .with_columns(

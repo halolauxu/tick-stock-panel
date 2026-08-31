@@ -8,17 +8,11 @@ from pathlib import Path
 
 import pytest
 
-SCRIPT = (
-    Path(__file__).resolve().parents[2]
-    / "research"
-    / "collect_institutional_survey_events.py"
-)
+SCRIPT = Path(__file__).resolve().parents[2] / "research" / "collect_institutional_survey_events.py"
 
 
 def _load_module():
-    spec = importlib.util.spec_from_file_location(
-        "collect_institutional_survey_events", SCRIPT
-    )
+    spec = importlib.util.spec_from_file_location("collect_institutional_survey_events", SCRIPT)
     assert spec and spec.loader
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
@@ -89,8 +83,20 @@ def test_request_uses_verified_wide_report_page_size() -> None:
 
     assert params["pageSize"] == "50"
     assert collector.SOURCE_PAGE_LIMIT == 100
-    assert params["sortColumns"] == "NOTICE_DATE,SECUCODE,OBJECT_CODE,URL"
-    assert params["sortTypes"] == "1,1,1,1"
+    assert params["sortColumns"] == collector.SORT_COLUMNS
+    assert params["sortTypes"] == collector.SORT_TYPES_ASC
+    assert params["sortColumns"].split(",") == [
+        "NOTICE_DATE",
+        "SECUCODE",
+        "URL",
+        "OBJECT_CODE",
+        "RECEIVE_START_DATE",
+        "RECEIVE_END_DATE",
+        "RECEIVE_OBJECT_TYPE",
+        "RECEIVE_OBJECT",
+        "ORG_TYPE",
+        "SUM",
+    ]
     assert params["source"] == "WEB"
     assert params["client"] == "WEB"
 
@@ -129,9 +135,7 @@ def test_client_surfaces_provider_error_context(monkeypatch) -> None:
 def test_client_normalizes_provider_empty_result(monkeypatch) -> None:
     def fake_urlopen(_request, *, timeout):
         del timeout
-        return _Response(
-            {"success": False, "code": 9201, "message": "返回数据为空"}
-        )
+        return _Response({"success": False, "code": 9201, "message": "返回数据为空"})
 
     monkeypatch.setattr(collector.urllib.request, "urlopen", fake_urlopen)
     client = collector.EastmoneySurveyClient(min_interval=0)
@@ -164,9 +168,41 @@ def test_fetch_month_reuses_valid_page_cache(tmp_path) -> None:
     assert calls == ["1"]
 
 
-def test_fetch_month_splits_source_deep_pagination_into_daily_shards(
-    monkeypatch, tmp_path
-) -> None:
+def test_fetch_month_rejects_cache_from_old_sort_contract(tmp_path) -> None:
+    calls = []
+
+    def fetch(params):
+        calls.append(params["pageNumber"])
+        return {
+            "result": {"count": 1, "pages": 1, "data": [_row("fresh")]},
+            "success": True,
+        }
+
+    cache_path = tmp_path / "stable-ascending" / "page=0001.json"
+    cache_path.parent.mkdir(parents=True)
+    cache_path.write_text(
+        json.dumps(
+            {
+                "year": 2020,
+                "month": 1,
+                "page": 1,
+                "count": 1,
+                "pages": 1,
+                "rows": [_row("stale")],
+            }
+        )
+    )
+
+    rows = collector.fetch_month(fetch, 2020, 1, cache_dir=tmp_path)
+
+    assert calls == ["1"]
+    assert rows[0]["OBJECT_CODE"] == "fresh"
+    payload = json.loads(cache_path.read_text())
+    assert payload["cache_schema_version"] == collector.PAGE_CACHE_SCHEMA_VERSION
+    assert payload["sort_columns"] == collector.SORT_COLUMNS
+
+
+def test_fetch_month_splits_source_deep_pagination_into_daily_shards(monkeypatch, tmp_path) -> None:
     monkeypatch.setattr(collector, "SOURCE_PAGE_LIMIT", 2)
 
     def fetch(params):
@@ -199,12 +235,7 @@ def test_fetch_month_splits_source_deep_pagination_into_daily_shards(
     rows = collector.fetch_month(fetch, 2020, 1, cache_dir=tmp_path)
 
     assert len(rows) == 101
-    assert (
-        tmp_path
-        / "day=2020-01-01"
-        / "stable-ascending"
-        / "page=0002.json"
-    ).is_file()
+    assert (tmp_path / "day=2020-01-01" / "stable-ascending" / "page=0002.json").is_file()
 
 
 def test_daily_shard_over_page_limit_uses_bidirectional_stable_paging(
@@ -239,9 +270,7 @@ def test_daily_shard_over_page_limit_uses_bidirectional_stable_paging(
     rows = collector.fetch_month(fetch, 2020, 1, cache_dir=tmp_path)
 
     assert len(rows) == 101
-    assert {row["OBJECT_CODE"] for row in rows} == {
-        row["OBJECT_CODE"] for row in canonical
-    }
+    assert {row["OBJECT_CODE"] for row in rows} == {row["OBJECT_CODE"] for row in canonical}
     day_cache = tmp_path / "day=2020-01-01"
     assert (day_cache / "ascending" / "page=0002.json").is_file()
     assert (day_cache / "descending" / "page=0002.json").is_file()
