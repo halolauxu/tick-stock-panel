@@ -41,7 +41,7 @@ from research.run_p0_microcap_baseline import (  # noqa: E402
 SIGNAL_START = date(2014, 6, 16)
 DEVELOPMENT_END = date(2016, 12, 31)
 PANEL_END = date(2017, 1, 31)
-IPO_LIST_END = date(2016, 11, 30)
+DEVELOPMENT_LIST_END = DEVELOPMENT_END
 INITIAL_CAPITALS = (200_000.0, 300_000.0, 500_000.0, 1_000_000.0)
 MIN_PRIOR_LIMIT_UPS = 3
 MAX_LISTING_TRADING_DAYS = 35
@@ -232,7 +232,9 @@ def build_first_open_events(panel: pl.DataFrame) -> pl.DataFrame:
     eligible = panel.filter(
         pl.col("symbol").str.starts_with("00") | pl.col("symbol").str.starts_with("60")
     ).filter(
-        pl.col("list_date").is_between(SIGNAL_START, IPO_LIST_END, closed="both")
+        pl.col("list_date").is_between(
+            SIGNAL_START, DEVELOPMENT_LIST_END, closed="both"
+        )
         & pl.col("date").is_between(SIGNAL_START, DEVELOPMENT_END, closed="both")
         & pl.col("listing_trade_index").is_between(
             1, MAX_LISTING_TRADING_DAYS - 1, closed="both"

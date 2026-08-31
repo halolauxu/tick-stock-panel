@@ -18,8 +18,8 @@ def _panel_rows(
     *,
     first_open_return: float,
     first_open_at_limit: bool = False,
+    start: date = date(2014, 6, 16),
 ) -> list[dict]:
-    start = date(2014, 6, 16)
     closes = [10.0, 11.0, 12.1, 13.31]
     rows = []
     for index, close in enumerate(closes):
@@ -106,6 +106,19 @@ def test_development_builder_does_not_admit_validation_signals() -> None:
         study.prepare_panel(pl.DataFrame(rows, infer_schema_length=None))
     )
     assert events["symbol"].to_list() == ["000001.SZ"]
+
+
+def test_december_2016_ipo_is_not_dropped_from_development() -> None:
+    raw = pl.DataFrame(
+        _panel_rows(
+            "600001.SH",
+            first_open_return=0.06,
+            start=date(2016, 12, 19),
+        ),
+        infer_schema_length=None,
+    )
+    events = study.build_first_open_events(study.prepare_panel(raw))
+    assert events["symbol"].to_list() == ["600001.SH"]
 
 
 def _quote(
