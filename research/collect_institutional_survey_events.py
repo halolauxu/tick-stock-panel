@@ -28,9 +28,10 @@ REPORT_NAME = "RPT_ORG_SURVEY"
 # repeated "server busy" responses.
 PAGE_SIZE = 50
 MAX_PAGES = 2_000
-# The endpoint reports deeper page counts but consistently returns code 9701
-# around the 10,000-row boundary. Split oversized months before that boundary.
-SOURCE_PAGE_LIMIT = 200
+# The endpoint reports deeper page counts, but production collection repeatedly
+# returned code 9701 before page 150.  Split at 5,000 rows so no request enters
+# the provider's observed unstable deep-pagination range.
+SOURCE_PAGE_LIMIT = 100
 MIN_INTERVAL_SECONDS = 1.0
 EVENT_SCHEMA = {
     "event_id": pl.String,

@@ -88,6 +88,7 @@ def test_request_uses_verified_wide_report_page_size() -> None:
     params = collector._params(2020, 1, 1)
 
     assert params["pageSize"] == "50"
+    assert collector.SOURCE_PAGE_LIMIT == 100
     assert params["source"] == "WEB"
     assert params["client"] == "WEB"
 
