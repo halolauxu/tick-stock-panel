@@ -103,6 +103,51 @@ def test_normalize_month_rejects_missing_factor() -> None:
         )
 
 
+def test_complete_factor_rows_uses_latest_past_factor_without_future_leakage() -> None:
+    calls = []
+
+    def fetch(api_name, params, fields):
+        calls.append((api_name, params, fields))
+        return [
+            {"ts_code": "600000.SH", "trade_date": "20071225", "adj_factor": 2},
+            {"ts_code": "600000.SH", "trade_date": "20080102", "adj_factor": 3},
+        ]
+
+    rows, fallback_count = collector.complete_factor_rows(
+        fetch,
+        [{"ts_code": "600000.SH"}],
+        [],
+        date(2007, 12, 28),
+    )
+    assert fallback_count == 1
+    assert rows == [{"ts_code": "600000.SH", "trade_date": "20071225", "adj_factor": 2}]
+    assert calls[0][1]["end_date"] == "20071228"
+
+
+def test_normalize_month_records_past_factor_lag() -> None:
+    frame, audit = collector.normalize_month(
+        [
+            {
+                "ts_code": "600000.SH",
+                "trade_date": "20071228",
+                "open": 10,
+                "high": 12,
+                "low": 9,
+                "close": 11,
+                "vol": 100,
+                "amount": 1_000,
+                "pct_chg": 1.0,
+            }
+        ],
+        [{"ts_code": "600000.SH", "trade_date": "20071225", "adj_factor": 2}],
+        date(2007, 12, 28),
+        fallback_factors=1,
+    )
+    assert audit["fallback_factors"] == 1
+    assert audit["maximum_factor_lag_days"] == 3
+    assert frame.get_column("adj_factor_lag_days").item() == 3
+
+
 def test_final_unique_key_shape() -> None:
     frame, _ = collector.normalize_month(
         [

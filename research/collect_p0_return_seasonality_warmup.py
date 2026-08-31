@@ -7,6 +7,7 @@ import contextlib
 import hashlib
 import json
 import os
+import re
 import sys
 import tempfile
 from datetime import date, datetime
@@ -37,6 +38,7 @@ MONTHLY_FIELDS = (
 )
 FACTOR_FIELDS = ("ts_code", "trade_date", "adj_factor")
 A_SHARE_PATTERN = r"^((60|68)\d{4}\.SH|(00|30)\d{4}\.SZ|[489]\d{5}\.BJ)$"
+_A_SHARE_RE = re.compile(A_SHARE_PATTERN)
 
 
 def _atomic_write(frame: pl.DataFrame, target: Path) -> None:
@@ -65,6 +67,45 @@ def expected_months(start: date = START_DATE, end: date = END_DATE) -> list[str]
     return months
 
 
+def complete_factor_rows(
+    fetch: Callable[[str, dict[str, str], tuple[str, ...]], list[dict[str, Any]]],
+    monthly_rows: list[dict[str, Any]],
+    exact_factor_rows: list[dict[str, Any]],
+    month_end: date,
+) -> tuple[list[dict[str, Any]], int]:
+    monthly_symbols = {
+        str(row.get("ts_code") or "").strip()
+        for row in monthly_rows
+        if _A_SHARE_RE.fullmatch(str(row.get("ts_code") or "").strip())
+    }
+    exact_symbols = {str(row.get("ts_code") or "").strip() for row in exact_factor_rows}
+    completed = list(exact_factor_rows)
+    fallback_count = 0
+    for symbol in sorted(monthly_symbols - exact_symbols):
+        rows = fetch(
+            "adj_factor",
+            {
+                "ts_code": symbol,
+                "start_date": date(month_end.year - 1, month_end.month, 1).strftime(
+                    "%Y%m%d"
+                ),
+                "end_date": month_end.strftime("%Y%m%d"),
+            },
+            FACTOR_FIELDS,
+        )
+        valid = [
+            row
+            for row in rows
+            if str(row.get("trade_date") or "") <= month_end.strftime("%Y%m%d")
+            and row.get("adj_factor") is not None
+        ]
+        if not valid:
+            continue
+        completed.append(max(valid, key=lambda row: str(row["trade_date"])))
+        fallback_count += 1
+    return completed, fallback_count
+
+
 def month_end_trading_dates(rows: list[dict[str, Any]]) -> list[date]:
     open_dates = sorted(
         datetime.strptime(str(row["cal_date"]), "%Y%m%d").date()
@@ -85,6 +126,7 @@ def normalize_month(
     monthly_rows: list[dict[str, Any]],
     factor_rows: list[dict[str, Any]],
     month_end: date,
+    fallback_factors: int = 0,
 ) -> tuple[pl.DataFrame, dict[str, int]]:
     monthly = pl.DataFrame(monthly_rows, infer_schema_length=None)
     factors = pl.DataFrame(factor_rows, infer_schema_length=None)
@@ -102,23 +144,26 @@ def normalize_month(
         ~pl.col("symbol").str.contains(A_SHARE_PATTERN)
     ).height
     monthly = monthly.filter(pl.col("symbol").str.contains(A_SHARE_PATTERN))
+    factors = factors.with_columns(
+        pl.col("ts_code").cast(pl.String).str.strip_chars().alias("symbol"),
+        pl.col("trade_date")
+        .cast(pl.String)
+        .str.to_date("%Y%m%d")
+        .alias("adj_factor_date"),
+        pl.col("adj_factor").cast(pl.Float64, strict=False),
+    )
+    factors = factors.filter(pl.col("symbol").str.contains(A_SHARE_PATTERN))
+    duplicate_factors = (
+        factors.height - factors.unique(subset=["symbol", "adj_factor_date"]).height
+    )
     factors = (
-        factors.with_columns(
-            pl.col("ts_code").cast(pl.String).str.strip_chars().alias("symbol"),
-            pl.col("trade_date")
-            .cast(pl.String)
-            .str.to_date("%Y%m%d")
-            .alias("month_end"),
-            pl.col("adj_factor").cast(pl.Float64, strict=False),
-        )
-        .filter(pl.col("symbol").str.contains(A_SHARE_PATTERN))
-        .select("symbol", "month_end", "adj_factor")
+        factors.sort(["symbol", "adj_factor_date"])
+        .unique(subset=["symbol"], keep="last")
+        .with_columns(pl.lit(month_end).alias("month_end"))
+        .select("symbol", "month_end", "adj_factor_date", "adj_factor")
     )
     duplicate_prices = (
         monthly.height - monthly.unique(subset=["symbol", "month_end"]).height
-    )
-    duplicate_factors = (
-        factors.height - factors.unique(subset=["symbol", "month_end"]).height
     )
     if duplicate_prices or duplicate_factors:
         raise ValueError(f"duplicate monthly keys for {month_end}")
@@ -129,6 +174,9 @@ def normalize_month(
     invalid_dates = joined.filter(pl.col("month_end") != pl.lit(month_end)).height
     invalid_symbols = joined.filter(
         ~pl.col("symbol").str.contains(r"^\d{6}\.(SH|SZ|BJ)$")
+    ).height
+    future_factors = joined.filter(
+        pl.col("adj_factor_date") > pl.col("month_end")
     ).height
     invalid_ohlc = joined.filter(
         (pl.col("open") <= 0)
@@ -146,10 +194,23 @@ def normalize_month(
         "invalid_dates": invalid_dates,
         "invalid_symbols": invalid_symbols,
         "invalid_ohlc": invalid_ohlc,
+        "future_factors": future_factors,
         "excluded_non_a_rows": excluded_non_a_rows,
+        "fallback_factors": fallback_factors,
+        "maximum_factor_lag_days": (
+            joined.select(
+                (pl.col("month_end") - pl.col("adj_factor_date")).dt.total_days().max()
+            ).item()
+            or 0
+        ),
+    }
+    informational = {
+        "excluded_non_a_rows",
+        "fallback_factors",
+        "maximum_factor_lag_days",
     }
     failure_fields = {
-        key: value for key, value in audit.items() if key != "excluded_non_a_rows"
+        key: value for key, value in audit.items() if key not in informational
     }
     if any(failure_fields.values()):
         raise ValueError(f"monthly data failed audit for {month_end}: {audit}")
@@ -165,6 +226,10 @@ def normalize_month(
             "amount",
             "pct_chg",
             "adj_factor",
+            "adj_factor_date",
+            (pl.col("month_end") - pl.col("adj_factor_date"))
+            .dt.total_days()
+            .alias("adj_factor_lag_days"),
             (pl.col("close") * pl.col("adj_factor")).alias("adjusted_close"),
             pl.lit("tushare_monthly_adj_factor").alias("source"),
         ).sort(["month_end", "symbol"]),
@@ -189,8 +254,13 @@ def collect(
     for month_end in month_end_trading_dates(calendar):
         day = month_end.strftime("%Y%m%d")
         monthly_rows = fetch("monthly", {"trade_date": day}, MONTHLY_FIELDS)
-        factor_rows = fetch("adj_factor", {"trade_date": day}, FACTOR_FIELDS)
-        frame, audit = normalize_month(monthly_rows, factor_rows, month_end)
+        exact_factor_rows = fetch("adj_factor", {"trade_date": day}, FACTOR_FIELDS)
+        factor_rows, fallback_count = complete_factor_rows(
+            fetch, monthly_rows, exact_factor_rows, month_end
+        )
+        frame, audit = normalize_month(
+            monthly_rows, factor_rows, month_end, fallback_count
+        )
         frames.append(frame)
         audits.append(
             {
