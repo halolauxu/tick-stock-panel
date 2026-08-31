@@ -7,6 +7,7 @@ import hashlib
 import json
 import math
 from datetime import date
+from itertools import pairwise
 from pathlib import Path
 from typing import Any
 
@@ -141,9 +142,7 @@ def build_trades(
         .sort("date")["date"]
         .to_list()
     )
-    next_date = {
-        current: following for current, following in zip(fund_dates, fund_dates[1:])
-    }
+    next_date = {current: following for current, following in pairwise(fund_dates)}
     quotes = _quote_lookup(options)
     records: list[dict[str, Any]] = []
     for signal in signals.filter(pl.col("regime") == regime).iter_rows(named=True):
