@@ -147,3 +147,47 @@ def test_account_uses_next_day_window_and_finishes_flat() -> None:
     assert result["completed_trades"] == 1
     assert result["open_positions"] == 0
     assert result["final_equity"] > 200_000.0
+    assert result["gross_realized_pnl_before_costs"] == 2_250.0
+    assert result["total_slippage"] > 0
+    assert result["max_exit_delay"] == 0
+
+
+def test_account_does_not_fill_after_twenty_day_exit_limit() -> None:
+    first = date(2025, 8, 27)
+    too_late = date(2025, 9, 29)
+    context = pl.DataFrame(
+        {
+            "symbol": ["000001.SZ", "000001.SZ"],
+            "date": [first, too_late],
+            "_global_index": [1, 23],
+            "close": [11.0, 11.5],
+            "adj_factor": [1.0, 1.0],
+            "limit_down_price": [9.0, 9.9],
+        }
+    )
+    windows = pl.DataFrame(
+        {
+            "symbol": ["000001.SZ"],
+            "date": [too_late],
+            "window_amount": [20_000_000.0],
+            "window_volume": [17_391.304347826088],
+            "window_high": [11.6],
+            "window_minutes": [5],
+            "window_vwap": [11.5],
+        }
+    )
+    events = [
+        {
+            "symbol": "000001.SZ",
+            "date": first,
+            "entry_price": 11.0,
+            "signal_amount": 20_000_000.0,
+            "adj_factor": 1.0,
+            "adjusted_close": 11.0,
+        }
+    ]
+
+    result = study.simulate_account(200_000.0, events, context, windows)
+
+    assert result["completed_trades"] == 0
+    assert result["open_positions"] == 1

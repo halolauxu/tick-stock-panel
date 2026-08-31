@@ -326,6 +326,8 @@ def simulate_account(
             position = positions[symbol]
             if current_index < position.due_index:
                 continue
+            if current_index - position.due_index > MAX_EXIT_DELAY:
+                continue
             ctx = daily.get((symbol, day))
             quote = quotes.get((symbol, day))
             if ctx is None or quote is None:
@@ -345,19 +347,27 @@ def simulate_account(
             executable_notional = raw_shares * vwap
             if executable_notional > amount * PARTICIPATION_RATE:
                 continue
+            gross_before_slippage = raw_shares * vwap
             exit_price = vwap * (1.0 - SLIPPAGE_PCT)
-            gross = raw_shares * exit_price
-            exit_fee = commission(gross) + gross * stamp_tax_rate(day)
-            cash += gross - exit_fee
+            gross_after_slippage = raw_shares * exit_price
+            slippage_cost = gross_before_slippage - gross_after_slippage
+            exit_fee = commission(gross_after_slippage) + (
+                gross_after_slippage * stamp_tax_rate(day)
+            )
+            cash += gross_after_slippage - exit_fee
             trades.append(
                 {
                     "symbol": symbol,
                     "entry_date": position.entry_date,
                     "exit_date": day,
                     "entry_notional": position.entry_notional,
-                    "exit_notional": gross,
+                    "exit_notional_before_slippage": gross_before_slippage,
+                    "exit_notional": gross_after_slippage,
+                    "slippage_cost": slippage_cost,
                     "fees": position.entry_fee + exit_fee,
-                    "net_pnl": gross
+                    "gross_pnl_before_costs": gross_before_slippage
+                    - position.entry_notional,
+                    "net_pnl": gross_after_slippage
                     - exit_fee
                     - position.entry_notional
                     - position.entry_fee,
@@ -429,6 +439,10 @@ def simulate_account(
     span = max(len(curve), 1)
     annualized = (final_equity / capital) ** (252.0 / span) - 1.0
     capacity_checks = entry_capacity_ok + rejected["signal_capacity"]
+    total_fees = sum(float(row["fees"]) for row in trades)
+    total_slippage = sum(float(row["slippage_cost"]) for row in trades)
+    gross_pnl = sum(float(row["gross_pnl_before_costs"]) for row in trades)
+    net_pnl = sum(float(row["net_pnl"]) for row in trades)
     return {
         "initial_capital": capital,
         "final_equity": final_equity,
@@ -443,8 +457,20 @@ def simulate_account(
             entry_capacity_ok / capacity_checks if capacity_checks else None
         ),
         "rejections": dict(sorted(rejected.items())),
-        "total_fees": sum(float(row["fees"]) for row in trades),
-        "net_realized_pnl": sum(float(row["net_pnl"]) for row in trades),
+        "gross_realized_pnl_before_costs": gross_pnl,
+        "total_fees": total_fees,
+        "total_slippage": total_slippage,
+        "total_costs": total_fees + total_slippage,
+        "net_realized_pnl": net_pnl,
+        "trade_win_rate_net": (
+            sum(float(row["net_pnl"]) > 0 for row in trades) / len(trades)
+            if trades
+            else None
+        ),
+        "max_exit_delay": max(
+            (int(row["exit_delay"]) for row in trades),
+            default=None,
+        ),
         "curve_start": curve[0]["date"].isoformat() if curve else None,
         "curve_end": curve[-1]["date"].isoformat() if curve else None,
     }
