@@ -75,6 +75,7 @@ const STATUS_LABELS: Record<string, string> = {
   REJECTED_LIMIT_DOWN: '跌停无法卖出',
   REJECTED_SUSPENDED: '停牌 / 无成交',
   REJECTED_INSUFFICIENT_CASH: '资金不足',
+  REJECTED_UNSUPPORTED_BOARD: '非沪深主板 · 已拒绝',
   UNKNOWN_MARKET_DATA: '行情不足 · 等待自动复核',
   EXECUTION_FAILED: '执行失败',
   MISSED_EXECUTION: '错过执行窗口',
@@ -223,6 +224,7 @@ function EventTimeline({ account, events }: { account: PaperTradingAccount; even
   const nextOpenOnly = pendingOrders.length > 0 && pendingOrders.every(order => order.planned_session === 'NEXT_OPEN')
   const fillFees = todayFills.reduce((sum, fill) => sum + fill.fee_amount, 0)
   const skippedSignals = events.filter(event => event.event_type === 'SIGNAL_SKIPPED')
+  const signalSeal = events.find(event => event.event_type === 'SIGNAL_SEAL_COMPLETED')
 
   const moments: {
     id: string
@@ -258,6 +260,20 @@ function EventTimeline({ account, events }: { account: PaperTradingAccount; even
       icon: AlertTriangle,
       tone: 'border-amber-400/35 bg-amber-400/10 text-amber-400',
       rows: skippedSignals.map(event => `${event.title.replace(' 信号未形成订单', '')} · ${event.detail}`),
+    })
+  }
+
+  if (signalSeal) {
+    moments.push({
+      id: 'signal-seal',
+      at: signalSeal.occurred_at,
+      title: signalSeal.title,
+      detail: signalSeal.detail,
+      badge: `${Number(signalSeal.payload.final_candidates ?? 0)} 只候选`,
+      icon: FileClock,
+      tone: Number(signalSeal.payload.final_candidates ?? 0) > 0
+        ? 'border-accent/35 bg-accent/10 text-accent'
+        : 'border-border bg-elevated/50 text-secondary',
     })
   }
 
@@ -446,6 +462,14 @@ export function PaperTrading() {
     mutationFn: async () => {
       if (!selectedStrategy || !detail) throw new Error('请先选择策略')
       if (!exitMode) throw new Error('必须选择退出模式')
+      const normalizedOverrides = normalizeStrategyOverrides(detail, overrides)
+      if (assetType === 'stock') {
+        normalizedOverrides.basic_filter = {
+          ...(normalizedOverrides.basic_filter ?? {}),
+          enabled: true,
+          boards: ['沪主板', '深主板'],
+        }
+      }
       const payload: PaperTradingConfig & { name: string } = {
         name: accountName.trim() || `${detail.name} 模拟盘`,
         strategy_id: selectedStrategy,
@@ -453,7 +477,7 @@ export function PaperTrading() {
         asset_type: assetType,
         symbols: null,
         params: strategyParams,
-        overrides: normalizeStrategyOverrides(detail, overrides),
+        overrides: normalizedOverrides,
         entry_fill: 'open_t+1',
         exit_fill: exitMode === 'intraday' ? 'signal_next_minute' : 'open_t+1',
         exit_mode: exitMode,
@@ -821,7 +845,10 @@ export function PaperTrading() {
               </details>
             )}
 
-            <div className="rounded-card border border-amber-400/25 bg-amber-400/5 p-3 text-[10px] leading-4 text-amber-200/80">订单只会在真实时钟到达后推进。服务错过 09:30 时会记录 MISSED_EXECUTION；只有存在可靠开盘或分钟证据才允许 RECOVERED_LATE，绝不倒填为准时成交。</div>
+            <div className="rounded-card border border-amber-400/25 bg-amber-400/5 p-3 text-[10px] leading-4 text-amber-200/80">
+              {assetType === 'stock' && <div className="mb-1 font-medium text-amber-200">股票账户固定仅买沪深主板，系统会在选股和下单两层排除创业板、科创板及北交所。</div>}
+              订单只会在真实时钟到达后推进。服务错过 09:30 时会记录 MISSED_EXECUTION；只有存在可靠开盘或分钟证据才允许 RECOVERED_LATE，绝不倒填为准时成交。
+            </div>
             <button type="button" onClick={() => createAccount.mutate()} disabled={!selectedStrategy || !detail || !exitMode || createAccount.isPending} className="flex h-11 w-full items-center justify-center gap-2 rounded-btn bg-accent text-sm font-semibold text-white disabled:opacity-50">{createAccount.isPending ? <Loader2 className="h-4 w-4 animate-spin" /> : <Play className="h-4 w-4" />}{createAccount.isPending ? '写入事件账本…' : '创建并冻结账户'}</button>
           </div>
         </Modal>

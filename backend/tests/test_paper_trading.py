@@ -279,6 +279,69 @@ def test_zero_lot_candidate_is_frozen_and_explained_in_timeline(tmp_path, monkey
     assert signal_count == 1
 
 
+def test_signal_seal_excludes_unsupported_boards_and_records_funnel(tmp_path, monkeypatch):
+    service = _service(tmp_path)
+    _stub_signal_seal(monkeypatch, service, [
+        {"symbol": "688001.SH", "name": "科创候选", "score": 99.0, "raw_close": 10.0},
+        {"symbol": "300001.SZ", "name": "创业候选", "score": 90.0, "raw_close": 10.0},
+        {"symbol": "600000.SH", "name": "浦发银行", "score": 80.0, "raw_close": 10.0},
+    ])
+    account = service.ledger.create_account(
+        name="沪深主板账户",
+        baseline_date=SIGNAL_DAY,
+        config=_config(),
+    )
+
+    result = service.seal_account_signals(account["id"], SIGNAL_DAY)
+    current = service.account(account["id"])
+
+    assert result == {"signals": 1, "orders": 1}
+    assert [row["symbol"] for row in current["orders"]] == ["600000.SH"]
+    completed = next(
+        row for row in current["timeline"]
+        if row["event_type"] == "SIGNAL_SEAL_COMPLETED"
+    )
+    assert completed["payload"] == {
+        "strategy_hits": 3,
+        "unsupported_board": 2,
+        "already_held": 0,
+        "already_pending": 0,
+        "available_slots": 10,
+        "slot_limited": 0,
+        "final_candidates": 1,
+        "orders_created": 1,
+    }
+
+
+def test_empty_signal_seal_explains_already_held_candidate(tmp_path, monkeypatch):
+    service = _service(tmp_path)
+    account, order_id = _account_with_buy_order(service)
+    service.ledger.assign_due_date(order_id, TRADE_DAY, {})
+    service.ledger.execute_fill(
+        order_id,
+        price=10,
+        quantity=1_000,
+        quote_at=OPEN_TIME,
+        source="open_quote",
+    )
+    _stub_signal_seal(monkeypatch, service, [
+        {"symbol": "000001.SZ", "name": "平安银行", "score": 88.0, "raw_close": 10.0},
+    ])
+
+    result = service.seal_account_signals(account["id"], TRADE_DAY)
+    current = service.account(account["id"])
+
+    assert result == {"signals": 0, "orders": 0}
+    completed = next(
+        row for row in current["timeline"]
+        if row["event_type"] == "SIGNAL_SEAL_COMPLETED"
+    )
+    assert completed["payload"]["strategy_hits"] == 1
+    assert completed["payload"]["already_held"] == 1
+    assert completed["payload"]["final_candidates"] == 0
+    assert "已持仓 1 只" in completed["detail"]
+
+
 def test_paper_service_has_no_backtest_replay_dependency():
     source = inspect.getsource(PaperTradingService)
 
@@ -399,6 +462,44 @@ def test_preflight_requires_each_orders_own_current_quote(tmp_path):
         and incident["status"] == "open"
         for incident in current["incidents"]
     )
+
+
+def test_preflight_rejects_legacy_unsupported_board_order(tmp_path):
+    service = _service(tmp_path)
+    account = service.ledger.create_account(
+        name="旧配置账户",
+        baseline_date=SIGNAL_DAY,
+        config=_config(),
+    )
+    _, order_id, _ = service.ledger.record_signal_and_order(
+        account_id=account["id"],
+        strategy_id="n_day_low_reversal",
+        symbol="688001.SH",
+        name="科创候选",
+        side="BUY",
+        signal_date=SIGNAL_DAY,
+        score=88,
+        reason="legacy_frozen_signal",
+        signal_ref="entry-low-reversal",
+        requested_qty=1_000,
+        target_amount=10_000,
+        target_weight=0.05,
+        planned_session="NEXT_OPEN",
+    )
+    at = datetime(2026, 8, 27, 9, 25, tzinfo=CN_TZ)
+
+    result = service.preflight_all(
+        now=at,
+        quotes={"688001.SH": _quote(symbol="688001.SH", at=at)},
+    )
+    current = service.account(account["id"])
+
+    assert result == {"checked": 1, "deferred": 0, "assigned": 0}
+    order = next(row for row in current["orders"] if row["id"] == order_id)
+    assert order["status"] == "REJECTED_UNSUPPORTED_BOARD"
+    assert order["execution_quality"] == "POLICY_REJECTED"
+    assert "仅允许买入沪深主板" in order["reason"]
+    assert current["summary"]["open_incident_count"] == 0
 
 
 def test_weekend_quotes_cannot_schedule_or_terminalize_next_open_order(tmp_path):
@@ -1424,7 +1525,41 @@ def test_create_account_api_freezes_exit_mode_without_running_backtest(monkeypat
 
     assert account["execution_policy"] == "event_driven"
     assert account["config"]["exit_mode"] == "eod"
+    assert account["config"]["overrides"]["basic_filter"]["boards"] == [
+        "沪主板",
+        "深主板",
+    ]
     assert account["orders"] == []
+
+
+def test_create_stock_account_rejects_explicit_unsupported_symbols(monkeypatch, tmp_path):
+    monkeypatch.setattr(
+        paper_api.StrategyEngine,
+        "validate_context",
+        lambda *_args, **_kwargs: None,
+    )
+    state = SimpleNamespace(
+        repo=FakeRepo(tmp_path),
+        strategy_engine=SimpleNamespace(get=lambda _strategy_id: object()),
+        capabilities=SimpleNamespace(has=lambda _cap: False),
+    )
+    request = SimpleNamespace(app=SimpleNamespace(state=state))
+
+    with pytest.raises(paper_api.HTTPException) as exc:
+        paper_api.create_account(
+            paper_api.PaperTradingCreateRequest(
+                name="错误板块账户",
+                strategy_id="n_day_low_reversal",
+                symbols=["600000.SH", "688001.SH", "300001.SZ"],
+                exit_mode="eod",
+            ),
+            request,
+        )
+
+    assert exc.value.status_code == 400
+    assert "仅支持沪深主板" in exc.value.detail
+    assert "688001.SH" in exc.value.detail
+    assert "300001.SZ" in exc.value.detail
 
 
 def test_intraday_account_requires_realtime_or_minute_capability(monkeypatch, tmp_path):

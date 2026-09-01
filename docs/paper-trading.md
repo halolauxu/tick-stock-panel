@@ -33,10 +33,15 @@
 - `REJECTED_LIMIT_UP` / `REJECTED_LIMIT_DOWN`
 - `REJECTED_SUSPENDED`
 - `REJECTED_INSUFFICIENT_CASH`
+- `REJECTED_UNSUPPORTED_BOARD`
 - `UNKNOWN_MARKET_DATA`
 - `EXECUTION_FAILED`
 - `MISSED_EXECUTION`
 - `CANCELLED`
+
+股票模拟账户固定只允许沪深主板。创业板、科创板和北交所会在候选冻结阶段排除；
+如果历史配置或异常数据仍产生相关买单，09:25 盘前校验会以
+`REJECTED_UNSUPPORTED_BOARD` 明确拒绝，不能进入开盘撮合。
 
 `PLANNED` 和 `PREFLIGHT_OK` 是执行窗口内的中间态，不能在已确认的交易日 09:31 后被页面描述成成交。
 

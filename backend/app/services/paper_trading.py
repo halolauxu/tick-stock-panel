@@ -41,6 +41,20 @@ OPEN_DEADLINE = dt_time(9, 31)
 SETTLEMENT_TIME = dt_time(15, 5)
 SIGNAL_SEAL_TIME = dt_time(15, 30)
 QUOTE_STALE_SECONDS = 90
+PAPER_STOCK_SUPPORTED_BOARDS = ("沪主板", "深主板")
+
+
+def is_supported_paper_stock_symbol(symbol: str) -> bool:
+    """Paper stock accounts are restricted to the Shanghai/Shenzhen main boards."""
+    normalized = str(symbol or "").strip().upper()
+    code, _, suffix = normalized.partition(".")
+    if suffix == "SH":
+        return code.startswith(("600", "601", "603", "605"))
+    if suffix == "SZ":
+        return code.startswith(("000", "001", "002", "003"))
+    if suffix:
+        return False
+    return code.startswith(("600", "601", "603", "605", "000", "001", "002", "003"))
 
 
 class PaperTradingStoreError(PaperLedgerError):
@@ -469,6 +483,20 @@ class PaperTradingService:
                 if order["scheduled_date"] and order["scheduled_date"] != trading_date.isoformat():
                     continue
                 summary["checked"] += 1
+                account_config = json.loads(accounts[order["account_id"]]["config_json"])
+                if (
+                    order["side"] == "BUY"
+                    and account_config.get("asset_type", "stock") == "stock"
+                    and not is_supported_paper_stock_symbol(str(order["symbol"]))
+                ):
+                    self.ledger.terminal_order(
+                        order["id"],
+                        status="REJECTED_UNSUPPORTED_BOARD",
+                        reason="账户仅允许买入沪深主板,已拒绝创业板、科创板或其他板块订单",
+                        quality="POLICY_REJECTED",
+                        scheduled_date=trading_date,
+                    )
+                    continue
                 quote = quotes.get(str(order["symbol"]))
                 quote_incident = (
                     f"order:{order['id']}:ORDER_QUOTE_NOT_READY:{trading_date}"
@@ -945,18 +973,57 @@ class PaperTradingService:
             if item["side"] == "BUY" and item["status"] not in TERMINAL_ORDER_STATUSES
         }
         slots = max(int(config.get("max_positions", 10)) - len(held) - len(open_buy_orders), 0)
-        candidates = [
-            row for row in result.rows
+        strategy_rows = list(result.rows)
+        unsupported_rows = (
+            [
+                row for row in strategy_rows
+                if not is_supported_paper_stock_symbol(str(row.get("symbol")))
+            ]
+            if config.get("asset_type", "stock") == "stock"
+            else []
+        )
+        unsupported_symbols = {str(row.get("symbol")) for row in unsupported_rows}
+        supported_rows = [
+            row for row in strategy_rows
+            if str(row.get("symbol")) not in unsupported_symbols
+        ]
+        held_rows = [row for row in supported_rows if str(row.get("symbol")) in held]
+        pending_rows = [
+            row for row in supported_rows
+            if str(row.get("symbol")) in open_buy_orders
+            and str(row.get("symbol")) not in held
+        ]
+        executable_rows = [
+            row for row in supported_rows
             if str(row.get("symbol")) not in held | open_buy_orders
-        ][:slots]
+        ]
+        candidates = executable_rows[:slots]
+        funnel = {
+            "strategy_hits": len(strategy_rows),
+            "unsupported_board": len(unsupported_rows),
+            "already_held": len(held_rows),
+            "already_pending": len(pending_rows),
+            "available_slots": slots,
+            "slot_limited": max(len(executable_rows) - slots, 0),
+            "final_candidates": len(candidates),
+        }
+        funnel_detail = (
+            f"策略已运行: 命中 {funnel['strategy_hits']} 只; "
+            f"非沪深主板 {funnel['unsupported_board']} 只; "
+            f"已持仓 {funnel['already_held']} 只; "
+            f"已有待执行订单 {funnel['already_pending']} 只; "
+            f"槽位截断 {funnel['slot_limited']} 只; "
+            f"最终形成 {funnel['final_candidates']} 只新买候选"
+        )
         if not candidates:
             self.ledger.record_account_event(
                 account_id,
                 event_key=f"{account_id}:SIGNAL_SEAL_EMPTY:{signal_date}",
                 event_type="SIGNAL_SEAL_COMPLETED",
                 trading_date=signal_date,
-                title="封板信号已完成",
-                detail="当日没有新的可执行买入候选",
+                title="选股已运行 · 未生成新订单",
+                detail=funnel_detail,
+                payload=funnel,
             )
             self.ledger.mark_signal_day(account_id, signal_date)
             return {"signals": signals_created, "orders": orders_created}
@@ -984,6 +1051,7 @@ class PaperTradingService:
                 allocation / equity if equity > 0 else 0 for allocation in allocations
             ]
         model = _account_cost_model(config)
+        buy_orders_before = orders_created
         for row, allocation, target_weight in zip(
             candidates, allocations, target_weights, strict=True
         ):
@@ -1045,6 +1113,20 @@ class PaperTradingService:
             )
             signals_created += int(was_created)
             orders_created += int(was_created)
+        buy_orders_created = orders_created - buy_orders_before
+        self.ledger.record_account_event(
+            account_id,
+            event_key=f"{account_id}:SIGNAL_SEAL_COMPLETED:{signal_date}",
+            event_type="SIGNAL_SEAL_COMPLETED",
+            trading_date=signal_date,
+            title=(
+                "选股已运行 · 次日订单已生成"
+                if buy_orders_created
+                else "选股已运行 · 信号未形成订单"
+            ),
+            detail=funnel_detail,
+            payload={**funnel, "orders_created": buy_orders_created},
+        )
         self.ledger.mark_signal_day(account_id, signal_date)
         return {"signals": signals_created, "orders": orders_created}
 

@@ -9,7 +9,13 @@ from pydantic import BaseModel, Field
 
 from app.market_time import cn_now
 from app.services.paper_ledger import PaperLedgerError
-from app.services.paper_trading import PaperTradingStoreError, get_service, run_account
+from app.services.paper_trading import (
+    PAPER_STOCK_SUPPORTED_BOARDS,
+    PaperTradingStoreError,
+    get_service,
+    is_supported_paper_stock_symbol,
+    run_account,
+)
 from app.strategy.engine import StrategyDataContext, StrategyEngine
 from app.tickflow.capabilities import Cap
 
@@ -92,6 +98,25 @@ def create_account(body: PaperTradingCreateRequest, request: Request) -> dict:
         raise HTTPException(status_code=400, detail="触发后下一分钟成交需要先开启分钟K成交")
 
     config = body.model_dump(exclude={"name"})
+    if body.asset_type == "stock":
+        unsupported = [
+            symbol for symbol in (body.symbols or [])
+            if not is_supported_paper_stock_symbol(symbol)
+        ]
+        if unsupported:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "股票模拟账户仅支持沪深主板,不能买入创业板、科创板或其他板块: "
+                    + ", ".join(unsupported)
+                ),
+            )
+        account_overrides = dict(config.get("overrides") or {})
+        basic_filter = dict(account_overrides.get("basic_filter") or {})
+        basic_filter["enabled"] = True
+        basic_filter["boards"] = list(PAPER_STOCK_SUPPORTED_BOARDS)
+        account_overrides["basic_filter"] = basic_filter
+        config["overrides"] = account_overrides
     config["minute_fill"] = body.exit_mode == "intraday"
     config["strategy_name"] = str(getattr(strategy, "name", body.strategy_id))
     try:
