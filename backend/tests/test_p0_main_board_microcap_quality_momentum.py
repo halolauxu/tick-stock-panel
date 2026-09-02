@@ -86,3 +86,12 @@ def test_future_financial_snapshot_is_not_joined() -> None:
     ranked = quality.attach_quality_momentum(candidates, panel, snapshots)
 
     assert ranked.is_empty()
+
+
+def test_stage_trading_dates_excludes_out_of_stage_history() -> None:
+    dates = [date(2013, 12, 31), date(2014, 1, 2), date(2020, 12, 31), date(2021, 1, 4)]
+
+    assert quality.stage_trading_dates(dates, "development") == [
+        date(2014, 1, 2),
+        date(2020, 12, 31),
+    ]

@@ -27,9 +27,7 @@ CAPITALS = (200_000.0, 300_000.0, 500_000.0, 1_000_000.0)
 PRIMARY_CAPITAL = 200_000.0
 MAX_FINANCIAL_AGE_DAYS = 550
 MOMENTUM_OBSERVATIONS = 60
-EXPECTED_AUDIT_SHA256 = (
-    "0fc106a8688f7e8cf06a8ba5aaadd0f92414d4f3f473c5c1e1ccdaeede9d9ac5"
-)
+EXPECTED_AUDIT_SHA256 = "0fc106a8688f7e8cf06a8ba5aaadd0f92414d4f3f473c5c1e1ccdaeede9d9ac5"
 STAGES = {
     "development": (date(2014, 1, 1), baseline.DEVELOPMENT_END),
     "validation": (date(2021, 1, 1), baseline.VALIDATION_END),
@@ -46,9 +44,7 @@ def attach_quality_momentum(
         panel.sort(["symbol", "date"])
         .with_columns(
             (
-                pl.col("close")
-                / pl.col("close").shift(MOMENTUM_OBSERVATIONS).over("symbol")
-                - 1.0
+                pl.col("close") / pl.col("close").shift(MOMENTUM_OBSERVATIONS).over("symbol") - 1.0
             ).alias("momentum_60d")
         )
         .select("symbol", "date", "momentum_60d")
@@ -70,9 +66,7 @@ def attach_quality_momentum(
             .alias("financial_age_days")
         )
         .filter(
-            pl.col("financial_age_days").is_between(
-                0, MAX_FINANCIAL_AGE_DAYS, closed="both"
-            )
+            pl.col("financial_age_days").is_between(0, MAX_FINANCIAL_AGE_DAYS, closed="both")
             & (pl.col("total_assets") > 0)
             & (pl.col("total_equity") > 0)
             & pl.col("momentum_60d").is_not_null()
@@ -81,9 +75,7 @@ def attach_quality_momentum(
             & pl.col("debt_ratio").is_not_null()
         )
         .with_columns(
-            (pl.col("net_income_attributable") / pl.col("total_assets")).alias(
-                "return_on_assets"
-            ),
+            (pl.col("net_income_attributable") / pl.col("total_assets")).alias("return_on_assets"),
             (pl.col("net_operating_cash_flow") / pl.col("total_assets")).alias(
                 "cash_flow_on_assets"
             ),
@@ -99,10 +91,9 @@ def attach_quality_momentum(
     )
     work = work.with_columns(
         *[
-            (
-                pl.col(column).rank(method="average").over("date")
-                / pl.len().over("date")
-            ).alias(f"{column}_rank")
+            (pl.col(column).rank(method="average").over("date") / pl.len().over("date")).alias(
+                f"{column}_rank"
+            )
             for column in score_columns
         ]
     ).with_columns(
@@ -134,24 +125,17 @@ def _summary(result: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def stage_trading_dates(all_dates: list[date], stage: str) -> list[date]:
+    start, end = STAGES[stage]
+    return [day for day in all_dates if start <= day <= end]
+
+
 def _common_checks(candidate: dict[str, Any]) -> dict[str, bool]:
     return {
-        "buy_execution_at_least_80pct": candidate["execution"]["buy"][
-            "execution_rate"
-        ]
-        >= 0.80,
-        "sell_execution_at_least_80pct": candidate["execution"]["sell"][
-            "execution_rate"
-        ]
-        >= 0.80,
-        "no_unresolved_positions": candidate["integrity"][
-            "ending_unresolved_positions"
-        ]
-        == 0,
-        "cash_reconciled": candidate["integrity"][
-            "max_cash_reconciliation_error"
-        ]
-        <= 0.01,
+        "buy_execution_at_least_80pct": candidate["execution"]["buy"]["execution_rate"] >= 0.80,
+        "sell_execution_at_least_80pct": candidate["execution"]["sell"]["execution_rate"] >= 0.80,
+        "no_unresolved_positions": candidate["integrity"]["ending_unresolved_positions"] == 0,
+        "cash_reconciled": candidate["integrity"]["max_cash_reconciliation_error"] <= 0.01,
     }
 
 
@@ -194,6 +178,7 @@ def run_stage(
     start, end = STAGES[stage]
     source = main_board.filter_main_board(baseline.load_daily(data_dir, end=end))
     all_dates = source["date"].unique().sort().to_list()
+    scoped_dates = stage_trading_dates(all_dates, stage)
     pit = baseline.attach_point_in_time_data(source, data_dir)
     del source
     gc.collect()
@@ -202,23 +187,17 @@ def run_stage(
     gc.collect()
     control_all = account.build_signal_candidates(panel)
     candidate_all = attach_quality_momentum(control_all, panel, snapshots)
-    control = control_all.filter(
-        pl.col("entry_date").is_between(start, end, closed="both")
-    )
-    candidate = candidate_all.filter(
-        pl.col("entry_date").is_between(start, end, closed="both")
-    )
+    control = control_all.filter(pl.col("entry_date").is_between(start, end, closed="both"))
+    candidate = candidate_all.filter(pl.col("entry_date").is_between(start, end, closed="both"))
     observations = baseline.build_weekly_observations(panel)
-    weekly_market = baseline.weekly_portfolios(observations).select(
-        "date", "period", "market_net"
-    )
+    weekly_market = baseline.weekly_portfolios(observations).select("date", "period", "market_net")
     symbols = control_all["symbol"].unique().to_list()
     del panel, observations
     gc.collect()
 
-    source_quotes = main_board.filter_main_board(
-        baseline.load_daily(data_dir, end=end)
-    ).filter(pl.col("symbol").is_in(symbols))
+    source_quotes = main_board.filter_main_board(baseline.load_daily(data_dir, end=end)).filter(
+        pl.col("symbol").is_in(symbols)
+    )
     source_quotes = account.attach_quote_names(source_quotes, data_dir)
     quotes = account.prepare_quote_panel(source_quotes)
     del source_quotes
@@ -232,7 +211,7 @@ def run_stage(
             control,
             execution_grid,
             quotes,
-            all_dates,
+            scoped_dates,
             weekly_market,
             initial_cash=capital,
         )
@@ -241,7 +220,7 @@ def run_stage(
             candidate,
             execution_grid,
             quotes,
-            all_dates,
+            scoped_dates,
             weekly_market,
             initial_cash=capital,
         )
@@ -250,15 +229,11 @@ def run_stage(
             "control": _summary(control_result),
             "quality_momentum": _summary(candidate_result),
         }
-    counts = (
-        candidate.group_by("entry_date")
-        .agg(pl.len().alias("eligible"))
-        .sort("entry_date")
-    )
+    counts = candidate.group_by("entry_date").agg(pl.len().alias("eligible")).sort("entry_date")
     return {
         "stage": stage,
         "period": {"start": start, "end": end},
-        "trading_days": len([day for day in all_dates if start <= day <= end]),
+        "trading_days": len(scoped_dates),
         "funnel": {
             "control_candidate_rows": control.height,
             "quality_momentum_candidate_rows": candidate.height,
@@ -273,11 +248,7 @@ def run_stage(
 
 
 def run(data_dir: Path, output: Path) -> dict[str, Any]:
-    audit_path = (
-        data_dir
-        / "research"
-        / "p0_main_board_microcap_financial_survival_data.json"
-    )
+    audit_path = data_dir / "research" / "p0_main_board_microcap_financial_survival_data.json"
     audit_sha = hashlib.sha256(audit_path.read_bytes()).hexdigest()
     if audit_sha != EXPECTED_AUDIT_SHA256:
         raise ValueError(f"financial audit hash mismatch: {audit_sha}")
@@ -296,9 +267,7 @@ def run(data_dir: Path, output: Path) -> dict[str, Any]:
         if stage == "validation" and not decisions["development"]["passed"]:
             stages[stage] = {"status": "NOT_READ_AFTER_DEVELOPMENT_FAILURE"}
             continue
-        if stage == "known_stress" and not decisions.get("validation", {}).get(
-            "passed", False
-        ):
+        if stage == "known_stress" and not decisions.get("validation", {}).get("passed", False):
             stages[stage] = {"status": "NOT_READ_AFTER_VALIDATION_FAILURE"}
             continue
         stage_result = run_stage(data_dir, snapshots, stage)
@@ -319,9 +288,7 @@ def run(data_dir: Path, output: Path) -> dict[str, Any]:
             "capital_ladder": list(CAPITALS),
         },
         "stages": stages,
-        "decision": (
-            "FORWARD_ELIGIBLE" if passed else "TERMINATE_QUALITY_MOMENTUM"
-        ),
+        "decision": ("FORWARD_ELIGIBLE" if passed else "TERMINATE_QUALITY_MOMENTUM"),
     }
     output.parent.mkdir(parents=True, exist_ok=True)
     output.write_text(
@@ -330,6 +297,16 @@ def run(data_dir: Path, output: Path) -> dict[str, Any]:
     )
     development = stages["development"]
     primary = development["accounts"][str(int(PRIMARY_CAPITAL))]
+    primary_summary = {
+        name: {
+            "metrics": result["metrics"],
+            "execution": result["execution"],
+            "integrity": result["integrity"],
+            "account": result["account"],
+        }
+        for name, result in primary.items()
+        if name != "initial_cash"
+    }
     print(
         json.dumps(
             {
@@ -337,10 +314,9 @@ def run(data_dir: Path, output: Path) -> dict[str, Any]:
                 "data_audit_sha256": audit_sha,
                 "development_funnel": development["funnel"],
                 "development_gate": development["decision"],
-                "primary_account": primary,
+                "primary_account": primary_summary,
                 "stage_status": {
-                    stage: result.get("status", "READ")
-                    for stage, result in stages.items()
+                    stage: result.get("status", "READ") for stage, result in stages.items()
                 },
                 "output": str(output),
                 "sha256": hashlib.sha256(output.read_bytes()).hexdigest(),
@@ -368,9 +344,7 @@ def main() -> None:
     parser.add_argument(
         "--output",
         type=Path,
-        default=Path(
-            "/app/data/research/p0_main_board_microcap_quality_momentum_v1.json"
-        ),
+        default=Path("/app/data/research/p0_main_board_microcap_quality_momentum_v1.json"),
     )
     args = parser.parse_args()
     run(args.data_dir, args.output)
