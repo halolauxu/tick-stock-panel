@@ -183,6 +183,7 @@ def simulate(
     all_dates: list[date],
     action_dates: list[date],
     data_dir: Path,
+    initial_cash: float = INITIAL_CASH,
 ) -> dict[str, Any]:
     symbols = candidates.get_column("symbol").unique().to_list()
     quotes = account.prepare_quote_panel(
@@ -194,12 +195,12 @@ def simulate(
     simulation = account.simulate_account(
         candidates,
         grid,
-        initial_cash=INITIAL_CASH,
+        initial_cash=initial_cash,
         target_positions=TARGET_POSITIONS,
         action_dates=action_dates,
     )
     account_daily, stale = account.build_daily_equity(
-        simulation, quotes, all_dates, initial_cash=INITIAL_CASH
+        simulation, quotes, all_dates, initial_cash=initial_cash
     )
     returns = account_daily.get_column("daily_return").drop_nulls().to_list()
     yearly = []
