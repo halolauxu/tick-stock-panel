@@ -1,4 +1,5 @@
 """Run the frozen development account for main-board forecast drift."""
+
 from __future__ import annotations
 
 import argparse
@@ -19,11 +20,11 @@ sys.path.insert(0, str(ROOT / "backend"))
 sys.path.insert(0, str(RESEARCH))
 
 import run_p0_daily_momentum_development as daily  # noqa: E402
+import run_p0_forecast_drift_development as forecast  # noqa: E402
 import run_p0_industry_momentum_development as shared  # noqa: E402
 import run_p0_main_board_microcap_account as main_board  # noqa: E402
 import run_p0_microcap_account as account  # noqa: E402
 import run_p0_microcap_baseline as baseline  # noqa: E402
-import run_p0_forecast_drift_development as forecast  # noqa: E402
 
 DEVELOPMENT_START = date(2014, 1, 1)
 DEVELOPMENT_END = date(2020, 12, 31)
@@ -51,9 +52,7 @@ def build_candidates(
     panel: pl.DataFrame,
     all_dates: list[date],
 ) -> tuple[pl.DataFrame, dict[str, Any]]:
-    calendar = pl.DataFrame({"entry_date": all_dates}).with_row_index(
-        "action_index"
-    )
+    calendar = pl.DataFrame({"entry_date": all_dates}).with_row_index("action_index")
     last_entry_index = len(all_dates) - SIGNAL_LIFETIME_TRADING_DAYS - 1
     signal_quotes = (
         events.sort(["symbol", "ann_date"])
@@ -72,9 +71,7 @@ def build_candidates(
             check_sortedness=False,
         )
         .rename({"date": "signal_quote_date"})
-        .with_columns(
-            (pl.col("ann_date") + pl.duration(days=1)).alias("available_after")
-        )
+        .with_columns((pl.col("ann_date") + pl.duration(days=1)).alias("available_after"))
         .sort("available_after")
         .join_asof(
             calendar.sort("entry_date"),
@@ -120,9 +117,7 @@ def build_candidates(
             descending=[False, True, True, False],
             nulls_last=True,
         )
-        .with_columns(
-            pl.int_range(1, pl.len() + 1).over("entry_date").alias("cap_rank")
-        )
+        .with_columns(pl.int_range(1, pl.len() + 1).over("entry_date").alias("cap_rank"))
         .filter(pl.col("cap_rank") <= TARGET_POSITIONS)
         .select(
             pl.col("ann_date").alias("date"),
@@ -158,9 +153,7 @@ def simulate(
 ) -> dict[str, Any]:
     symbols = candidates.get_column("symbol").unique().to_list()
     quotes = account.prepare_quote_panel(
-        account.attach_quote_names(
-            raw_source.filter(pl.col("symbol").is_in(symbols)), data_dir
-        )
+        account.attach_quote_names(raw_source.filter(pl.col("symbol").is_in(symbols)), data_dir)
     )
     grid = daily.build_action_grid(candidates, quotes, all_dates)
     simulation = account.simulate_account(
@@ -199,9 +192,7 @@ def simulate(
         "execution": account.execution_summary(simulation["orders"]),
         "integrity": {
             **stale,
-            "max_cash_reconciliation_error": simulation[
-                "max_cash_reconciliation_error"
-            ],
+            "max_cash_reconciliation_error": simulation["max_cash_reconciliation_error"],
         },
         "account": account.account_summary(simulation, account_daily),
     }
@@ -221,19 +212,11 @@ def evaluate(primary: dict[str, Any], benchmark: dict[str, Any]) -> dict[str, An
     checks = {
         "annualized_at_least_20pct": (annualized or -math.inf) >= 0.20,
         "annualized_excess_at_least_10pp": (excess or -math.inf) >= 0.10,
-        "max_drawdown_no_worse_than_30pct": (
-            metrics.get("max_drawdown") or -math.inf
-        )
-        >= -0.30,
+        "max_drawdown_no_worse_than_30pct": (metrics.get("max_drawdown") or -math.inf) >= -0.30,
         "at_least_5_positive_years": metrics["positive_years"] >= 5,
-        "mean_cash_ratio_at_most_50pct": (
-            metrics.get("mean_cash_ratio") or math.inf
-        )
-        <= 0.50,
-        "buy_execution_at_least_90pct": execution["buy"]["execution_rate"]
-        >= 0.90,
-        "sell_execution_at_least_90pct": execution["sell"]["execution_rate"]
-        >= 0.90,
+        "mean_cash_ratio_at_most_50pct": (metrics.get("mean_cash_ratio") or math.inf) <= 0.50,
+        "buy_execution_at_least_90pct": execution["buy"]["execution_rate"] >= 0.90,
+        "sell_execution_at_least_90pct": execution["sell"]["execution_rate"] >= 0.90,
         "no_unresolved_positions": integrity["ending_unresolved_positions"] == 0,
         "cash_reconciled": integrity["max_cash_reconciliation_error"] <= 0.01,
     }
@@ -272,9 +255,7 @@ def run(data_dir: Path, output: Path) -> dict[str, Any]:
     del panel
     gc.collect()
     tiers = {
-        str(int(capital)): simulate(
-            candidates, raw_source, all_dates, data_dir, capital
-        )
+        str(int(capital)): simulate(candidates, raw_source, all_dates, data_dir, capital)
         for capital in CAPITALS
     }
     decision = evaluate(tiers[str(int(PRIMARY_CAPITAL))], benchmark)
@@ -331,9 +312,7 @@ def main() -> None:
     parser.add_argument(
         "--output",
         type=Path,
-        default=Path(
-            "/app/data/research/p0_main_board_forecast_drift_account.json"
-        ),
+        default=Path("/app/data/research/p0_main_board_forecast_drift_account.json"),
     )
     args = parser.parse_args()
     run(args.data_dir, args.output)

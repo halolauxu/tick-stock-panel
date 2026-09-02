@@ -105,4 +105,3 @@ def test_gate_keeps_promising_account_below_final_50pct_target() -> None:
 
     assert decision["passed"] is True
     assert decision["verdict"] == "PROMOTE_TO_VALIDATION"
-
