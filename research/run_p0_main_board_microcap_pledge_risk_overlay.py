@@ -428,9 +428,16 @@ def run(data_dir: Path, output: Path) -> dict[str, Any]:
                 "data_audit_sha256": payload["data_audit_sha256"],
                 "development_funnel": development["funnel"],
                 "development_gate": development["decision"],
-                "primary_account": development["accounts"][
-                    str(int(PRIMARY_CAPITAL))
-                ],
+                "primary_account": {
+                    name: {
+                        key: result[key]
+                        for key in ("metrics", "execution", "integrity", "account")
+                    }
+                    for name, result in development["accounts"][
+                        str(int(PRIMARY_CAPITAL))
+                    ].items()
+                    if name != "initial_cash"
+                },
                 "stage_status": {
                     stage: result.get("status", "READ")
                     for stage, result in stages.items()
