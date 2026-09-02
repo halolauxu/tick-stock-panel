@@ -498,6 +498,25 @@ def simulate_account(
                 raw_open, candidate_target, cash, lot_size=lot_size
             )
             gross = shares * raw_open
+            if (
+                shares <= 0
+                and target_exposure_by_date is not None
+                and candidate_target + 1e-9 < target_notional
+            ):
+                orders.append(
+                    {
+                        "date": entry_date,
+                        "signal_date": candidate["date"],
+                        "symbol": symbol,
+                        "side": "BUY",
+                        "status": "PRETRADE_SKIPPED",
+                        "reason": "portfolio_risk_budget",
+                        "rank": candidate["cap_rank"],
+                        "target_notional": target_notional,
+                        "remaining_buy_budget": remaining_buy_budget,
+                    }
+                )
+                continue
             reason = (
                 "zero_lot_or_cash"
                 if shares <= 0
@@ -511,6 +530,7 @@ def simulate_account(
                 "status": "REJECTED" if reason else "FILLED",
                 "reason": reason,
                 "rank": candidate["cap_rank"],
+                "target_notional": candidate_target,
             }
             if reason:
                 orders.append(order)

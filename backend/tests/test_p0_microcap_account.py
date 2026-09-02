@@ -244,6 +244,49 @@ def test_exposure_budget_caps_buys_without_forcing_desired_sales() -> None:
     assert result["snapshots"][1]["risk_budget_blocked_slots"] == 1
 
 
+def test_residual_exposure_budget_is_skipped_before_order_submission() -> None:
+    d0, d1 = date(2024, 1, 5), date(2024, 1, 8)
+    d2, d3 = date(2024, 1, 12), date(2024, 1, 15)
+    candidates = _candidates(
+        [
+            (d0, d1, "A.SZ", 1),
+            (d2, d3, "A.SZ", 1),
+            (d2, d3, "B.SZ", 2),
+            (d2, d3, "C.SZ", 3),
+        ]
+    )
+    execution = pl.DataFrame(
+        [
+            _quote(d1, "A.SZ", raw_open=5.0, close=15.0),
+            _quote(d1, "B.SZ", raw_open=5.0),
+            _quote(d1, "C.SZ", raw_open=5.0),
+            _quote(d3, "A.SZ", raw_open=15.0, close=15.0),
+            _quote(d3, "B.SZ", raw_open=5.0),
+            _quote(d3, "C.SZ", raw_open=5.0),
+        ]
+    )
+
+    result = account.simulate_account(
+        candidates,
+        execution,
+        initial_cash=20_000.0,
+        target_positions=3,
+        target_exposure_by_date={d1: 0.10, d3: 0.10},
+    )
+
+    skipped = [
+        row
+        for row in result["orders"]
+        if row["status"] == "PRETRADE_SKIPPED"
+        and row["reason"] == "portfolio_risk_budget"
+    ]
+    assert len(skipped) == 1
+    summary = account.execution_summary(result["orders"])
+    assert summary["buy"]["pretrade_skip_reasons"] == {
+        "portfolio_risk_budget": 1
+    }
+
+
 def test_daily_equity_uses_stale_mark_without_future_backfill() -> None:
     d1, d2, d3 = date(2024, 1, 8), date(2024, 1, 9), date(2024, 1, 10)
     simulation = {
