@@ -406,3 +406,42 @@ def test_cb_settlement_waits_until_after_delist_date() -> None:
     assert simulation["settlements"][0]["status"] == (
         "CB_DELISTED_ZERO_RECOVERY"
     )
+
+
+def test_cb_settlement_can_credit_conservative_face_value() -> None:
+    buy_day = date(2020, 3, 16)
+    delist_day = date(2020, 3, 17)
+    settlement_day = date(2020, 3, 23)
+    candidates = _candidates([(date(2020, 3, 13), buy_day, "A.SZ", 1)])
+    execution = pl.DataFrame(
+        [
+            _quote(
+                buy_day,
+                "A.SZ",
+                raw_open=110.0,
+                limit_up=121.0,
+                limit_down=99.0,
+            )
+        ]
+    )
+
+    simulation = account.simulate_account(
+        candidates,
+        execution,
+        initial_cash=20_000.0,
+        target_positions=1,
+        action_dates=[buy_day, delist_day, settlement_day],
+        lot_size=10,
+        stamp_tax_rate=0.0,
+        delist_dates={"A.SZ": delist_day},
+        delist_settlement_status="CB_DELISTED_FACE_VALUE_RECOVERY",
+        settle_only_after_delist_date=True,
+        delist_recovery_per_raw_share=100.0,
+    )
+
+    settlement = simulation["settlements"][0]
+    assert settlement["raw_shares"] == 180
+    assert settlement["recovery_value"] == 18_000.0
+    assert settlement["recognized_loss"] == pytest.approx(-1_800.0)
+    assert simulation["ending_cash"] == pytest.approx(18_185.1)
+    assert simulation["max_cash_reconciliation_error"] == pytest.approx(0.0)

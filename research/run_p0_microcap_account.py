@@ -295,6 +295,7 @@ def simulate_account(
     delist_dates: dict[str, date] | None = None,
     delist_settlement_status: str = "DELISTED_WRITE_OFF",
     settle_only_after_delist_date: bool = False,
+    delist_recovery_per_raw_share: float = 0.0,
 ) -> dict[str, Any]:
     candidate_groups = _partition_rows(candidates, "entry_date")
     quote_groups = _partition_rows(execution_grid, "entry_date")
@@ -335,6 +336,11 @@ def simulate_account(
                 continue
             position = positions.pop(symbol)
             last_book_value = position["units"] * position["last_mark"]
+            recovery_value = (
+                position["raw_shares"] * delist_recovery_per_raw_share
+            )
+            cash += recovery_value
+            cash_ledger += recovery_value
             settlements.append(
                 {
                     "date": entry_date,
@@ -342,9 +348,9 @@ def simulate_account(
                     "symbol": symbol,
                     "status": delist_settlement_status,
                     "raw_shares": position["raw_shares"],
-                    "recovery_value": 0.0,
+                    "recovery_value": recovery_value,
                     "last_book_value": last_book_value,
-                    "recognized_loss": -last_book_value,
+                    "recognized_loss": recovery_value - last_book_value,
                 }
             )
             intervals.append(
