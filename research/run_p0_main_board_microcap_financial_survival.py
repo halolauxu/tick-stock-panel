@@ -276,10 +276,20 @@ def run(data_dir: Path, output: Path) -> dict[str, Any]:
         json.dumps(payload, ensure_ascii=False, indent=2, default=_json_default),
         encoding="utf-8",
     )
+    development = stages["development"]
+    primary = development["accounts"][str(int(PRIMARY_CAPITAL))]
     print(
         json.dumps(
             {
-                **payload,
+                "decision": payload["decision"],
+                "data_audit_sha256": payload["data_audit_sha256"],
+                "development_funnel": development["funnel"],
+                "development_gate": development["decision"],
+                "primary_account": primary,
+                "stage_status": {
+                    stage: result.get("status", "READ")
+                    for stage, result in stages.items()
+                },
                 "output": str(output),
                 "sha256": hashlib.sha256(output.read_bytes()).hexdigest(),
             },
