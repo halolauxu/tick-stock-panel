@@ -509,10 +509,37 @@ def run(data_dir: Path, output: Path) -> dict[str, Any]:
         json.dumps(payload, ensure_ascii=False, indent=2, default=_json_default),
         encoding="utf-8",
     )
+    summary = {
+        "schema_version": payload["schema_version"],
+        "notice_audit_sha256": payload["notice_audit_sha256"],
+        "notice_data": payload["notice_data"],
+        "stages": {
+            stage: (
+                value
+                if "status" in value
+                else {
+                    "period": value["period"],
+                    "cycles": len(value["cycles"]),
+                    "symbols": value["symbols"],
+                    "trading_days": value["trading_days"],
+                    "accounts": {
+                        capital: {
+                            key: account_row[key]
+                            for key in ("metrics", "execution", "integrity")
+                        }
+                        for capital, account_row in value["accounts"].items()
+                    },
+                    "decision": value["decision"],
+                }
+            )
+            for stage, value in stages.items()
+        },
+        "decision": payload["decision"],
+    }
     print(
         json.dumps(
             {
-                **payload,
+                **summary,
                 "output": str(output),
                 "sha256": hashlib.sha256(output.read_bytes()).hexdigest(),
             },
