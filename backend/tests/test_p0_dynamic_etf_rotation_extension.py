@@ -117,4 +117,60 @@ def test_weekly_rank_does_not_use_future_exit_to_replace_the_winner() -> None:
     assert result.row(0, named=True)["symbol"] == "510001.SH"
     assert result.row(0, named=True)["entry_executable"] is True
     assert result.row(0, named=True)["exit_executable"] is False
+    assert result.row(0, named=True)["marked_at_end"] is False
     assert result.row(0, named=True)["etf_return"] == -1.0
+
+
+def test_open_final_position_is_marked_at_study_end() -> None:
+    signal = date(2026, 8, 21)
+    entry = date(2026, 8, 24)
+    rows = [
+        {
+            "symbol": "510001.SH",
+            "date": signal,
+            "adjusted_open": 1.0,
+            "adjusted_close": 1.0,
+            "volume": 1_000.0,
+            "amount": 100_000_000.0,
+            "momentum_120d": 0.30,
+            "mean_amount_20d": 100_000_000.0,
+            "listing_days": 200,
+        },
+        {
+            "symbol": "510001.SH",
+            "date": entry,
+            "adjusted_open": 1.0,
+            "adjusted_close": 1.0,
+            "volume": 1_000.0,
+            "amount": 100_000_000.0,
+            "momentum_120d": 0.30,
+            "mean_amount_20d": 100_000_000.0,
+            "listing_days": 203,
+        },
+        {
+            "symbol": "510001.SH",
+            "date": study.END,
+            "adjusted_open": 1.1,
+            "adjusted_close": 1.2,
+            "volume": 1_000.0,
+            "amount": 100_000_000.0,
+            "momentum_120d": 0.30,
+            "mean_amount_20d": 100_000_000.0,
+            "listing_days": 207,
+        },
+    ]
+    panel = pl.DataFrame(rows)
+    schedule = pl.DataFrame(
+        {
+            "date": [signal],
+            "entry_date": [entry],
+            "exit_date": pl.Series([None], dtype=pl.Date),
+        }
+    )
+
+    result = study.build_weekly_best_etf(panel, schedule)
+    row = result.row(0, named=True)
+
+    assert row["marked_at_end"] is True
+    assert row["exit_executable"] is False
+    assert row["etf_return"] > 0.19

@@ -172,9 +172,13 @@ def build_weekly_best_etf(panel: pl.DataFrame, schedule: pl.DataFrame) -> pl.Dat
         pl.col("adjusted_open").alias("exit_open"),
         pl.col("volume").alias("exit_volume"),
     )
+    end_marks = panel.filter(pl.col("date") == pl.lit(END)).select(
+        "symbol", pl.col("adjusted_close").alias("end_mark")
+    )
     return (
         ranked.join(entry, on=["symbol", "entry_date"], how="left")
         .join(exit_quotes, on=["symbol", "exit_date"], how="left")
+        .join(end_marks, on="symbol", how="left")
         .with_columns(
             (
                 (pl.col("entry_open") > 0)
@@ -186,10 +190,22 @@ def build_weekly_best_etf(panel: pl.DataFrame, schedule: pl.DataFrame) -> pl.Dat
             ((pl.col("exit_open") > 0) & (pl.col("exit_volume") > 0))
             .fill_null(False)
             .alias("exit_executable"),
+            (pl.col("exit_date").is_null() & (pl.col("end_mark") > 0).fill_null(False)).alias(
+                "marked_at_end"
+            ),
         )
         .with_columns(
             pl.when(~pl.col("entry_executable"))
             .then(0.0)
+            .when(pl.col("marked_at_end"))
+            .then(
+                pl.col("end_mark")
+                / (
+                    pl.col("entry_open")
+                    * (1.0 + overlay.baseline.COMMISSION_PCT + overlay.baseline.SLIPPAGE_PCT)
+                )
+                - 1.0
+            )
             .when(~pl.col("exit_executable"))
             .then(-1.0)
             .otherwise(
@@ -212,6 +228,7 @@ def build_weekly_best_etf(panel: pl.DataFrame, schedule: pl.DataFrame) -> pl.Dat
             "etf_return",
             "entry_executable",
             "exit_executable",
+            "marked_at_end",
         )
     )
 
@@ -292,6 +309,11 @@ def run(data_dir: Path, output: Path) -> dict[str, Any]:
             "weeks": microcap.height,
             "etf_selected_weeks": best_etf.height,
             "etf_selected_symbols": best_etf.get_column("symbol").n_unique(),
+            "entry_rejections": best_etf.filter(~pl.col("entry_executable")).height,
+            "missing_historical_exits": best_etf.filter(
+                pl.col("entry_executable") & ~pl.col("exit_executable") & ~pl.col("marked_at_end")
+            ).height,
+            "end_marked_positions": best_etf.filter(pl.col("marked_at_end")).height,
             "top_selected_etfs": selection,
         },
         "control": control,
