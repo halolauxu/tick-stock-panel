@@ -193,6 +193,57 @@ def test_simulator_can_disable_stamp_tax_for_etf_account() -> None:
     assert sell["stamp_tax"] == 0.0
 
 
+def test_exposure_budget_caps_buys_without_forcing_desired_sales() -> None:
+    d0, d1 = date(2024, 1, 5), date(2024, 1, 8)
+    d2, d3 = date(2024, 1, 12), date(2024, 1, 15)
+    candidates = _candidates(
+        [
+            (d0, d1, "A.SZ", 1),
+            (d0, d1, "B.SZ", 2),
+            (d2, d3, "A.SZ", 1),
+            (d2, d3, "C.SZ", 2),
+        ]
+    )
+    execution = pl.DataFrame(
+        [
+            _quote(d1, "A.SZ"),
+            _quote(d1, "B.SZ"),
+            _quote(d1, "C.SZ"),
+            _quote(d3, "A.SZ"),
+            _quote(d3, "B.SZ"),
+            _quote(d3, "C.SZ"),
+        ]
+    )
+
+    result = account.simulate_account(
+        candidates,
+        execution,
+        initial_cash=20_000.0,
+        target_positions=2,
+        target_exposure_by_date={d1: 0.20, d3: 0.0},
+    )
+
+    first = result["snapshots"][0]
+    assert first["target_exposure"] == pytest.approx(0.20)
+    assert first["actual_exposure"] <= 0.20
+    assert {row["symbol"] for row in result["ending_positions"]} == {
+        "A.SZ"
+    }
+    assert not any(
+        row["date"] == d3
+        and row["side"] == "SELL"
+        and row["symbol"] == "A.SZ"
+        for row in result["orders"]
+    )
+    assert not any(
+        row["date"] == d3
+        and row["side"] == "BUY"
+        and row["symbol"] == "C.SZ"
+        for row in result["orders"]
+    )
+    assert result["snapshots"][1]["risk_budget_blocked_slots"] == 1
+
+
 def test_daily_equity_uses_stale_mark_without_future_backfill() -> None:
     d1, d2, d3 = date(2024, 1, 8), date(2024, 1, 9), date(2024, 1, 10)
     simulation = {

@@ -296,6 +296,7 @@ def simulate_account(
     delist_settlement_status: str = "DELISTED_WRITE_OFF",
     settle_only_after_delist_date: bool = False,
     delist_recovery_per_raw_share: float = 0.0,
+    target_exposure_by_date: dict[date, float] | None = None,
 ) -> dict[str, Any]:
     candidate_groups = _partition_rows(candidates, "entry_date")
     quote_groups = _partition_rows(execution_grid, "entry_date")
@@ -377,6 +378,17 @@ def simulate_account(
             )
             pre_open_equity += position["units"] * price
 
+        target_exposure = (
+            float(target_exposure_by_date.get(entry_date, 1.0))
+            if target_exposure_by_date is not None
+            else 1.0
+        )
+        if not math.isfinite(target_exposure) or not 0.0 <= target_exposure <= 1.0:
+            raise ValueError(
+                f"invalid target exposure for {entry_date}: {target_exposure}"
+            )
+        target_gross = pre_open_equity * target_exposure
+
         desired = {
             row["symbol"] for row in candidate_rows[:target_positions]
         }
@@ -435,17 +447,37 @@ def simulate_account(
             del positions[symbol]
 
         slots = max(0, target_positions - len(positions))
-        target_notional = pre_open_equity / target_positions
+        target_notional = target_gross / target_positions
+        current_gross = 0.0
+        for symbol, position in positions.items():
+            quote = quotes.get(symbol)
+            price = (
+                float(quote["open"])
+                if quote and quote.get("exact_quote") and quote.get("open")
+                else float(position["last_mark"])
+            )
+            current_gross += position["units"] * price
+        remaining_buy_budget = max(0.0, target_gross - current_gross)
         for candidate in candidate_rows:
             if slots <= 0:
+                break
+            if (
+                target_exposure_by_date is not None
+                and remaining_buy_budget <= MIN_COMMISSION
+            ):
                 break
             symbol = candidate["symbol"]
             if symbol in positions or symbol in sold_today:
                 continue
+            candidate_target = (
+                min(target_notional, remaining_buy_budget)
+                if target_exposure_by_date is not None
+                else target_notional
+            )
             signal_capacity = float(
                 candidate.get("signal_amount") or 0.0
             ) * baseline.DAILY_PARTICIPATION
-            if target_notional > signal_capacity:
+            if candidate_target > signal_capacity:
                 orders.append(
                     {
                         "date": entry_date,
@@ -455,7 +487,7 @@ def simulate_account(
                         "status": "PRETRADE_SKIPPED",
                         "reason": "signal_capacity",
                         "rank": candidate["cap_rank"],
-                        "target_notional": target_notional,
+                        "target_notional": candidate_target,
                         "signal_capacity": signal_capacity,
                     }
                 )
@@ -463,7 +495,7 @@ def simulate_account(
             quote = quotes.get(symbol)
             raw_open = float(quote["raw_open"]) if quote and quote.get("raw_open") else 0.0
             shares = affordable_shares(
-                raw_open, target_notional, cash, lot_size=lot_size
+                raw_open, candidate_target, cash, lot_size=lot_size
             )
             gross = shares * raw_open
             reason = (
@@ -509,6 +541,8 @@ def simulate_account(
             )
             orders.append(order)
             trades.append(order.copy())
+            current_gross += gross
+            remaining_buy_budget = max(0.0, target_gross - current_gross)
             slots -= 1
 
         max_cash_error = max(max_cash_error, abs(cash - cash_ledger))
@@ -519,6 +553,19 @@ def simulate_account(
                 "position_count": len(positions),
                 "pre_open_equity": pre_open_equity,
                 "target_notional": target_notional,
+                "target_exposure": target_exposure,
+                "target_gross": target_gross,
+                "actual_exposure": (
+                    current_gross / pre_open_equity
+                    if pre_open_equity > 0
+                    else 0.0
+                ),
+                "risk_budget_blocked_slots": (
+                    slots
+                    if target_exposure_by_date is not None
+                    and remaining_buy_budget <= MIN_COMMISSION
+                    else 0
+                ),
             }
         )
 
