@@ -114,9 +114,6 @@ def test_gate_checks_require_improvement_and_integrity() -> None:
         },
     }
 
-    checks = study.gate_checks(
-        result, control, {"annualized": 0.12}, active=0.50
-    )
+    checks = study.gate_checks(result, control, {"annualized": 0.12}, active=0.50)
 
     assert all(checks.values())
-

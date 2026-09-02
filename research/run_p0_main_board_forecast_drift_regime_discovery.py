@@ -39,13 +39,7 @@ STATE_NAMES = (
 
 
 def _rolling_return(column: str, window: int) -> pl.Expr:
-    return (
-        pl.col(column)
-        .log1p()
-        .rolling_sum(window_size=window, min_samples=window)
-        .exp()
-        - 1.0
-    )
+    return pl.col(column).log1p().rolling_sum(window_size=window, min_samples=window).exp() - 1.0
 
 
 def build_market_states(panel: pl.DataFrame) -> pl.DataFrame:
@@ -86,27 +80,14 @@ def build_market_states(panel: pl.DataFrame) -> pl.DataFrame:
         .drop_nulls("entry_date")
         .with_columns(
             pl.lit(True).alias(CONTROL),
-            (pl.col("market_return_5d") > 0)
-            .fill_null(False)
-            .alias("market_5d_positive"),
-            (pl.col("market_return_20d") > 0)
-            .fill_null(False)
-            .alias("market_20d_positive"),
-            (pl.col("market_return_60d") > 0)
-            .fill_null(False)
-            .alias("market_60d_positive"),
-            (pl.col("market_return_120d") > 0)
-            .fill_null(False)
-            .alias("market_120d_positive"),
-            (
-                (pl.col("market_return_20d") > 0)
-                & (pl.col("market_return_120d") > 0)
-            )
+            (pl.col("market_return_5d") > 0).fill_null(False).alias("market_5d_positive"),
+            (pl.col("market_return_20d") > 0).fill_null(False).alias("market_20d_positive"),
+            (pl.col("market_return_60d") > 0).fill_null(False).alias("market_60d_positive"),
+            (pl.col("market_return_120d") > 0).fill_null(False).alias("market_120d_positive"),
+            ((pl.col("market_return_20d") > 0) & (pl.col("market_return_120d") > 0))
             .fill_null(False)
             .alias("market_20d_and_120d_positive"),
-            (pl.col("breadth_60d") >= 0.50)
-            .fill_null(False)
-            .alias("breadth_60d_at_least_half"),
+            (pl.col("breadth_60d") >= 0.50).fill_null(False).alias("breadth_60d_at_least_half"),
         )
         .rename({"date": "signal_date"})
     )
@@ -127,9 +108,7 @@ def gate_candidates(
     candidates: pl.DataFrame, states: pl.DataFrame, state_name: str
 ) -> pl.DataFrame:
     return (
-        candidates.join(
-            states.select("entry_date", state_name), on="entry_date", how="left"
-        )
+        candidates.join(states.select("entry_date", state_name), on="entry_date", how="left")
         .filter(pl.col(state_name).fill_null(False))
         .drop(state_name)
         .sort(["entry_date", "cap_rank", "symbol"])
@@ -160,17 +139,13 @@ def intent_execution_summary(
                 or episode[-1]["status"] == "FILLED"
             ):
                 totals[side]["intents"] += 1
-                totals[side]["executed"] += int(
-                    any(item["status"] == "FILLED" for item in episode)
-                )
+                totals[side]["executed"] += int(any(item["status"] == "FILLED" for item in episode))
                 episode = []
             episode.append(row)
             previous_index = current_index
         if episode:
             totals[side]["intents"] += 1
-            totals[side]["executed"] += int(
-                any(item["status"] == "FILLED" for item in episode)
-            )
+            totals[side]["executed"] += int(any(item["status"] == "FILLED" for item in episode))
     for values in totals.values():
         values["execution_rate"] = (
             values["executed"] / values["intents"] if values["intents"] else 1.0
@@ -220,9 +195,7 @@ def simulate_variant(
         "intent_execution": intent_execution_summary(simulation["orders"], all_dates),
         "integrity": {
             **stale,
-            "max_cash_reconciliation_error": simulation[
-                "max_cash_reconciliation_error"
-            ],
+            "max_cash_reconciliation_error": simulation["max_cash_reconciliation_error"],
         },
         "account": account.account_summary(simulation, account_daily),
     }
@@ -238,38 +211,24 @@ def gate_checks(
     return {
         "annualized_at_least_20pct": (annualized or -math.inf) >= 0.20,
         "annualized_improves_control_by_3pp": (
-            (annualized or -math.inf)
-            - (control_metrics.get("annualized") or math.inf)
-            >= 0.03
+            (annualized or -math.inf) - (control_metrics.get("annualized") or math.inf) >= 0.03
         ),
         "annualized_excess_at_least_5pp": (
-            (annualized or -math.inf) - (benchmark.get("annualized") or math.inf)
-            >= 0.05
+            (annualized or -math.inf) - (benchmark.get("annualized") or math.inf) >= 0.05
         ),
         "max_drawdown_no_worse_than_30pct": (drawdown or -math.inf) >= -0.30,
         "drawdown_improves_control_by_5pp": (
-            (drawdown or -math.inf)
-            - (control_metrics.get("max_drawdown") or math.inf)
-            >= 0.05
+            (drawdown or -math.inf) - (control_metrics.get("max_drawdown") or math.inf) >= 0.05
         ),
         "at_least_5_positive_years": metrics["positive_years"] >= 5,
         "active_ratio_at_least_35pct": active >= 0.35,
-        "mean_cash_ratio_at_most_75pct": (
-            metrics.get("mean_cash_ratio") or math.inf
-        )
-        <= 0.75,
-        "buy_intent_execution_at_least_90pct": result["intent_execution"]["buy"][
-            "execution_rate"
-        ]
+        "mean_cash_ratio_at_most_75pct": (metrics.get("mean_cash_ratio") or math.inf) <= 0.75,
+        "buy_intent_execution_at_least_90pct": result["intent_execution"]["buy"]["execution_rate"]
         >= 0.90,
-        "sell_intent_execution_at_least_90pct": result["intent_execution"][
-            "sell"
-        ]["execution_rate"]
+        "sell_intent_execution_at_least_90pct": result["intent_execution"]["sell"]["execution_rate"]
         >= 0.90,
-        "no_unresolved_positions": result["integrity"]["ending_unresolved_positions"]
-        == 0,
-        "cash_reconciled": result["integrity"]["max_cash_reconciliation_error"]
-        <= 0.01,
+        "no_unresolved_positions": result["integrity"]["ending_unresolved_positions"] == 0,
+        "cash_reconciled": result["integrity"]["max_cash_reconciliation_error"] <= 0.01,
     }
 
 
@@ -287,12 +246,8 @@ def run(data_dir: Path, output: Path) -> dict[str, Any]:
     )
     raw_source = main_board.filter_main_board(raw_all)
     all_dates = raw_source.get_column("date").unique().sort().to_list()
-    panel = baseline.prepare_panel(
-        baseline.attach_point_in_time_data(raw_source, data_dir)
-    )
-    candidates, signal_audit = base.build_candidates(
-        base.load_events(data_dir), panel, all_dates
-    )
+    panel = baseline.prepare_panel(baseline.attach_point_in_time_data(raw_source, data_dir))
+    candidates, signal_audit = base.build_candidates(base.load_events(data_dir), panel, all_dates)
     states = build_market_states(panel)
     benchmark = shared.benchmark_metrics(panel)
     del panel
@@ -300,9 +255,7 @@ def run(data_dir: Path, output: Path) -> dict[str, Any]:
 
     symbols = candidates.get_column("symbol").unique().to_list()
     quotes = account.prepare_quote_panel(
-        account.attach_quote_names(
-            raw_source.filter(pl.col("symbol").is_in(symbols)), data_dir
-        )
+        account.attach_quote_names(raw_source.filter(pl.col("symbol").is_in(symbols)), data_dir)
     )
     grid = daily.build_action_grid(candidates, quotes, all_dates)
     results: dict[str, Any] = {}
@@ -322,9 +275,7 @@ def run(data_dir: Path, output: Path) -> dict[str, Any]:
     checks: dict[str, dict[str, bool]] = {}
     for state_name in STATE_NAMES:
         active_ratio = results[state_name]["state"]["active_ratio"]
-        checks[state_name] = gate_checks(
-            results[state_name], control, benchmark, active_ratio
-        )
+        checks[state_name] = gate_checks(results[state_name], control, benchmark, active_ratio)
         if all(checks[state_name].values()):
             qualified.append(state_name)
     order = {name: index for index, name in enumerate(STATE_NAMES)}
@@ -402,10 +353,7 @@ def main() -> None:
     parser.add_argument(
         "--output",
         type=Path,
-        default=Path(
-            "/app/data/research/"
-            "p0_main_board_forecast_drift_regime_discovery.json"
-        ),
+        default=Path("/app/data/research/p0_main_board_forecast_drift_regime_discovery.json"),
     )
     args = parser.parse_args()
     run(args.data_dir, args.output)
@@ -413,4 +361,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
