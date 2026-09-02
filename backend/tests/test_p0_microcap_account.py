@@ -337,3 +337,41 @@ def test_independent_account_respects_requested_initial_cash() -> None:
 
     assert result["daily_equity"][0]["equity"] == pytest.approx(20_000.0)
     assert result["account"]["ending_equity"] == pytest.approx(20_000.0)
+
+
+def test_confirmed_delisting_writes_position_off_without_fake_sale() -> None:
+    buy_day = date(2024, 5, 27)
+    settlement_day = date(2024, 7, 1)
+    candidates = _candidates([(date(2024, 5, 24), buy_day, "A.SZ", 1)])
+    execution = pl.DataFrame([_quote(buy_day, "A.SZ", raw_open=1.0)])
+
+    simulation = account.simulate_account(
+        candidates,
+        execution,
+        initial_cash=20_000.0,
+        target_positions=1,
+        action_dates=[buy_day, settlement_day],
+        delist_dates={"A.SZ": date(2024, 6, 27)},
+    )
+
+    assert simulation["ending_positions"] == []
+    assert len(simulation["settlements"]) == 1
+    settlement = simulation["settlements"][0]
+    assert settlement["date"] == settlement_day
+    assert settlement["effective_delist_date"] == date(2024, 6, 27)
+    assert settlement["status"] == "DELISTED_WRITE_OFF"
+    assert settlement["recovery_value"] == 0.0
+    assert settlement["recognized_loss"] < 0
+    assert [row["side"] for row in simulation["orders"]] == ["BUY"]
+
+    daily, integrity = account.build_daily_equity(
+        simulation,
+        pl.DataFrame(
+            {"symbol": ["A.SZ"], "date": [buy_day], "close": [1.0]}
+        ),
+        [buy_day, settlement_day],
+        initial_cash=20_000.0,
+    )
+    assert daily[-1, "position_count"] == 0
+    assert daily[-1, "equity"] == pytest.approx(simulation["ending_cash"])
+    assert integrity["ending_unresolved_positions"] == 0

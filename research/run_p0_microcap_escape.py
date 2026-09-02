@@ -317,12 +317,14 @@ def simulate_tier(
     quotes: pl.DataFrame,
     scoped_dates: list[date],
     weekly_market: pl.DataFrame,
+    delist_dates: dict[str, date] | None = None,
 ) -> dict[str, Any]:
     overlay = account.simulate_account(
         action_candidates,
         execution_grid,
         initial_cash=capital,
         action_dates=action_dates,
+        delist_dates=delist_dates,
     )
     overlay_daily, stale = account.build_daily_equity(
         overlay, quotes, scoped_dates, initial_cash=capital
@@ -332,6 +334,7 @@ def simulate_tier(
         execution_grid,
         initial_cash=capital,
         action_dates=naked_dates,
+        delist_dates=delist_dates,
     )
     naked_daily, naked_stale = account.build_daily_equity(
         naked, quotes, scoped_dates, initial_cash=capital
@@ -372,6 +375,7 @@ def simulate_tier(
             "cash_ratio",
         ).to_dicts(),
         "orders": overlay["orders"],
+        "settlements": overlay["settlements"],
         "worst_weeks": account.worst_weeks(overlay_daily),
     }
 

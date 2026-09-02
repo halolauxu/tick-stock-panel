@@ -292,6 +292,7 @@ def simulate_account(
     action_dates: list[date] | None = None,
     stamp_tax_rate: float | None = None,
     lot_size: int = LOT_SIZE,
+    delist_dates: dict[str, date] | None = None,
 ) -> dict[str, Any]:
     candidate_groups = _partition_rows(candidates, "entry_date")
     quote_groups = _partition_rows(execution_grid, "entry_date")
@@ -299,6 +300,7 @@ def simulate_account(
     intervals: list[dict[str, Any]] = []
     orders: list[dict[str, Any]] = []
     trades: list[dict[str, Any]] = []
+    settlements: list[dict[str, Any]] = []
     snapshots: list[dict[str, Any]] = []
     cash = float(initial_cash)
     cash_ledger = float(initial_cash)
@@ -318,6 +320,33 @@ def simulate_account(
             row["symbol"]: row
             for row in quote_frame.to_dicts()
         }
+        for symbol in list(positions):
+            delist_date = (delist_dates or {}).get(symbol)
+            if delist_date is None or entry_date < delist_date:
+                continue
+            position = positions.pop(symbol)
+            last_book_value = position["units"] * position["last_mark"]
+            settlements.append(
+                {
+                    "date": entry_date,
+                    "effective_delist_date": delist_date,
+                    "symbol": symbol,
+                    "status": "DELISTED_WRITE_OFF",
+                    "raw_shares": position["raw_shares"],
+                    "recovery_value": 0.0,
+                    "last_book_value": last_book_value,
+                    "recognized_loss": -last_book_value,
+                }
+            )
+            intervals.append(
+                {
+                    "position_id": position["position_id"],
+                    "symbol": symbol,
+                    "units": position["units"],
+                    "start_date": position["start_date"],
+                    "end_date": entry_date,
+                }
+            )
         for symbol, position in positions.items():
             quote = quotes.get(symbol)
             if quote and quote.get("close") is not None:
@@ -491,6 +520,7 @@ def simulate_account(
     return {
         "orders": orders,
         "trades": trades,
+        "settlements": settlements,
         "snapshots": snapshots,
         "intervals": intervals,
         "ending_positions": list(positions.values()),
