@@ -42,6 +42,16 @@ def test_normalize_daily_converts_amount_to_cny() -> None:
     assert frame.row(0, named=True)["amount"] == 123_500.0
 
 
+def test_adjustment_requests_are_split_by_calendar_year() -> None:
+    ranges = collector.year_ranges(date(2013, 7, 1), date(2015, 3, 2))
+
+    assert ranges == [
+        (date(2013, 7, 1), date(2013, 12, 31)),
+        (date(2014, 1, 1), date(2014, 12, 31)),
+        (date(2015, 1, 1), date(2015, 3, 2)),
+    ]
+
+
 def test_prepare_etf_panel_uses_only_trailing_adjusted_prices() -> None:
     start = date(2020, 1, 1)
     rows = []

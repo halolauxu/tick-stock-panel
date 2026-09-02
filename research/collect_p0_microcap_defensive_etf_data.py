@@ -93,6 +93,16 @@ def _atomic_parquet(frame: pl.DataFrame, target: Path) -> None:
     temporary.replace(target)
 
 
+def year_ranges(start: date, end: date) -> list[tuple[date, date]]:
+    return [
+        (
+            max(start, date(year, 1, 1)),
+            min(end, date(year, 12, 31)),
+        )
+        for year in range(start.year, end.year + 1)
+    ]
+
+
 def collect(data_dir: Path, output: Path) -> dict[str, Any]:
     token = secrets_store.get_env_backed_secret(
         "tushare_api_key", "TUSHARE_TOKEN"
@@ -115,17 +125,18 @@ def collect(data_dir: Path, output: Path) -> dict[str, Any]:
                     DAILY_FIELDS,
                 )
             )
-            adjustment_rows.extend(
-                client.query(
-                    "fund_adj",
-                    {
-                        "ts_code": symbol,
-                        "start_date": START.strftime("%Y%m%d"),
-                        "end_date": END.strftime("%Y%m%d"),
-                    },
-                    ADJ_FIELDS,
+            for chunk_start, chunk_end in year_ranges(START, END):
+                adjustment_rows.extend(
+                    client.query(
+                        "fund_adj",
+                        {
+                            "ts_code": symbol,
+                            "start_date": chunk_start.strftime("%Y%m%d"),
+                            "end_date": chunk_end.strftime("%Y%m%d"),
+                        },
+                        ADJ_FIELDS,
+                    )
                 )
-            )
             print(f"collected={symbol}", flush=True)
     finally:
         client.close()
