@@ -305,3 +305,35 @@ def test_gate_uses_independently_started_validation_and_stress_accounts() -> Non
     decision = account.evaluate_gate(independent)
     assert decision["verdict"] == "DOWNGRADE"
     assert "known_stress_annualized" in decision["failures"]
+
+
+def test_independent_account_respects_requested_initial_cash() -> None:
+    signal_day = date(2020, 12, 31)
+    entry_day = date(2021, 1, 4)
+    candidates = _candidates(
+        [(signal_day, entry_day, "A.SZ", 1)]
+    )
+    execution = pl.DataFrame([_quote(entry_day, "A.SZ")])
+    quotes = pl.DataFrame(
+        {"symbol": ["A.SZ"], "date": [entry_day], "close": [10.0]}
+    )
+    weekly_market = pl.DataFrame(
+        {
+            "date": [entry_day],
+            "period": ["validation"],
+            "market_net": [0.0],
+        }
+    )
+
+    result = account.run_independent_account(
+        "validation",
+        candidates,
+        execution,
+        quotes,
+        [entry_day],
+        weekly_market,
+        initial_cash=20_000.0,
+    )
+
+    assert result["daily_equity"][0]["equity"] == pytest.approx(20_000.0)
+    assert result["account"]["ending_equity"] == pytest.approx(20_000.0)

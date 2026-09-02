@@ -649,6 +649,7 @@ def account_period_metrics(
             {
                 "period": period,
                 "trading_days": scoped.height,
+                "account_total_return": account_total,
                 "account_annualized": account_annual,
                 "market_annualized": market_annual,
                 "annualized_excess": (
@@ -753,6 +754,8 @@ def run_independent_account(
     quotes: pl.DataFrame,
     all_dates: list[date],
     weekly_market: pl.DataFrame,
+    *,
+    initial_cash: float = INITIAL_CASH,
 ) -> dict[str, Any]:
     scoped_dates = period_dates(all_dates, period)
     first_date = scoped_dates[0]
@@ -765,8 +768,17 @@ def run_independent_account(
         (pl.col("entry_date") >= pl.lit(first_date))
         & (pl.col("entry_date") <= pl.lit(last_date))
     )
-    simulation = simulate_account(scoped_candidates, scoped_grid)
-    daily, stale = build_daily_equity(simulation, quotes, scoped_dates)
+    simulation = simulate_account(
+        scoped_candidates,
+        scoped_grid,
+        initial_cash=initial_cash,
+    )
+    daily, stale = build_daily_equity(
+        simulation,
+        quotes,
+        scoped_dates,
+        initial_cash=initial_cash,
+    )
     metric = next(
         row
         for row in account_period_metrics(daily, weekly_market)
