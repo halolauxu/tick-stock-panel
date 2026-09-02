@@ -9,11 +9,7 @@ import polars as pl
 
 
 def _load_module():
-    path = (
-        Path(__file__).resolve().parents[2]
-        / "research"
-        / "audit_p0_index_inclusion_notices.py"
-    )
+    path = Path(__file__).resolve().parents[2] / "research" / "audit_p0_index_inclusion_notices.py"
     spec = importlib.util.spec_from_file_location("p0_index_notices", path)
     assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)
@@ -68,9 +64,7 @@ def test_extract_official_counts_normalizes_html_and_spaces() -> None:
 def test_audit_rejects_entire_cycle_when_one_index_count_differs() -> None:
     corrupt = date(2015, 12, 1)
 
-    matched, payload = study.audit_notices(
-        _additions(corrupt_cycle=corrupt), fetcher=_official
-    )
+    matched, payload = study.audit_notices(_additions(corrupt_cycle=corrupt), fetcher=_official)
 
     assert payload["status"] == "NOTICE_MATCH_SUFFICIENT"
     assert payload["matched_cycles"] == len(study.NOTICES) - 1

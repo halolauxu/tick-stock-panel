@@ -6,11 +6,7 @@ from pathlib import Path
 
 
 def _load_module():
-    path = (
-        Path(__file__).resolve().parents[2]
-        / "research"
-        / "collect_p0_index_inclusion_data.py"
-    )
+    path = Path(__file__).resolve().parents[2] / "research" / "collect_p0_index_inclusion_data.py"
     spec = importlib.util.spec_from_file_location("p0_index_inclusion_data", path)
     assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)
@@ -91,3 +87,18 @@ def test_derive_regular_additions_only_compares_may_june_and_november_december()
     assert result.height == 2
     assert set(result["symbol"].to_list()) == {"600002.SH"}
     assert set(result["cycle_month"].to_list()) == {date(2020, 6, 1)}
+
+
+def test_covered_index_months_supports_incremental_extension() -> None:
+    weights = study.normalize_weights(
+        [
+            {
+                "index_code": "000300.SH",
+                "con_code": "600001.SH",
+                "trade_date": "20260529",
+                "weight": 1.0,
+            }
+        ]
+    )
+
+    assert study.covered_index_months(weights) == {("000300.SH", 2026, 5)}

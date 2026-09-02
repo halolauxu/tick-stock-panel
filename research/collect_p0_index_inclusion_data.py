@@ -1,4 +1,5 @@
 """Collect index membership metadata before opening constituent returns."""
+
 from __future__ import annotations
 
 import argparse
@@ -19,7 +20,7 @@ from app import secrets_store  # noqa: E402
 from app.plugins.tushare.client import TushareClient  # noqa: E402
 
 START = date(2013, 1, 1)
-END = date(2020, 12, 31)
+END = date(2026, 8, 31)
 INDEX_CODES = ("000300.SH", "000905.SH")
 FIELDS = ("index_code", "con_code", "trade_date", "weight")
 OUTCOME_FIELDS = {
@@ -68,9 +69,7 @@ def normalize_weights(rows: list[dict[str, Any]]) -> pl.DataFrame:
         .with_columns(
             pl.col("index_code").cast(pl.Utf8).str.strip_chars(),
             pl.col("symbol").cast(pl.Utf8).str.strip_chars(),
-            pl.col("snapshot_date")
-            .cast(pl.Utf8)
-            .str.to_date("%Y%m%d", strict=False),
+            pl.col("snapshot_date").cast(pl.Utf8).str.to_date("%Y%m%d", strict=False),
             pl.col("weight_pct").cast(pl.Float64, strict=False),
         )
         .filter(
@@ -104,7 +103,13 @@ def derive_regular_additions(weights: pl.DataFrame) -> pl.DataFrame:
         index_code, snapshot_date = key
         snapshots[(index_code, snapshot_date.year, snapshot_date.month)] = (
             snapshot_date,
-            dict(zip(group["symbol"].to_list(), group["weight_pct"].to_list(), strict=True)),
+            dict(
+                zip(
+                    group["symbol"].to_list(),
+                    group["weight_pct"].to_list(),
+                    strict=True,
+                )
+            ),
         )
     for index_code in INDEX_CODES:
         for year in range(START.year, END.year + 1):
@@ -171,8 +176,7 @@ def audit(weights: pl.DataFrame, additions: pl.DataFrame) -> dict[str, Any]:
             for code in INDEX_CODES
         ),
         "each_index_has_at_least_12_regular_cycles": all(
-            cycle_rows.get(code, {}).get("cycles", 0)
-            >= MIN_REGULAR_CYCLES_PER_INDEX
+            cycle_rows.get(code, {}).get("cycles", 0) >= MIN_REGULAR_CYCLES_PER_INDEX
             for code in INDEX_CODES
         ),
         "at_least_500_additions": additions.height >= MIN_ADDITIONS,
@@ -216,39 +220,69 @@ def _json_default(value: Any) -> Any:
     raise TypeError(f"unsupported JSON value: {type(value).__name__}")
 
 
+def covered_index_months(weights: pl.DataFrame) -> set[tuple[str, int, int]]:
+    if weights.is_empty():
+        return set()
+    return {
+        (row["index_code"], row["snapshot_date"].year, row["snapshot_date"].month)
+        for row in weights.select("index_code", "snapshot_date").unique().to_dicts()
+    }
+
+
 def collect(data_dir: Path, output: Path) -> dict[str, Any]:
-    token = secrets_store.get_env_backed_secret(
-        "tushare_api_key", "TUSHARE_TOKEN"
-    )
+    token = secrets_store.get_env_backed_secret("tushare_api_key", "TUSHARE_TOKEN")
     if not token:
         raise RuntimeError("Tushare token is not configured")
     client = TushareClient(token)
-    frames: list[pl.DataFrame] = []
+    root = data_dir / "research" / "index_inclusion"
+    weights_path = root / "monthly_weights.parquet"
+    existing = (
+        normalize_weights(
+            pl.read_parquet(weights_path)
+            .rename(
+                {
+                    "symbol": "con_code",
+                    "snapshot_date": "trade_date",
+                    "weight_pct": "weight",
+                }
+            )
+            .to_dicts()
+        )
+        if weights_path.is_file()
+        else normalize_weights([])
+    )
+    covered = covered_index_months(existing)
+    frames: list[pl.DataFrame] = [existing] if not existing.is_empty() else []
     try:
-        total = len(INDEX_CODES) * len(month_ranges())
+        pending = [
+            (index_code, month_start, month_end)
+            for index_code in INDEX_CODES
+            for month_start, month_end in month_ranges()
+            if (index_code, month_start.year, month_start.month) not in covered
+        ]
+        total = len(pending)
         progress = 0
-        for index_code in INDEX_CODES:
-            for month_start, month_end in month_ranges():
-                frame = normalize_weights(
-                    client.query(
-                        "index_weight",
-                        {
-                            "index_code": index_code,
-                            "start_date": month_start.strftime("%Y%m%d"),
-                            "end_date": month_end.strftime("%Y%m%d"),
-                        },
-                        FIELDS,
-                    )
+        for index_code, month_start, month_end in pending:
+            frame = normalize_weights(
+                client.query(
+                    "index_weight",
+                    {
+                        "index_code": index_code,
+                        "start_date": month_start.strftime("%Y%m%d"),
+                        "end_date": month_end.strftime("%Y%m%d"),
+                    },
+                    FIELDS,
                 )
-                if not frame.is_empty():
-                    frames.append(frame)
-                progress += 1
-                if progress == 1 or progress % 12 == 0 or progress == total:
-                    print(
-                        f"index_weight_progress={progress}/{total} "
-                        f"returned_months={len(frames)}",
-                        flush=True,
-                    )
+            )
+            if not frame.is_empty():
+                frames.append(frame)
+            progress += 1
+            if progress == 1 or progress % 12 == 0 or progress == total:
+                print(
+                    f"index_weight_progress={progress}/{total} "
+                    f"cached_months={len(covered)}",
+                    flush=True,
+                )
     finally:
         client.close()
     weights = (
@@ -259,12 +293,11 @@ def collect(data_dir: Path, output: Path) -> dict[str, Any]:
         else normalize_weights([])
     )
     additions = derive_regular_additions(weights)
-    root = data_dir / "research" / "index_inclusion"
-    _atomic_parquet(weights, root / "monthly_weights.parquet")
+    _atomic_parquet(weights, weights_path)
     _atomic_parquet(additions, root / "regular_additions.parquet")
     payload = {
-        "schema_version": "p0-index-inclusion-data-v1",
-        "contract_frozen": "2026-08-31",
+        "schema_version": "p0-index-inclusion-data-v2",
+        "contract_frozen": "2026-09-03",
         **audit(weights, additions),
         "artifacts": {
             "monthly_weights": str(root / "monthly_weights.parquet"),

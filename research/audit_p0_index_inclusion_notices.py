@@ -4,6 +4,7 @@ This audit is metadata-only.  It deliberately refuses to read market prices or
 returns.  Adjacent-month membership differences are admitted only when both
 CSI 300 and CSI 500 counts match the official announcement for that cycle.
 """
+
 from __future__ import annotations
 
 import argparse
@@ -32,7 +33,7 @@ DETAIL_URL = (
     "https://www.csindex.com.cn/csindex-home/announcement/"
     "queryAnnouncementById?id={notice_id}"
 )
-MIN_MATCHED_CYCLES = 12
+MIN_MATCHED_CYCLES = 22
 
 
 @dataclass(frozen=True)
@@ -61,6 +62,17 @@ NOTICES = (
     Notice(date(2019, 12, 1), date(2019, 12, 2), date(2019, 12, 16), 13044, 16, 50),
     Notice(date(2020, 6, 1), date(2020, 6, 1), date(2020, 6, 15), 13130, 21, 50),
     Notice(date(2020, 12, 1), date(2020, 11, 27), date(2020, 12, 14), 13247, 26, 50),
+    Notice(date(2021, 6, 1), date(2021, 5, 28), date(2021, 6, 11), 12470, 25, 50),
+    Notice(date(2021, 12, 1), date(2021, 11, 26), date(2021, 12, 10), 13888, 28, 50),
+    Notice(date(2022, 6, 1), date(2022, 5, 27), date(2022, 6, 10), 14223, 28, 50),
+    Notice(date(2022, 12, 1), date(2022, 11, 25), date(2022, 12, 9), 14497, 15, 50),
+    Notice(date(2023, 6, 1), date(2023, 5, 26), date(2023, 6, 9), 14796, 9, 50),
+    Notice(date(2023, 12, 1), date(2023, 11, 24), date(2023, 12, 8), 15044, 14, 50),
+    Notice(date(2024, 6, 1), date(2024, 5, 31), date(2024, 6, 14), 15267, 12, 50),
+    Notice(date(2024, 12, 1), date(2024, 11, 29), date(2024, 12, 13), 15471, 16, 50),
+    Notice(date(2025, 6, 1), date(2025, 5, 30), date(2025, 6, 13), 15690, 7, 50),
+    Notice(date(2025, 12, 1), date(2025, 11, 28), date(2025, 12, 12), 3006000, 11, 50),
+    Notice(date(2026, 6, 1), date(2026, 5, 29), date(2026, 6, 12), 3006137, 19, 50),
 )
 
 
@@ -99,9 +111,7 @@ def audit_notices(
         raise ValueError("price or outcome fields are forbidden in notice audit")
     counts = {
         (row["cycle_month"], row["index_code"]): row["len"]
-        for row in additions.group_by(["cycle_month", "index_code"])
-        .len()
-        .to_dicts()
+        for row in additions.group_by(["cycle_month", "index_code"]).len().to_dicts()
     }
     cycle_rows: list[dict[str, Any]] = []
     accepted_cycles: list[date] = []
@@ -117,8 +127,7 @@ def audit_notices(
             "000905.SH": notice.expected_csi500_additions,
         }
         inferred = {
-            code: int(counts.get((notice.cycle_month, code), 0))
-            for code in expected
+            code: int(counts.get((notice.cycle_month, code), 0)) for code in expected
         }
         checks = {
             "announcement_date_matches": official_date == notice.announcement_date,
@@ -161,13 +170,14 @@ def audit_notices(
     )
     checks = {
         "price_data_absent": not (PRICE_FIELDS & set(matched_additions.columns)),
-        "at_least_12_notice_matched_cycles": len(accepted_cycles)
-        >= MIN_MATCHED_CYCLES,
+        "at_least_22_notice_matched_cycles": len(accepted_cycles) >= MIN_MATCHED_CYCLES,
         "announcement_precedes_effective_date": all(
             notice.announcement_date < notice.effective_date for notice in NOTICES
         ),
         "all_admitted_cycles_match_both_indices": all(
-            row["matched"] for row in cycle_rows if row["cycle_month"] in accepted_cycles
+            row["matched"]
+            for row in cycle_rows
+            if row["cycle_month"] in accepted_cycles
         ),
     }
     payload = {
@@ -200,8 +210,8 @@ def run(data_dir: Path, output: Path) -> dict[str, Any]:
     matched.write_parquet(temporary)
     temporary.replace(matched_path)
     payload = {
-        "schema_version": "p0-index-inclusion-notice-audit-v1",
-        "contract_frozen": "2026-08-31",
+        "schema_version": "p0-index-inclusion-notice-audit-v2",
+        "contract_frozen": "2026-09-03",
         **payload,
         "artifact": str(matched_path),
     }
@@ -211,7 +221,14 @@ def run(data_dir: Path, output: Path) -> dict[str, Any]:
         encoding="utf-8",
     )
     digest = hashlib.sha256(output.read_bytes()).hexdigest()
-    print(json.dumps({**payload, "sha256": digest}, ensure_ascii=False, indent=2, default=_json_default))
+    print(
+        json.dumps(
+            {**payload, "sha256": digest},
+            ensure_ascii=False,
+            indent=2,
+            default=_json_default,
+        )
+    )
     return payload
 
 
