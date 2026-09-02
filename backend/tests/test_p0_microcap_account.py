@@ -375,3 +375,34 @@ def test_confirmed_delisting_writes_position_off_without_fake_sale() -> None:
     assert daily[-1, "position_count"] == 0
     assert daily[-1, "equity"] == pytest.approx(simulation["ending_cash"])
     assert integrity["ending_unresolved_positions"] == 0
+
+
+def test_cb_settlement_waits_until_after_delist_date() -> None:
+    buy_day = date(2020, 3, 16)
+    delist_day = date(2020, 3, 17)
+    settlement_day = date(2020, 3, 23)
+    candidates = _candidates([(date(2020, 3, 13), buy_day, "A.SZ", 1)])
+    execution = pl.DataFrame([_quote(buy_day, "A.SZ", raw_open=10.0)])
+
+    simulation = account.simulate_account(
+        candidates,
+        execution,
+        initial_cash=20_000.0,
+        target_positions=1,
+        action_dates=[buy_day, delist_day, settlement_day],
+        delist_dates={"A.SZ": delist_day},
+        delist_settlement_status="CB_DELISTED_ZERO_RECOVERY",
+        settle_only_after_delist_date=True,
+    )
+
+    rejected = [
+        row for row in simulation["orders"] if row["side"] == "SELL"
+    ]
+    assert len(rejected) == 1
+    assert rejected[0]["date"] == delist_day
+    assert rejected[0]["reason"] == "missing_market_data"
+    assert simulation["settlements"][0]["date"] == settlement_day
+    assert simulation["settlements"][0]["effective_delist_date"] == delist_day
+    assert simulation["settlements"][0]["status"] == (
+        "CB_DELISTED_ZERO_RECOVERY"
+    )

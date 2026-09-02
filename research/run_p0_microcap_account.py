@@ -293,6 +293,8 @@ def simulate_account(
     stamp_tax_rate: float | None = None,
     lot_size: int = LOT_SIZE,
     delist_dates: dict[str, date] | None = None,
+    delist_settlement_status: str = "DELISTED_WRITE_OFF",
+    settle_only_after_delist_date: bool = False,
 ) -> dict[str, Any]:
     candidate_groups = _partition_rows(candidates, "entry_date")
     quote_groups = _partition_rows(execution_grid, "entry_date")
@@ -322,7 +324,14 @@ def simulate_account(
         }
         for symbol in list(positions):
             delist_date = (delist_dates or {}).get(symbol)
-            if delist_date is None or entry_date < delist_date:
+            if (
+                delist_date is None
+                or entry_date < delist_date
+                or (
+                    settle_only_after_delist_date
+                    and entry_date == delist_date
+                )
+            ):
                 continue
             position = positions.pop(symbol)
             last_book_value = position["units"] * position["last_mark"]
@@ -331,7 +340,7 @@ def simulate_account(
                     "date": entry_date,
                     "effective_delist_date": delist_date,
                     "symbol": symbol,
-                    "status": "DELISTED_WRITE_OFF",
+                    "status": delist_settlement_status,
                     "raw_shares": position["raw_shares"],
                     "recovery_value": 0.0,
                     "last_book_value": last_book_value,
