@@ -91,6 +91,15 @@ def build_microcap_weekly(data_dir: Path) -> pl.DataFrame:
     observations = baseline.build_weekly_observations(panel)
     del panel
     gc.collect()
+    pool_state = (
+        observations.filter(pl.col("cap_decile") == 0)
+        .group_by("date")
+        .agg(
+            pl.col("return_120d")
+            .median()
+            .alias("microcap_momentum_120d")
+        )
+    )
     candidates = resilience.build_candidate_sets(observations)[
         "cap_smallest"
     ]
@@ -98,17 +107,12 @@ def build_microcap_weekly(data_dir: Path) -> pl.DataFrame:
         candidates.group_by("date", "entry_date", maintain_order=True)
         .agg(
             pl.col("exit_date").drop_nulls().first().alias("exit_date"),
-            pl.col("microcap_median_return_60d")
-            .first()
-            .alias("unused_median_return_60d"),
-            pl.col("return_120d")
-            .median()
-            .alias("microcap_momentum_120d"),
             (
                 pl.col("net_return").fill_null(0.0).sum()
                 / resilience.TARGET_POSITIONS
             ).alias("microcap_return"),
         )
+        .join(pool_state, on="date", how="left")
         .filter(pl.col("entry_date") >= pl.lit(START))
         .sort("entry_date")
     )
