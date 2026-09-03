@@ -256,6 +256,117 @@ def test_cost_multiplier_doubles_modeled_friction() -> None:
     )
 
 
+def test_max_holding_clock_exits_even_when_symbol_remains_desired() -> None:
+    days = [
+        date(2026, 1, 5),
+        date(2026, 1, 6),
+        date(2026, 1, 7),
+        date(2026, 1, 8),
+        date(2026, 1, 9),
+    ]
+    candidates = _candidates(
+        [(day, day, "A.SZ", 1) for day in days]
+    )
+    execution = pl.DataFrame([_quote(day, "A.SZ") for day in days])
+
+    result = account.simulate_account(
+        candidates,
+        execution,
+        initial_cash=20_000.0,
+        target_positions=1,
+        action_dates=days,
+        max_holding_sessions=3,
+    )
+
+    assert [(row["date"], row["side"]) for row in result["trades"]] == [
+        (days[0], "BUY"),
+        (days[2], "SELL"),
+        (days[3], "BUY"),
+    ]
+    forced = next(row for row in result["orders"] if row["side"] == "SELL")
+    assert forced["exit_trigger"] == "max_holding_sessions"
+    assert result["ending_positions"][0]["start_date"] == days[3]
+
+
+def test_cooldown_blocks_reentry_for_requested_trading_sessions() -> None:
+    days = [
+        date(2026, 1, 5),
+        date(2026, 1, 6),
+        date(2026, 1, 7),
+        date(2026, 1, 8),
+        date(2026, 1, 9),
+        date(2026, 1, 12),
+    ]
+    candidates = _candidates(
+        [(day, day, "A.SZ", 1) for day in days]
+    )
+    execution = pl.DataFrame([_quote(day, "A.SZ") for day in days])
+
+    result = account.simulate_account(
+        candidates,
+        execution,
+        initial_cash=20_000.0,
+        target_positions=1,
+        action_dates=days,
+        max_holding_sessions=3,
+        cooldown_sessions=2,
+    )
+
+    assert [(row["date"], row["side"]) for row in result["trades"]] == [
+        (days[0], "BUY"),
+        (days[2], "SELL"),
+        (days[5], "BUY"),
+    ]
+    cooldown_skips = [
+        row
+        for row in result["orders"]
+        if row.get("reason") == "cooldown"
+    ]
+    assert [row["date"] for row in cooldown_skips] == days[3:5]
+
+
+def test_entry_gate_blocks_only_new_positions() -> None:
+    days = [
+        date(2026, 1, 5),
+        date(2026, 1, 6),
+        date(2026, 1, 7),
+        date(2026, 1, 8),
+        date(2026, 1, 9),
+    ]
+    candidates = _candidates(
+        [(day, day, "A.SZ", 1) for day in days]
+    )
+    execution = pl.DataFrame([_quote(day, "A.SZ") for day in days])
+
+    result = account.simulate_account(
+        candidates,
+        execution,
+        initial_cash=20_000.0,
+        target_positions=1,
+        action_dates=days,
+        max_holding_sessions=3,
+        entry_gate_by_date={
+            days[0]: True,
+            days[1]: False,
+            days[2]: False,
+            days[3]: False,
+            days[4]: True,
+        },
+    )
+
+    assert [(row["date"], row["side"]) for row in result["trades"]] == [
+        (days[0], "BUY"),
+        (days[2], "SELL"),
+        (days[4], "BUY"),
+    ]
+    blocked = [
+        row
+        for row in result["orders"]
+        if row.get("reason") == "entry_gate"
+    ]
+    assert [row["date"] for row in blocked] == [days[3]]
+
+
 def test_exposure_budget_caps_buys_without_forcing_desired_sales() -> None:
     d0, d1 = date(2024, 1, 5), date(2024, 1, 8)
     d2, d3 = date(2024, 1, 12), date(2024, 1, 15)

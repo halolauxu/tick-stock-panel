@@ -304,12 +304,21 @@ def simulate_account(
     force_rebalance_dates: set[date] | None = None,
     allow_same_day_reentry: bool = False,
     cost_multiplier: float = 1.0,
+    max_holding_sessions: int | None = None,
+    cooldown_sessions: int = 0,
+    entry_gate_by_date: dict[date, bool] | None = None,
 ) -> dict[str, Any]:
     if cost_multiplier <= 0:
         raise ValueError("cost_multiplier must be positive")
+    if max_holding_sessions is not None and max_holding_sessions <= 0:
+        raise ValueError("max_holding_sessions must be positive")
+    if cooldown_sessions < 0:
+        raise ValueError("cooldown_sessions must be non-negative")
     candidate_groups = _partition_rows(candidates, "entry_date")
     quote_groups = _partition_rows(execution_grid, "entry_date")
     positions: dict[str, dict[str, Any]] = {}
+    position_start_session: dict[str, int] = {}
+    last_exit_session: dict[str, int] = {}
     intervals: list[dict[str, Any]] = []
     orders: list[dict[str, Any]] = []
     trades: list[dict[str, Any]] = []
@@ -321,7 +330,7 @@ def simulate_account(
     max_cash_error = 0.0
 
     scheduled_dates = action_dates or sorted(candidate_groups)
-    for entry_date in scheduled_dates:
+    for session_index, entry_date in enumerate(scheduled_dates):
         candidate_frame = candidate_groups.get(entry_date)
         candidate_rows = (
             candidate_frame.sort(["cap_rank", "symbol"]).to_dicts()
@@ -339,6 +348,8 @@ def simulate_account(
             ):
                 continue
             position = positions.pop(symbol)
+            position_start_session.pop(symbol, None)
+            last_exit_session[symbol] = session_index
             last_book_value = position["units"] * position["last_mark"]
             recovery_value = position["raw_shares"] * delist_recovery_per_raw_share
             cash += recovery_value
@@ -394,7 +405,12 @@ def simulate_account(
         force_rebalance = entry_date in (force_rebalance_dates or set())
         sold_today: set[str] = set()
         for symbol in list(positions):
-            if symbol in desired and not force_rebalance:
+            holding_expired = (
+                max_holding_sessions is not None
+                and session_index - position_start_session[symbol] + 1
+                >= max_holding_sessions
+            )
+            if symbol in desired and not force_rebalance and not holding_expired:
                 continue
             position = positions[symbol]
             quote = quotes.get(symbol)
@@ -407,6 +423,10 @@ def simulate_account(
                 "reason": reason,
                 "family": position.get("family"),
             }
+            if holding_expired:
+                order["exit_trigger"] = "max_holding_sessions"
+            elif force_rebalance:
+                order["exit_trigger"] = "forced_rebalance"
             if reason:
                 orders.append(order)
                 continue
@@ -446,6 +466,8 @@ def simulate_account(
             )
             sold_today.add(symbol)
             del positions[symbol]
+            position_start_session.pop(symbol, None)
+            last_exit_session[symbol] = session_index
 
         slots = max(0, target_positions - len(positions))
         target_notional = target_gross / target_positions
@@ -490,6 +512,44 @@ def simulate_account(
                     if target_exposure_by_date is not None
                     else target_notional
                 )
+            if (
+                entry_gate_by_date is not None
+                and not entry_gate_by_date.get(entry_date, False)
+            ):
+                orders.append(
+                    {
+                        "date": entry_date,
+                        "signal_date": candidate["date"],
+                        "symbol": symbol,
+                        "side": "BUY",
+                        "status": "PRETRADE_SKIPPED",
+                        "reason": "entry_gate",
+                        "rank": candidate["cap_rank"],
+                        "target_notional": candidate_target,
+                        "family": candidate.get("family"),
+                    }
+                )
+                continue
+            previous_exit = last_exit_session.get(symbol)
+            if (
+                cooldown_sessions > 0
+                and previous_exit is not None
+                and session_index - previous_exit <= cooldown_sessions
+            ):
+                orders.append(
+                    {
+                        "date": entry_date,
+                        "signal_date": candidate["date"],
+                        "symbol": symbol,
+                        "side": "BUY",
+                        "status": "PRETRADE_SKIPPED",
+                        "reason": "cooldown",
+                        "rank": candidate["cap_rank"],
+                        "target_notional": candidate_target,
+                        "family": candidate.get("family"),
+                    }
+                )
+                continue
             signal_capacity = (
                 float(candidate.get("signal_amount") or 0.0)
                 * baseline.DAILY_PARTICIPATION
@@ -577,6 +637,7 @@ def simulate_account(
                 "last_mark": float(quote["close"]),
                 "family": candidate.get("family"),
             }
+            position_start_session[symbol] = session_index
             order.update(
                 raw_shares=shares,
                 gross=gross,
