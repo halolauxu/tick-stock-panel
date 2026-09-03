@@ -74,3 +74,26 @@ def test_candidate_gate_requires_broad_point_in_time_sample() -> None:
     )
     assert failed["verdict"] == "BLOCKED_OR_REJECTED_SAMPLE"
     assert "at_least_150_candidate_rows" in failed["failures"]
+
+
+def test_source_dates_map_to_prior_quote_and_next_entry() -> None:
+    study = _load_module()
+    sources = pl.DataFrame(
+        {
+            "symbol": ["A.SZ"],
+            "ann_date": [date(2020, 1, 4)],
+            "period_end": [date(2019, 12, 31)],
+            "l1_code": ["I1"],
+            "l1_name": ["行业"],
+            "p_change_min": [10.0],
+            "p_change_max": [20.0],
+        }
+    )
+
+    mapped = study._source_times(
+        sources,
+        [date(2020, 1, 3), date(2020, 1, 6)],
+    )
+
+    assert mapped["signal_quote_date"].to_list() == [date(2020, 1, 3)]
+    assert mapped["entry_date"].to_list() == [date(2020, 1, 6)]

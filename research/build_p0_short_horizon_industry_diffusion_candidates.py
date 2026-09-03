@@ -209,7 +209,7 @@ def _source_times(sources: pl.DataFrame, all_dates: list[date]) -> pl.DataFrame:
             right_on="entry_date",
             strategy="forward",
         )
-        .drop_nulls("signal_quote_date", "entry_date")
+        .drop_nulls(["signal_quote_date", "entry_date"])
         .select(
             "source_event_id",
             "source_symbol",
