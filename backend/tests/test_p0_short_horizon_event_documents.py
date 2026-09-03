@@ -101,3 +101,38 @@ def test_materialize_joins_event_and_document_keys_without_ambiguity(tmp_path) -
     assert summary["targets"] == 1
     assert summary["status"] == {"NO_MATCH": 1}
     connection.close()
+
+
+def test_no_match_target_is_not_queried_again(tmp_path) -> None:
+    study = _load_module()
+    connection = duckdb.connect(str(tmp_path / "events.duckdb"))
+    study._initialize(connection)
+    row = {
+        "symbol": "000001.SZ",
+        "ann_date": date(2020, 1, 1),
+        "period_end": date(2019, 12, 31),
+        "type": "预增",
+        "p_change_min": None,
+        "p_change_max": None,
+        "net_profit_min": None,
+        "net_profit_max": None,
+    }
+    connection.execute(
+        "INSERT INTO event_document_targets VALUES (?, ?, ?, ?, ?, ?, ?, current_timestamp)",
+        [
+            study.event_key(row),
+            row["symbol"],
+            row["ann_date"],
+            row["period_end"],
+            row["type"],
+            "NO_MATCH",
+            None,
+        ],
+    )
+
+    class ClientThatMustNotRun:
+        def announcements(self, *_args, **_kwargs):
+            raise AssertionError("cached NO_MATCH must not be queried")
+
+    assert study._discover(connection, ClientThatMustNotRun(), row) is None
+    connection.close()

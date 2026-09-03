@@ -215,6 +215,11 @@ def _discover(
     row: dict[str, Any],
 ) -> dict[str, Any] | None:
     key = event_key(row)
+    target_status = connection.execute(
+        "SELECT query_status FROM event_document_targets WHERE event_key=?", [key]
+    ).fetchone()
+    if target_status and target_status[0] == "NO_MATCH":
+        return None
     existing = connection.execute(
         """
         SELECT a.announcement_id, a.announce_time, a.title, a.pdf_url,
