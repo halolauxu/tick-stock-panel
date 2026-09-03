@@ -669,7 +669,11 @@ def run(data_dir: Path, output: Path) -> dict[str, Any]:
         .to_list()
     )
     event_panel = forecast.prepare_panel(
-        forecast.attach_point_in_time_universe(raw_source, data_dir)
+        forecast.load_panel(
+            data_dir,
+            start=DEVELOPMENT_START - timedelta(days=45),
+            panel_end=DEVELOPMENT_END,
+        ).filter(pl.col("symbol").str.contains(main_board.MAIN_BOARD_PATTERN))
     )
     account_panel = baseline.prepare_panel(baseline.attach_point_in_time_data(raw_source, data_dir))
     membership = industry.load_point_in_time_membership(data_dir)
