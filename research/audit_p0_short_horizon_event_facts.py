@@ -369,9 +369,11 @@ def run(data_dir: Path, output: Path) -> dict[str, Any]:
         },
         "by_year": by_year,
         "original_pdf_linkage": {
-            "events_with_pdf_identifier": 0,
-            "status": "TUSHARE_STRUCTURED_REASON_ONLY",
-            "rule": "original PDF is required only before paid semantic scoring",
+            "events_with_pdf_identifier": enriched.get_column("pdf_sha256")
+            .is_not_null()
+            .sum(),
+            "status": "TUSHARE_STRUCTURED_PLUS_CNINFO_OFFICIAL_PDF",
+            "rule": "paid semantic scoring may only use hash-linked official PDF text",
         },
     }
     decision = evaluate_data_gate(audit)
