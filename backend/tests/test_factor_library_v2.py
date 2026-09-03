@@ -29,6 +29,7 @@ def _single_symbol_panel(n_days: int = 70) -> pl.DataFrame:
         consecutive = 0
         if offset % 15 == 0:
             consecutive = 1 + (offset // 15) % 3 if offset % 30 == 0 else 1
+        raw_close = close * 2.0
         rows.append({
             "symbol": "000001.SZ",
             "date": start + timedelta(days=offset),
@@ -36,8 +37,9 @@ def _single_symbol_panel(n_days: int = 70) -> pl.DataFrame:
             "high": close * 1.02,
             "low": close * 0.97,
             "close": close,
+            "raw_close": raw_close,
             "volume": volume,
-            "amount": volume * 100.0 * close,
+            "amount": volume * 100.0 * raw_close,
             "turnover_rate": 1.0 + (offset % 7) * 0.3,
             "consecutive_limit_ups": consecutive,
         })
@@ -100,7 +102,9 @@ def test_vwap_bias_and_vol_trend():
 
     last = panel.tail(1).to_dicts()[0]
     vwap = last["amount"] / (last["volume"] * 100.0)
-    assert math.isclose(_tail_value(frame, "vwap_bias"), last["close"] / vwap - 1, rel_tol=1e-9)
+    assert math.isclose(
+        _tail_value(frame, "vwap_bias"), last["raw_close"] / vwap - 1, rel_tol=1e-9
+    )
 
     volumes = panel["volume"].to_list()
     fast = sum(volumes[-5:]) / 5

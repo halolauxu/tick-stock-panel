@@ -41,7 +41,7 @@ VIRTUAL_SCORING_DEPENDENCIES: dict[str, frozenset[str]] = {
     "amihud_20d": frozenset({"close", "amount"}),
     "turnover_z_60d": frozenset({"turnover_rate"}),
     "vol_price_corr_20d": frozenset({"close", "volume"}),
-    "vwap_bias": frozenset({"close", "volume", "amount"}),
+    "vwap_bias": frozenset({"raw_close", "volume", "amount"}),
     "vol_trend_5_60": frozenset({"volume"}),
     "limit_up_count_20d": frozenset({"consecutive_limit_ups"}),
     "limit_up_count_60d": frozenset({"consecutive_limit_ups"}),
@@ -193,7 +193,9 @@ def scoring_value_expr(columns: Collection[str], name: str) -> pl.Expr | None:
         )
     if name == "vwap_bias":
         vwap = _ratio(pl.col("amount"), pl.col("volume") * 100.0)
-        return _relative(pl.col("close"), vwap)
+        # 成交额/成交量得到的是未复权成交均价, 必须与未复权收盘价比较。
+        # 使用复权 close 会把历史除权因子伪装成可预测的 VWAP 偏离。
+        return _relative(pl.col("raw_close"), vwap)
     if name == "vol_trend_5_60":
         fast = pl.col("volume").rolling_mean(5)
         slow = pl.col("volume").rolling_mean(60)

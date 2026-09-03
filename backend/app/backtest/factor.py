@@ -84,7 +84,7 @@ FACTOR_COLUMNS: list[dict] = [
     {"id": "close_position", "label": "收盘位置", "group": "价格位置", "desc": "收盘价在当日最低价到最高价之间的位置"},
     {"id": "distance_to_high_60d", "label": "距60日高点", "group": "价格位置", "desc": "收盘价 / 60日最高收盘价 - 1"},
     {"id": "distance_from_low_60d", "label": "距60日低点", "group": "价格位置", "desc": "收盘价 / 60日最低收盘价 - 1"},
-    {"id": "vwap_bias", "label": "VWAP乖离", "group": "价格位置", "desc": "收盘价 / 当日成交均价 - 1, 成交均价 = 成交额 / (成交量x100)"},
+    {"id": "vwap_bias", "label": "VWAP乖离", "group": "价格位置", "desc": "未复权收盘价 / 当日未复权成交均价 - 1, 成交均价 = 成交额 / (成交量x100)"},
 
     {"id": "max_ret_20d", "label": "20日最大单日涨幅", "group": "收益形态", "desc": "近20个交易日单日涨幅最大值(彩票效应, 高值代表博彩型特征强)"},
     {"id": "ret_skew_20d", "label": "20日收益偏度", "group": "收益形态", "desc": "近20个交易日日收益偏度, 高值代表右偏(偶发大涨)"},
