@@ -7,9 +7,11 @@
 **在当前本地点时数据、用户可交易范围和 2–10 个交易日持有约束内，没有找到一条
 同时满足收益、超额、回撤、跨期稳定性、容量、成交和完整退出的可部署独立 Alpha。**
 
-因此本轮最终动作是 **NO DEPLOY / NO TRADE**：不发布策略，不分配模拟或实盘资金，
-严格通过数为 0。这个结论不是“A 股不存在 Alpha”，而是一个有明确边界的否证：
-当前已注册的信息域和冻结搜索空间，不能支持可审计的主板非微盘短周期策略。
+因此本轮最终动作是 **NO DEPLOY / NO TRADE**：不发布独立策略，不分配模拟或实盘
+资金。这个结论不是“A 股不存在 Alpha”，而是一个有明确边界的否证：当前已注册的
+信息域和冻结搜索空间，不能支持可审计的主板非微盘短周期策略。另有一条依附主板微盘
+母机制的风险准入增强已进入 60 个交易日前向观察，但那不是本轮独立 Alpha，也尚未
+取得实盘资格。
 
 ## 为什么可以结束本轮，而不是继续改阈值
 
@@ -24,6 +26,12 @@
 3. **真实账户复算**：凡上游有相对信号的候选，都进一步执行下一交易日开盘、费用、
    滑点、T+1、涨跌停、停牌、容量、100 股整数手、现金占用和最长延迟退出；没有用
    事件均值直接年化，也没有把验证失败的方向继续调参。
+
+在上述裁决后又新增了一个真正不同的信息域：生态环境部逐企业、逐品种 HFC 年度生产
+配额，加上市公司首次明确披露“配额约束、价格上涨和盈利改善”的快事件。冻结的 5 家
+候选、4 家同链对照和五日轮换账户完整执行 43 个批次，候选累计 -4.62%、年化 -5.37%，
+对照累计 +4.89%，双倍摩擦后候选 -8.71%。这再次否决了“产业逻辑成立即可直接转化为
+短期交易收益”，且没有留下可在不污染验证集的前提下继续调参的分支。
 
 最后一轮理想化因子上限仍为 0/156 晋级。唯一在发现段达到 20% 的稳健近邻——低
 换手 10 日——在确认段从 +20.72% 变为 -8.17%。这说明缺口不是账户实现细节，而是
@@ -75,5 +83,5 @@
 - 实际公司买入：[`p0-actual-corporate-buying-development-result.md`](p0-actual-corporate-buying-development-result.md)
 - 行业龙头回踩：[`p0-industry-leader-pullback-development-result.md`](p0-industry-leader-pullback-development-result.md)
 - DeepSeek 短周期假设：[`p0-deepseek-main-board-short-horizon-screen-result.md`](p0-deepseek-main-board-short-horizon-screen-result.md)
+- HFC 配额供给重定价：[`p0-hfc-quota-repricing-result.md`](p0-hfc-quota-repricing-result.md)
 - VWAP 口径修复：[`vwap-factor-data-contract-fix.md`](vwap-factor-data-contract-fix.md)
-
