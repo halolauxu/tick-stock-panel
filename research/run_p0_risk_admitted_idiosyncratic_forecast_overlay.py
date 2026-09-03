@@ -1,9 +1,8 @@
-"""Gate the frozen forecast-priority sleeve with the frozen micro-cap risk clock."""
+"""Admit forecast events only when their first tradable open is risk-off."""
 
 from __future__ import annotations
 
 import argparse
-import gc
 import hashlib
 import json
 import math
@@ -17,64 +16,14 @@ RESEARCH = Path(__file__).resolve().parent
 sys.path.insert(0, str(ROOT / "backend"))
 sys.path.insert(0, str(RESEARCH))
 
-import run_p0_main_board_microcap_risk_overlay as risk  # noqa: E402
-import run_p0_microcap_baseline as baseline  # noqa: E402
-import run_p0_microcap_escape as escape  # noqa: E402
 import run_p0_microcap_idiosyncratic_forecast_unified_account as unified  # noqa: E402
-
-PERIODS = {
-    "validation": (date(2021, 1, 1), date(2023, 12, 31)),
-    "known_stress": (date(2024, 1, 1), date(2026, 8, 28)),
-}
-
-
-def build_event_gate(
-    data_dir: Path, start: date, end: date, thresholds_path: Path
-) -> tuple[dict[date, bool], dict[str, Any]]:
-    thresholds = risk.load_frozen_thresholds(thresholds_path)
-    source = baseline.load_daily(data_dir, end=end)
-    pit = baseline.attach_point_in_time_data(source, data_dir)
-    del source
-    gc.collect()
-    panel = baseline.prepare_panel(pit)
-    del pit
-    gc.collect()
-    features = escape.build_daily_features(panel)
-    del panel
-    gc.collect()
-    alarms = escape.apply_alarms(features, thresholds)
-    risk_by_open, decisions, switches = escape.build_risk_clock(alarms)
-    del features, alarms
-    gc.collect()
-    event_gate = {day: not risk_on for day, risk_on in risk_by_open.items()}
-    scoped_decisions = [row for row in decisions if start <= row["action_date"] <= end]
-    scoped_switches = [row for row in switches if start <= row["action_date"] <= end]
-    return event_gate, {
-        "thresholds": thresholds,
-        "risk_off_opens": sum(not row["risk_on"] for row in scoped_decisions),
-        "risk_on_opens": sum(row["risk_on"] for row in scoped_decisions),
-        "switch_count": len(scoped_switches),
-        "decisions": scoped_decisions,
-        "switches": scoped_switches,
-    }
-
-
-def _load_comparison(path: Path) -> dict[str, dict[str, Any]]:
-    payload = json.loads(path.read_text(encoding="utf-8"))
-    return {
-        period: {
-            "annualized": row["metrics"]["annualized"],
-            "max_drawdown": row["metrics"]["max_drawdown"],
-            "yearly": row["metrics"]["yearly"],
-        }
-        for period, row in payload["results"].items()
-    }
+import run_p0_risk_gated_idiosyncratic_forecast_overlay as gated  # noqa: E402
 
 
 def evaluate(
     results: dict[str, dict[str, Any]],
     core: dict[str, dict[str, Any]],
-    ungated: dict[str, dict[str, Any]],
+    daily_gated: dict[str, dict[str, Any]],
 ) -> dict[str, Any]:
     validation = results["validation"]
     stress = results["known_stress"]
@@ -96,13 +45,8 @@ def evaluate(
             validation["metrics"].get("max_drawdown") or -math.inf
         )
         >= -0.25,
-        "stress_annualized_at_least_21_5pct": (metrics.get("annualized") or -math.inf)
-        >= 0.215,
-        "stress_beats_ungated_by_1_5pp": (
-            (metrics.get("annualized") or -math.inf)
-            - (ungated["known_stress"].get("annualized") or -math.inf)
-            >= 0.015
-        ),
+        "stress_annualized_at_least_23pct": (metrics.get("annualized") or -math.inf)
+        >= 0.23,
         "stress_drawdown_within_35pct": (metrics.get("max_drawdown") or -math.inf)
         >= -0.35,
         "stress_drawdown_improves_core_by_10pp": (
@@ -110,8 +54,13 @@ def evaluate(
             - (core["known_stress"].get("max_drawdown") or -math.inf)
             >= 0.10
         ),
-        "stress_2026_nonnegative": (stress_yearly.get(2026) or -math.inf) >= 0,
-        "stress_at_least_two_positive_years": metrics["positive_years"] >= 2,
+        "stress_all_years_positive": all(
+            (stress_yearly.get(year) or -math.inf) > 0 for year in (2024, 2025, 2026)
+        ),
+        "stress_not_worse_than_daily_gate": (
+            (metrics.get("annualized") or -math.inf)
+            >= (daily_gated["known_stress"].get("annualized") or -math.inf)
+        ),
         "stress_at_least_20_event_round_trips": stress["event_round_trips"] >= 20,
         "stress_buy_execution_at_least_80pct": stress["execution"]["buy"][
             "execution_rate"
@@ -129,16 +78,14 @@ def evaluate(
         <= 0.01,
     }
     return {
-        "verdict": "REPLACE_UNGATED_FORWARD_CANDIDATE"
-        if all(checks.values())
-        else "TERMINATE",
+        "verdict": "FORWARD_ELIGIBLE" if all(checks.values()) else "TERMINATE",
         "passed": all(checks.values()),
         "checks": checks,
         "failures": [name for name, passed in checks.items() if not passed],
         "stress_annualized_vs_core": metrics.get("annualized")
         - core["known_stress"].get("annualized"),
-        "stress_annualized_vs_ungated": metrics.get("annualized")
-        - ungated["known_stress"].get("annualized"),
+        "stress_annualized_vs_daily_gate": metrics.get("annualized")
+        - daily_gated["known_stress"].get("annualized"),
         "stress_drawdown_vs_core": metrics.get("max_drawdown")
         - core["known_stress"].get("max_drawdown"),
     }
@@ -156,27 +103,35 @@ def run(
     data_dir: Path,
     thresholds_path: Path,
     core_result: Path,
-    ungated_result: Path,
+    daily_gated_result: Path,
     output: Path,
 ) -> dict[str, Any]:
     core_payload = json.loads(core_result.read_text(encoding="utf-8"))
-    core = {period: unified._core_metrics(core_payload, period) for period in PERIODS}
-    ungated = _load_comparison(ungated_result)
+    daily_gated_payload = json.loads(daily_gated_result.read_text(encoding="utf-8"))
+    core = {
+        period: unified._core_metrics(core_payload, period) for period in gated.PERIODS
+    }
+    daily_gated = {
+        period: {
+            "annualized": row["metrics"]["annualized"],
+            "max_drawdown": row["metrics"]["max_drawdown"],
+        }
+        for period, row in daily_gated_payload["results"].items()
+    }
     results = {}
     risk_audit = {}
-    for period, (start, end) in PERIODS.items():
-        gate, audit = build_event_gate(data_dir, start, end, thresholds_path)
+    for period, (start, end) in gated.PERIODS.items():
+        gate, audit = gated.build_event_gate(data_dir, start, end, thresholds_path)
         results[period] = unified.run_period(
-            data_dir, start, end, event_gate_by_date=gate
+            data_dir, start, end, event_admission_by_date=gate
         )
         risk_audit[period] = audit
-    decision = evaluate(results, core, ungated)
+    decision = evaluate(results, core, daily_gated)
     payload = {
-        "schema_version": "p0-risk-gated-idiosyncratic-forecast-overlay-v1",
+        "schema_version": "p0-risk-admitted-idiosyncratic-forecast-overlay-v1",
         "contract_frozen": "2026-09-03",
-        "thresholds_sha256": risk.FROZEN_THRESHOLDS_SHA256,
         "core": core,
-        "ungated": ungated,
+        "daily_gated": daily_gated,
         "risk": risk_audit,
         "results": results,
         "decision": decision,
@@ -233,18 +188,17 @@ def main() -> None:
         default=Path("/app/data/research/p0_main_board_microcap_account_v1.json"),
     )
     parser.add_argument(
-        "--ungated-result",
+        "--daily-gated-result",
         type=Path,
         default=Path(
-            "/app/data/research/"
-            "p0_microcap_idiosyncratic_forecast_unified_account_v1.json"
+            "/app/data/research/p0_risk_gated_idiosyncratic_forecast_overlay_v1.json"
         ),
     )
     parser.add_argument(
         "--output",
         type=Path,
         default=Path(
-            "/app/data/research/p0_risk_gated_idiosyncratic_forecast_overlay_v1.json"
+            "/app/data/research/p0_risk_admitted_idiosyncratic_forecast_overlay_v1.json"
         ),
     )
     args = parser.parse_args()
@@ -252,7 +206,7 @@ def main() -> None:
         args.data_dir,
         args.thresholds,
         args.core_result,
-        args.ungated_result,
+        args.daily_gated_result,
         args.output,
     )
 

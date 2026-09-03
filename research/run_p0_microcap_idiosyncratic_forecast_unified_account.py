@@ -166,6 +166,7 @@ def run_period(
     end: date,
     *,
     event_gate_by_date: dict[date, bool] | None = None,
+    event_admission_by_date: dict[date, bool] | None = None,
 ) -> dict[str, Any]:
     screen._set_event_period(start, end)
     raw = baseline.load_daily(data_dir, end=end).filter(pl.col("date") >= start)
@@ -185,6 +186,19 @@ def run_period(
         event_candidates = event_candidates.filter(
             pl.col("entry_date").is_in(enabled_dates)
         )
+    if event_admission_by_date is not None and event_candidates.height:
+        admitted_dates = [
+            day for day, enabled in event_admission_by_date.items() if enabled
+        ]
+        admissions = (
+            event_candidates.group_by("symbol", "date")
+            .agg(pl.col("entry_date").min().alias("initial_entry_date"))
+            .filter(pl.col("initial_entry_date").is_in(admitted_dates))
+            .select("symbol", "date")
+        )
+        event_candidates = event_candidates.join(
+            admissions, on=["symbol", "date"], how="inner"
+        )
     event_audit = {
         **event_audit,
         "ungated_daily_candidate_rows": ungated_event_rows,
@@ -194,6 +208,13 @@ def run_period(
             event_candidates.get_column("entry_date").n_unique()
             if event_candidates.height
             else 0
+        ),
+        "gate_mode": (
+            "daily_holding"
+            if event_gate_by_date is not None
+            else "initial_entry_admission"
+            if event_admission_by_date is not None
+            else "none"
         ),
     }
     targets = build_daily_targets(microcap_candidates, event_candidates, all_dates)
