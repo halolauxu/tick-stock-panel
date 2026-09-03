@@ -188,6 +188,38 @@ def attach_prior_financials(
     )
 
 
+def apply_document_evidence(events: pl.DataFrame, supplement: pl.DataFrame | None) -> pl.DataFrame:
+    join_keys = ["symbol", "ann_date", "period_end"]
+    if supplement is None or supplement.is_empty():
+        return events.with_columns(
+            pl.col("change_reason").alias("effective_reason_text"),
+            pl.col("reason_class").alias("effective_reason_class"),
+            pl.lit(None, dtype=pl.String).alias("pdf_sha256"),
+        )
+    usable = supplement.select(
+        *join_keys,
+        "document_reason",
+        "document_reason_class",
+        "pdf_sha256",
+    )
+    if usable.height != usable.unique(subset=join_keys).height:
+        raise ValueError("document evidence has duplicate event join keys")
+    return (
+        events.join(usable, on=join_keys, how="left")
+        .with_columns(
+            pl.when(pl.col("change_reason").fill_null("").str.strip_chars().str.len_chars() > 0)
+            .then(pl.col("change_reason"))
+            .otherwise(pl.col("document_reason"))
+            .alias("effective_reason_text"),
+            pl.when(pl.col("reason_class") != "MISSING")
+            .then(pl.col("reason_class"))
+            .otherwise(pl.col("document_reason_class").fill_null("MISSING"))
+            .alias("effective_reason_class"),
+        )
+        .drop("document_reason", "document_reason_class")
+    )
+
+
 def _read_many(paths: list[Path]) -> pl.DataFrame:
     if not paths:
         raise ValueError("required parquet input is missing")
@@ -266,13 +298,16 @@ def run(data_dir: Path, output: Path) -> dict[str, Any]:
         .map_elements(classify_reason, return_dtype=pl.String, skip_nulls=False)
         .alias("reason_class")
     )
+    supplement_path = data_dir / "research" / "p0_short_horizon_event_documents_v1.parquet"
+    supplement = pl.read_parquet(supplement_path) if supplement_path.is_file() else None
+    events = apply_document_evidence(events, supplement)
 
     metrics = _read_many(list((data_dir / "financials" / "metrics").glob("*.parquet")))
     cash_flow = _read_many(list((data_dir / "financials" / "cash_flow").glob("*.parquet")))
     enriched = attach_prior_financials(events, metrics, cash_flow)
     event_count = enriched.height
     reason_text_count = enriched.filter(
-        pl.col("change_reason").fill_null("").str.strip_chars().str.len_chars() > 0
+        pl.col("effective_reason_text").fill_null("").str.strip_chars().str.len_chars() > 0
     ).height
     source_count = enriched.filter(
         pl.col("collection_source").fill_null("").str.len_chars() > 0
@@ -286,18 +321,18 @@ def run(data_dir: Path, output: Path) -> dict[str, Any]:
         | (pl.col("prior_cash_announce_date") >= pl.col("ann_date"))
     ).height
     qualified = enriched.filter(
-        (pl.col("reason_class") == "OPERATING")
+        (pl.col("effective_reason_class") == "OPERATING")
         & pl.col("prior_metrics_announce_date").is_not_null()
         & pl.col("prior_cash_announce_date").is_not_null()
     )
     fact_qualified_years = qualified.get_column("ann_date").dt.year().n_unique()
-    reason_counts = dict(sorted(Counter(enriched["reason_class"].to_list()).items()))
+    reason_counts = dict(sorted(Counter(enriched["effective_reason_class"].to_list()).items()))
     by_year = (
         enriched.with_columns(pl.col("ann_date").dt.year().alias("year"))
         .group_by("year")
         .agg(
             pl.len().alias("events"),
-            (pl.col("reason_class") == "OPERATING").sum().alias("operating_events"),
+            (pl.col("effective_reason_class") == "OPERATING").sum().alias("operating_events"),
             pl.col("symbol").n_unique().alias("symbols"),
         )
         .sort("year")
@@ -328,6 +363,10 @@ def run(data_dir: Path, output: Path) -> dict[str, Any]:
         "model_review_candidates": sum(
             reason_counts.get(key, 0) for key in ("MIXED", "UNCLASSIFIED")
         ),
+        "document_evidence": {
+            "path": str(supplement_path) if supplement_path.is_file() else None,
+            "rows_with_pdf": enriched.get_column("pdf_sha256").is_not_null().sum(),
+        },
         "by_year": by_year,
         "original_pdf_linkage": {
             "events_with_pdf_identifier": 0,

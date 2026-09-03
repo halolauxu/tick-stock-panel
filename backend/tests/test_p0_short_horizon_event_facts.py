@@ -91,6 +91,39 @@ def test_prior_financial_join_never_uses_same_day_or_future_report() -> None:
     ).is_empty()
 
 
+def test_document_reason_fills_only_missing_structured_reason() -> None:
+    events = pl.DataFrame(
+        {
+            "symbol": ["A.SZ", "B.SZ"],
+            "ann_date": [date(2020, 1, 1), date(2020, 1, 2)],
+            "period_end": [date(2019, 12, 31), date(2019, 12, 31)],
+            "change_reason": [None, "主营业务增长"],
+            "reason_class": ["MISSING", "OPERATING"],
+        }
+    )
+    supplement = pl.DataFrame(
+        {
+            "symbol": ["A.SZ", "B.SZ"],
+            "ann_date": [date(2020, 1, 1), date(2020, 1, 2)],
+            "period_end": [date(2019, 12, 31), date(2019, 12, 31)],
+            "document_reason": ["政府补助", "资产处置收益"],
+            "document_reason_class": ["ONE_TIME", "ONE_TIME"],
+            "pdf_sha256": ["a", "b"],
+        }
+    )
+
+    result = study.apply_document_evidence(events, supplement)
+
+    assert result.get_column("effective_reason_class").to_list() == [
+        "ONE_TIME",
+        "OPERATING",
+    ]
+    assert result.get_column("effective_reason_text").to_list() == [
+        "政府补助",
+        "主营业务增长",
+    ]
+
+
 def test_data_gate_requires_usable_sample_and_point_in_time_coverage() -> None:
     passed = study.evaluate_data_gate(
         {
