@@ -3,6 +3,7 @@
 from app.services.serenity_thesis_iteration import (
     conservative_dimension_consensus,
     is_full_annual_report,
+    supplier_concentration_evidence_is_bound,
     thesis_dimension_gate,
 )
 
@@ -26,11 +27,68 @@ def test_thesis_gate_requires_complete_score_and_all_five_ratings() -> None:
             "evidence_quality",
         )
     ]
+    dimensions[2]["evidence"] = [
+        {
+            "document_id": "DOC-1",
+            "page_number": 2,
+            "quote": "该产品目前全球只有三家合格供应商，替代认证周期超过一年。",
+        }
+    ]
     assert thesis_dimension_gate(dimensions, 38.4) is True
     assert thesis_dimension_gate(dimensions, None) is False
     assert thesis_dimension_gate(dimensions, 38.3) is False
     dimensions[2]["rating"] = 2
     assert thesis_dimension_gate(dimensions, 50.0) is False
+
+
+def test_supplier_concentration_requires_evidence_about_the_supply_market() -> None:
+    false_positive = [
+        {
+            "dimension_id": "supplier_concentration",
+            "status": "EVIDENCED",
+            "rating": 4,
+            "evidence": [
+                {
+                    "document_id": "DOC-1",
+                    "page_number": 2,
+                    "quote": "公司持续开发核心原材料，推进关键原材料自主化。",
+                }
+            ],
+        }
+    ]
+    assert supplier_concentration_evidence_is_bound(false_positive) is False
+
+    input_procurement = [
+        {
+            "dimension_id": "supplier_concentration",
+            "status": "EVIDENCED",
+            "rating": 3,
+            "evidence": [
+                {
+                    "document_id": "DOC-2",
+                    "page_number": 88,
+                    "quote": "前五名供应商采购额占年度采购总额56.27%。",
+                }
+            ],
+        }
+    ]
+    assert supplier_concentration_evidence_is_bound(input_procurement) is False
+
+    valid = [
+        {
+            "dimension_id": "supplier_concentration",
+            "status": "EVIDENCED",
+            "rating": 4,
+            "evidence": [
+                {
+                    "document_id": "DOC-3",
+                    "page_number": 7,
+                    "quote": "该关键材料目前仅有两家合格供应商，替代供应商认证困难。",
+                }
+            ],
+        }
+    ]
+    assert supplier_concentration_evidence_is_bound(valid) is True
 
 
 def test_consensus_keeps_evidence_over_unknown_and_takes_lower_rating() -> None:
@@ -62,7 +120,9 @@ def test_consensus_keeps_evidence_over_unknown_and_takes_lower_rating() -> None:
             "evidence": [],
         },
     ]
-    merged = {item["dimension_id"]: item for item in conservative_dimension_consensus(first, second)}
+    merged = {
+        item["dimension_id"]: item for item in conservative_dimension_consensus(first, second)
+    }
     assert merged["architecture_coupling"]["rating"] == 4
     assert merged["chokepoint_severity"]["rating"] == 3
     assert merged["supplier_concentration"]["status"] == "UNKNOWN"

@@ -73,18 +73,56 @@ MIN_DIMENSION_RATING = 3
 
 _FULL_ANNUAL_RE = re.compile(r"年度报告(?:（更正后）)?$")
 _ANNUAL_EXCLUDE_RE = re.compile(r"半年度报告|摘要|披露提示|英文版")
+_SUPPLIER_SUBJECT_RE = re.compile(r"供应商|厂商|供给|供应来源|供应格局|市场份额|市占率")
+_SUPPLIER_CONSTRAINT_RE = re.compile(
+    r"独家|独供|唯一|仅有|只有|少数|高度集中|垄断|寡头|"
+    r"主导|不超过[\u4e00\u4e8c\u4e09123]家|[\u4e00\u4e8c\u4e09123]家(?:合格)?(?:供应商|厂商)|"
+    r"份额.{0,12}(?:[5-9]\d|100)%|市占率.{0,12}(?:[5-9]\d|100)%|"
+    r"替代.{0,12}(?:认证|受限|困难|周期)"
+)
+_IRRELEVANT_INPUT_SUPPLIER_RE = re.compile(
+    r"前五(?:名|大)供应商.{0,20}(?:采购|占比)|"
+    r"采购额.{0,20}年度采购总额|第一大供应商"
+)
 
 
 def is_full_annual_report(title: str) -> bool:
     compact = re.sub(r"\s+", "", str(title or ""))
-    return bool(_FULL_ANNUAL_RE.search(compact)) and not bool(
-        _ANNUAL_EXCLUDE_RE.search(compact)
-    )
+    return bool(_FULL_ANNUAL_RE.search(compact)) and not bool(_ANNUAL_EXCLUDE_RE.search(compact))
 
 
-def thesis_dimension_gate(
-    dimensions: list[dict[str, Any]], complete_score: float | None
+def supplier_concentration_evidence_is_bound(
+    dimensions: list[dict[str, Any]],
 ) -> bool:
+    """Reject citations that exist verbatim but do not prove supply concentration.
+
+    The model previously treated an issuer's upstream self-sufficiency statement as
+    evidence that the issuer was one of only a few suppliers of the bottleneck
+    product.  Exact quote matching cannot catch that construct error.  Ratings of
+    three or above therefore need a quote that names the supply market and an
+    explicit scarcity, concentration, limited-source, or substitution constraint.
+    Ordinary top-five *input procurement* concentration is a different exposure and
+    is deliberately rejected here.
+    """
+
+    item = next(
+        (value for value in dimensions if value.get("dimension_id") == "supplier_concentration"),
+        None,
+    )
+    if not item or item.get("status") == "UNKNOWN" or item.get("rating") is None:
+        return False
+    if int(item["rating"]) < MIN_DIMENSION_RATING:
+        return False
+    for citation in item.get("evidence") or []:
+        quote = re.sub(r"\s+", "", str(citation.get("quote") or ""))
+        if not quote or _IRRELEVANT_INPUT_SUPPLIER_RE.search(quote):
+            continue
+        if _SUPPLIER_SUBJECT_RE.search(quote) and _SUPPLIER_CONSTRAINT_RE.search(quote):
+            return True
+    return False
+
+
+def thesis_dimension_gate(dimensions: list[dict[str, Any]], complete_score: float | None) -> bool:
     if complete_score is None or float(complete_score) < MIN_COMPLETE_SCORE:
         return False
     ratings = {
@@ -99,10 +137,10 @@ def thesis_dimension_gate(
         "expansion_difficulty",
         "evidence_quality",
     }
-    return required.issubset(ratings) and all(
-        ratings[key] is not None and int(ratings[key]) >= MIN_DIMENSION_RATING
-        for key in required
+    ratings_pass = required.issubset(ratings) and all(
+        ratings[key] is not None and int(ratings[key]) >= MIN_DIMENSION_RATING for key in required
     )
+    return ratings_pass and supplier_concentration_evidence_is_bound(dimensions)
 
 
 def conservative_dimension_consensus(
@@ -317,9 +355,7 @@ def discover_and_plan(store: EventReplayStore) -> dict[str, Any]:
                 "announcement_id": str(annual[0]),
                 "announce_time": annual[1].isoformat(),
                 "title": str(annual[2]),
-                "announced_size_kb": (
-                    float(annual[3]) if annual[3] is not None else None
-                ),
+                "announced_size_kb": (float(annual[3]) if annual[3] is not None else None),
             }
         )
 
@@ -624,9 +660,10 @@ def load_states(store: EventReplayStore) -> tuple[list[EventScoreState], list[di
             }
             if not pages:
                 continue
-            opaque_id = "DOC-" + _stable_hash(
-                OPTIMIZATION_ID, THESIS_SUBSTAGE, str(event_id), str(index)
-            )[:16]
+            opaque_id = (
+                "DOC-"
+                + _stable_hash(OPTIMIZATION_ID, THESIS_SUBSTAGE, str(event_id), str(index))[:16]
+            )
             packets.append(
                 DocumentPacket(
                     document_id=opaque_id,
@@ -773,8 +810,7 @@ def run_scores(store: EventReplayStore, *, execute: bool) -> dict[str, Any]:
             "primary_entry": "next_session_open_without_momentum_or_gap_filter",
         },
         "base_enriched_population_sha256": _file_hash(
-            paths["run_root"]
-            / f"{EVENT_ENRICHED_SCORE_STAGE.lower()}-paid-population.json"
+            paths["run_root"] / f"{EVENT_ENRICHED_SCORE_STAGE.lower()}-paid-population.json"
         ),
         "slots": [
             {
@@ -806,8 +842,7 @@ def run_scores(store: EventReplayStore, *, execute: bool) -> dict[str, Any]:
                 ),
             }
             correction_path = (
-                paths["run_root"]
-                / "thesis-evidence-paid-population-amendment-correction-01.json"
+                paths["run_root"] / "thesis-evidence-paid-population-amendment-correction-01.json"
             )
             _freeze_json(
                 correction_path,
@@ -840,9 +875,7 @@ def run_scores(store: EventReplayStore, *, execute: bool) -> dict[str, Any]:
         }
         sanitized, _adjustments = sanitize_score_evidence(raw_output, documents)
         sanitized, event_citation_failures = _event_review_is_bound(sanitized, documents)
-        errors = validate_score_output(
-            sanitized, entity_id=state.entity_id, documents=documents
-        )
+        errors = validate_score_output(sanitized, entity_id=state.entity_id, documents=documents)
         if errors:
             raise RuntimeError(
                 f"thesis score validation failed for {state.event_id}: {'; '.join(errors[:5])}"
@@ -989,9 +1022,7 @@ def evaluate(store: EventReplayStore) -> dict[str, Any]:
             and row["base_economic_bridge"] == "PASS"
             and row["base_event_stage"] != "ROUTINE_ADMIN"
         )
-        hard_gate = gates_agree and thesis_dimension_gate(
-            row["dimensions"], consensus_score
-        )
+        hard_gate = gates_agree and thesis_dimension_gate(row["dimensions"], consensus_score)
         row["consensus_event_gate"] = "PASS" if gates_agree else "FAIL_CROSS_CALL"
         store.connection.execute(
             """
@@ -1013,9 +1044,8 @@ def evaluate(store: EventReplayStore) -> dict[str, Any]:
         )
 
     def pure(row: dict[str, Any]) -> bool:
-        return (
-            row["consensus_event_gate"] == "PASS"
-            and thesis_dimension_gate(row["dimensions"], row["complete_score"])
+        return row["consensus_event_gate"] == "PASS" and thesis_dimension_gate(
+            row["dimensions"], row["complete_score"]
         )
 
     def overlay(row: dict[str, Any]) -> bool:
