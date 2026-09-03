@@ -63,6 +63,7 @@ def _atomic_json(payload: dict[str, Any], path: Path) -> None:
             json.dumps(payload, ensure_ascii=False, indent=2, default=_json_default),
             encoding="utf-8",
         )
+        temporary.chmod(0o644)
         os.replace(temporary, path)
     finally:
         with contextlib.suppress(FileNotFoundError):

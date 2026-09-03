@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib.util
+import stat
 from pathlib import Path
 
 SCRIPT = Path(__file__).resolve().parents[2] / "research" / "run_p0_short_horizon_event_account.py"
@@ -72,3 +73,12 @@ def test_no_horizon_is_selected_when_concentration_gate_fails() -> None:
     assert decision["verdict"] == "REJECT_EVENT_ACCOUNT"
     assert decision["selected_horizon"] is None
     assert "top5_positive_profit_share_at_most_30pct" in decision["horizons"]["2"]["failures"]
+
+
+def test_atomic_json_is_readable_by_auditors(tmp_path: Path) -> None:
+    study = _load_module()
+    output = tmp_path / "result.json"
+
+    study._atomic_json({"decision": "PASS"}, output)
+
+    assert stat.S_IMODE(output.stat().st_mode) == 0o644
