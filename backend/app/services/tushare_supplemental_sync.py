@@ -8,7 +8,11 @@ without re-downloading their full history.
 """
 from __future__ import annotations
 
+import contextlib
+import json
 import logging
+import os
+import tempfile
 from collections.abc import Callable
 from datetime import date, timedelta
 from pathlib import Path
@@ -142,6 +146,46 @@ def sync_irm_qa_range(
     return fetched
 
 
+def sync_forecast(
+    data_dir: Path,
+    *,
+    end_date: date,
+    lookback_days: int = 3,
+    on_progress: ProgressCb | None = None,
+) -> int:
+    """Sync newly announced earnings forecasts and publish a coverage receipt."""
+    start_date = end_date - timedelta(days=max(1, lookback_days) - 1)
+    days = _date_range(start_date, end_date)
+    provider = TushareProvider()
+    fetched = 0
+    try:
+        for index, day in enumerate(days, start=1):
+            frame = provider.get_forecast(day)
+            fetched += frame.height
+            _merge_forecast_year(data_dir, frame, day.year)
+            if on_progress is not None:
+                on_progress(index, len(days), day.isoformat())
+    finally:
+        provider.close()
+    receipt = {
+        "schema_version": "tushare-forecast-sync-v1",
+        "start_date": start_date.isoformat(),
+        "end_date": end_date.isoformat(),
+        "rows_returned": fetched,
+    }
+    _atomic_json(
+        data_dir / "event_data" / "forecast" / "sync_status.json",
+        receipt,
+    )
+    logger.info(
+        "tushare forecast sync: [%s ~ %s] fetched=%d",
+        start_date,
+        end_date,
+        fetched,
+    )
+    return fetched
+
+
 def _date_range(start_date: date, end_date: date) -> list[date]:
     if start_date > end_date:
         raise ValueError("start_date must not be after end_date")
@@ -172,3 +216,45 @@ def _merge_partitions(
         temporary = out.with_name(out.name + ".tmp")
         merged.write_parquet(temporary)
         temporary.replace(out)
+
+
+def _merge_forecast_year(data_dir: Path, frame: pl.DataFrame, year: int) -> None:
+    if frame.is_empty():
+        return
+    out = data_dir / "event_data" / "forecast" / f"year={year}" / "part.parquet"
+    out.parent.mkdir(parents=True, exist_ok=True)
+    merged = frame
+    if out.exists():
+        merged = pl.concat([pl.read_parquet(out), frame], how="diagonal_relaxed")
+    merged = merged.unique(
+        subset=[
+            "symbol",
+            "ann_date",
+            "period_end",
+            "type",
+            "p_change_min",
+            "p_change_max",
+            "net_profit_min",
+            "net_profit_max",
+        ],
+        keep="last",
+    ).sort(["ann_date", "symbol", "period_end", "type"])
+    temporary = out.with_name(out.name + ".tmp")
+    merged.write_parquet(temporary, compression="zstd", statistics=True)
+    temporary.replace(out)
+
+
+def _atomic_json(path: Path, payload: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    handle, name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+    os.close(handle)
+    temporary = Path(name)
+    try:
+        temporary.write_text(
+            json.dumps(payload, ensure_ascii=False, separators=(",", ":")),
+            encoding="utf-8",
+        )
+        os.replace(temporary, path)
+    finally:
+        with contextlib.suppress(FileNotFoundError):
+            temporary.unlink()

@@ -594,6 +594,7 @@ def run_now(
     supplemental_on = preferences.get_tushare_supplemental_sync_enabled()
     written_auction = 0
     written_irm_qa = 0
+    written_forecast = 0
     if supplemental_on:
         from app.services import tushare_supplemental_sync
 
@@ -661,8 +662,34 @@ def run_now(
             logger.warning("tushare irm qa sync failed: %s", e)
             emit("sync_irm_qa", 92, f"董秘问答同步失败:{e}")
             stage_errors.append(f"tushare irm qa: {e}")
+
+        # 业绩预告是风险准入事件策略的点时输入。失败时不让旧数据冒充完整,
+        # 但也不拖垮日K与其他模拟账户;专用账户会核对回执后单独失败关闭。
+        try:
+            emit("sync_forecast", 92, "同步近 3 日新发布业绩预告…")
+
+            def _forecast_progress(cur: int, tot: int, label: str) -> None:
+                emit(
+                    "sync_forecast",
+                    92,
+                    f"业绩预告 {cur}/{tot} · {label}",
+                    stage_pct=int(100 * cur / tot),
+                    skip_log=cur < tot,
+                )
+
+            written_forecast = tushare_supplemental_sync.sync_forecast(
+                repo.store.data_dir,
+                end_date=today,
+                lookback_days=3,
+                on_progress=_forecast_progress,
+            )
+            emit("sync_forecast", 92, f"业绩预告完成,本次获取 {written_forecast} 行")
+        except Exception as e:  # noqa: BLE001
+            logger.warning("tushare forecast sync failed: %s", e)
+            emit("sync_forecast", 92, f"业绩预告同步失败:{e}")
+            deferred.append("sync_forecast")
     else:
-        skipped.extend(["sync_auction", "sync_irm_qa"])
+        skipped.extend(["sync_auction", "sync_irm_qa", "sync_forecast"])
         logger.info("tushare supplemental sync skipped: user disabled")
 
     # Step 2.6: 分钟 K 同步(可选) — 未启用或无 capability 时静默跳过(不 emit)
@@ -833,6 +860,7 @@ def run_now(
         "minute_readiness": minute_readiness,
         "auction_rows": written_auction,
         "irm_qa_rows": written_irm_qa,
+        "forecast_rows": written_forecast,
         "regime_days": regime_days,
         "mainline_rows": mainline_rows,
         "lagging_symbols": len(lagging_symbols),

@@ -614,7 +614,15 @@ class PaperTradingService:
         with self._lock:
             self.preflight_all(now=current, quotes=quotes)
             market_observed = self._market_is_observed(trading_date, quotes)
-            for row in self.ledger.planned_orders():
+            planned_orders = sorted(
+                self.ledger.planned_orders(),
+                key=lambda row: (
+                    0 if row["side"] == "SELL" else 1,
+                    row["created_at"],
+                    row["id"],
+                ),
+            )
+            for row in planned_orders:
                 order = dict(row)
                 eligible_today = (
                     date.fromisoformat(str(order["signal_date"])) < trading_date
@@ -904,6 +912,12 @@ class PaperTradingService:
         if account.get("last_processed_date") == signal_date.isoformat():
             return {"signals": 0, "orders": 0}
         config = account["config"]
+        from app.services import risk_admitted_forecast_paper
+
+        if risk_admitted_forecast_paper.is_managed_account(config):
+            return risk_admitted_forecast_paper.seal_account(
+                self, account_id, signal_date
+            )
         if not self._regime_allows(signal_date, config):
             self.ledger.record_account_event(
                 account_id,

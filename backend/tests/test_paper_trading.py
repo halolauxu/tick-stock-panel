@@ -527,6 +527,57 @@ def test_weekend_quotes_cannot_schedule_or_terminalize_next_open_order(tmp_path)
     assert current["summary"]["critical_incident_count"] == 0
 
 
+def test_open_executor_sells_before_buys_to_release_frozen_cash(tmp_path):
+    service = _service(tmp_path)
+    account, initial_order_id = _account_with_buy_order(
+        service,
+        config=_config(initial_capital=20_000),
+    )
+    service.ledger.assign_due_date(initial_order_id, TRADE_DAY, {})
+    service.ledger.execute_fill(
+        initial_order_id,
+        price=10,
+        quantity=1_000,
+        quote_at=OPEN_TIME,
+        source="open_quote",
+    )
+    # Create the BUY first on purpose. Execution must still sell the old
+    # holding before it sizes the new BUY from the released cash.
+    next_signal_day = date(2026, 8, 27)
+    next_trade_day = date(2026, 8, 28)
+    next_open = datetime(2026, 8, 28, 9, 30, 5, tzinfo=CN_TZ)
+    _, buy_id, _ = service.ledger.record_signal_and_order(
+        account_id=account["id"], strategy_id="replacement",
+        symbol="600000.SH", name="浦发银行", side="BUY",
+        signal_date=next_signal_day, score=1, reason="replacement_entry",
+        signal_ref="replacement", requested_qty=1_500, target_amount=15_000,
+        target_weight=0.75, planned_session="NEXT_OPEN",
+    )
+    _, sell_id, _ = service.ledger.record_signal_and_order(
+        account_id=account["id"], strategy_id="replacement",
+        symbol="000001.SZ", name="平安银行", side="SELL",
+        signal_date=next_signal_day, score=None, reason="replacement_exit",
+        signal_ref="replacement", requested_qty=1_000, target_amount=10_000,
+        target_weight=0, planned_session="NEXT_OPEN",
+    )
+    service.ledger.assign_due_date(buy_id, next_trade_day, {})
+    service.ledger.assign_due_date(sell_id, next_trade_day, {})
+
+    result = service.execute_open_orders(
+        now=next_open,
+        quotes={
+            "000001.SZ": _quote(symbol="000001.SZ", at=next_open),
+            "600000.SH": _quote(symbol="600000.SH", at=next_open),
+        },
+    )
+    current = service.account(account["id"])
+
+    assert result["filled"] == 2
+    assert {row["symbol"] for row in current["positions"]} == {"600000.SH"}
+    assert next(row for row in current["orders"] if row["id"] == buy_id)["status"] == "FILLED"
+    assert next(row for row in current["orders"] if row["id"] == sell_id)["status"] == "FILLED"
+
+
 def test_weekend_preflight_does_not_unlock_friday_t_plus_one_position(tmp_path):
     service = _service(tmp_path)
     account, order_id = _account_with_buy_order(service)

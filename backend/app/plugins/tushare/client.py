@@ -50,6 +50,21 @@ IRM_QA_FIELDS: dict[str, tuple[str, ...]] = {
     "sz": ("ts_code", "name", "trade_date", "q", "a", "pub_time", "industry"),
 }
 
+FORECAST_FIELDS = (
+    "ts_code",
+    "ann_date",
+    "end_date",
+    "type",
+    "p_change_min",
+    "p_change_max",
+    "net_profit_min",
+    "net_profit_max",
+    "last_parent_net",
+    "first_ann_date",
+    "summary",
+    "change_reason",
+)
+
 MAIN_BUSINESS_FIELDS = (
     "ts_code",
     "end_date",
@@ -293,4 +308,12 @@ class TushareClient:
                 "pub_end": pub_end.strftime("%Y-%m-%d 23:59:59"),
             },
             IRM_QA_FIELDS[normalized],
+        )
+
+    def forecast_records(self, announcement_date: date) -> list[dict]:
+        """Fetch market-wide earnings forecasts first published on one date."""
+        return self.query(
+            "forecast",
+            {"ann_date": announcement_date.strftime("%Y%m%d")},
+            FORECAST_FIELDS,
         )

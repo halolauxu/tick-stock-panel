@@ -49,6 +49,7 @@ from app.extensions.loader import (
     start_backend_extensions,
 )
 from app.jobs import daily_pipeline
+from app.market_time import cn_today
 from app.optional_alpha import load_alpha_api
 from app.services.matrix_prewarm_owner import MatrixCachePrewarmOwner
 from app.services.mining_process_lock import MiningProcessLock
@@ -262,6 +263,15 @@ async def _application_lifespan(app: FastAPI):
     from app.services.paper_trading import get_service as get_paper_trading_service
 
     paper_trading_service = get_paper_trading_service(app.state)
+
+    # The frozen overlay owns one forward-only paper account. Creation is
+    # idempotent, hash-gated, and never replays historical fills on startup.
+    try:
+        from app.services.risk_admitted_forecast_paper import ensure_account
+        ensured = ensure_account(paper_trading_service, cn_today())
+        logger.info("forecast overlay paper account ready: %s", ensured["id"])
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("forecast overlay paper account not started: %s", exc)
 
     def _refresh_paper_quotes_on_boot() -> None:
         try:

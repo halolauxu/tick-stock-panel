@@ -52,6 +52,21 @@ _IRM_QA_CANONICAL = [
     "symbol", "name", "date", "trade_date", "question", "answer",
     "pub_time", "industry", "exchange",
 ]
+_FORECAST_CANONICAL = [
+    "symbol",
+    "ann_date",
+    "period_end",
+    "type",
+    "p_change_min",
+    "p_change_max",
+    "net_profit_min",
+    "net_profit_max",
+    "last_parent_net",
+    "first_ann_date",
+    "summary",
+    "change_reason",
+    "collection_source",
+]
 _FINANCIAL_NUMERIC_FIELDS: dict[str, tuple[str, ...]] = {
     "metrics": (
         "eps_basic",
@@ -567,6 +582,65 @@ class TushareProvider:
             .select(_IRM_QA_CANONICAL)
             .unique(subset=["symbol", "pub_time", "question"], keep="last")
             .sort(["date", "pub_time", "symbol"])
+        )
+
+    def get_forecast(self, announcement_date: date) -> pl.DataFrame:
+        """Return one announcement day's point-in-time earnings forecasts."""
+        rows = self._get_client().forecast_records(announcement_date)
+        if len(rows) >= 5_000:
+            raise TushareError(
+                f"业绩预告 {announcement_date} 返回 {len(rows)} 行,达到接口上限,"
+                "拒绝保存可能被截断的数据"
+            )
+        records: list[dict] = []
+        numeric = {
+            "p_change_min",
+            "p_change_max",
+            "net_profit_min",
+            "net_profit_max",
+            "last_parent_net",
+        }
+        for source in rows:
+            symbol = _canonical_symbol(source.get("ts_code"))
+            ann_date = _canonical_date(source.get("ann_date"))
+            if not symbol or ann_date != announcement_date.isoformat():
+                continue
+            record = {
+                "symbol": symbol,
+                "ann_date": ann_date,
+                "period_end": _canonical_date(source.get("end_date")),
+                "type": str(source.get("type") or "").strip(),
+                "first_ann_date": _canonical_date(source.get("first_ann_date")),
+                "summary": str(source.get("summary") or "").strip(),
+                "change_reason": str(source.get("change_reason") or "").strip(),
+                "collection_source": "forecast_by_announcement_day",
+            }
+            record.update({field: _number(source, field) for field in numeric})
+            records.append(record)
+        if not records:
+            return pl.DataFrame()
+        return (
+            pl.DataFrame(records, infer_schema_length=None, strict=False)
+            .with_columns(
+                pl.col("ann_date").str.to_date(strict=False),
+                pl.col("period_end").str.to_date(strict=False),
+                pl.col("first_ann_date").str.to_date(strict=False),
+            )
+            .select(_FORECAST_CANONICAL)
+            .unique(
+                subset=[
+                    "symbol",
+                    "ann_date",
+                    "period_end",
+                    "type",
+                    "p_change_min",
+                    "p_change_max",
+                    "net_profit_min",
+                    "net_profit_max",
+                ],
+                keep="last",
+            )
+            .sort(["ann_date", "symbol", "period_end", "type"])
         )
 
     @staticmethod
