@@ -32,8 +32,9 @@ from app.services.serenity_pilot import (  # noqa: E402
 )
 
 SCHEMA_VERSION = "p0-short-horizon-event-documents-v1"
+SELECTION_VERSION = "V2"
 MAX_TOTAL_PDF_BYTES = 512_000_000
-FORECAST_TITLE_PATTERN = re.compile(r"业绩预告")
+FORECAST_TITLE_PATTERN = re.compile(r"业绩(?:预告|预增|预减|预亏|预盈|扭亏)")
 REVISED_TITLE_PATTERN = re.compile(r"修正|更正|补充")
 REASON_HEADING_PATTERN = re.compile(
     r"(?:业绩变动(?:的)?(?:主要)?原因(?:说明|分析)?|"
@@ -94,20 +95,41 @@ def _period_title_fragments(period_end: date) -> tuple[str, ...]:
     return (str(year),)
 
 
+def _source_report_fragments(period_end: date) -> tuple[str, ...]:
+    year = period_end.year
+    month_day = (period_end.month, period_end.day)
+    if month_day == (3, 31):
+        return (f"{year - 1}年年度报告",)
+    if month_day == (6, 30):
+        return (f"{year}年第一季度报告", f"{year}年一季度报告")
+    if month_day == (9, 30):
+        return (f"{year}年半年度报告", f"{year}年上半年报告")
+    if month_day == (12, 31):
+        return (f"{year}年第三季度报告", f"{year}年三季度报告")
+    return ()
+
+
 def select_forecast_document(rows: list[dict[str, Any]], period_end: date) -> dict[str, Any] | None:
     candidates: list[tuple[int, str, dict[str, Any]]] = []
     fragments = _period_title_fragments(period_end)
+    source_fragments = _source_report_fragments(period_end)
     for row in rows:
         title = re.sub(r"\s+", "", str(row.get("title") or ""))
-        if not FORECAST_TITLE_PATTERN.search(title):
+        is_forecast = FORECAST_TITLE_PATTERN.search(title) is not None
+        is_source_report = any(fragment in title for fragment in source_fragments)
+        if not is_forecast and not is_source_report:
             continue
-        score = 20
+        score = 30 if is_forecast else 10
         if any(fragment in title for fragment in fragments):
             score += 20
         if "首次" in title:
             score += 2
         if REVISED_TITLE_PATTERN.search(title):
             score -= 10
+        if is_source_report and "摘要" not in title:
+            score += 5
+        if "审计报告" in title or "社会责任报告" in title:
+            score -= 20
         candidates.append((score, str(row.get("announcement_id") or ""), row))
     if not candidates:
         return None
@@ -218,7 +240,7 @@ def _discover(
     target_status = connection.execute(
         "SELECT query_status FROM event_document_targets WHERE event_key=?", [key]
     ).fetchone()
-    if target_status and target_status[0] == "NO_MATCH":
+    if target_status and target_status[0] == f"NO_MATCH_{SELECTION_VERSION}":
         return None
     existing = connection.execute(
         """
@@ -270,7 +292,7 @@ def _discover(
                     now,
                 ],
             )
-        status = "DISCOVERED" if selected else "NO_MATCH"
+        status = "DISCOVERED" if selected else f"NO_MATCH_{SELECTION_VERSION}"
         connection.execute(
             "UPDATE event_document_targets SET query_status=?, error=NULL, updated_at=? WHERE event_key=?",
             [status, now, key],

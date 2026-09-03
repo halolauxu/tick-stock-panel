@@ -32,7 +32,7 @@ def test_selects_matching_first_forecast_document() -> None:
         {
             "announcement_id": "2",
             "announce_time": None,
-            "title": "2019年度业绩预告",
+            "title": "2019年度业绩预增公告",
             "pdf_url": "https://example.invalid/2.pdf",
             "announced_size_kb": 20.0,
         },
@@ -49,6 +49,28 @@ def test_selects_matching_first_forecast_document() -> None:
 
     assert selected is not None
     assert selected["announcement_id"] == "2"
+
+    embedded = study.select_forecast_document(
+        [
+            {
+                "announcement_id": "4",
+                "announce_time": None,
+                "title": "2019年年度报告摘要",
+                "pdf_url": "https://example.invalid/4.pdf",
+                "announced_size_kb": 20.0,
+            },
+            {
+                "announcement_id": "5",
+                "announce_time": None,
+                "title": "2019年年度报告",
+                "pdf_url": "https://example.invalid/5.pdf",
+                "announced_size_kb": 100.0,
+            },
+        ],
+        date(2020, 3, 31),
+    )
+    assert embedded is not None
+    assert embedded["announcement_id"] == "5"
 
 
 def test_extracts_reason_section_without_later_boilerplate() -> None:
@@ -125,7 +147,7 @@ def test_no_match_target_is_not_queried_again(tmp_path) -> None:
             row["ann_date"],
             row["period_end"],
             row["type"],
-            "NO_MATCH",
+            f"NO_MATCH_{study.SELECTION_VERSION}",
             None,
         ],
     )
