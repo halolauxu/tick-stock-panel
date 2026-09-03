@@ -160,7 +160,13 @@ def _family_execution(orders: list[dict[str, Any]]) -> dict[str, Any]:
     return output
 
 
-def run_period(data_dir: Path, start: date, end: date) -> dict[str, Any]:
+def run_period(
+    data_dir: Path,
+    start: date,
+    end: date,
+    *,
+    event_gate_by_date: dict[date, bool] | None = None,
+) -> dict[str, Any]:
     screen._set_event_period(start, end)
     raw = baseline.load_daily(data_dir, end=end).filter(pl.col("date") >= start)
     raw_source = main_board.filter_main_board(raw)
@@ -172,6 +178,24 @@ def run_period(data_dir: Path, start: date, end: date) -> dict[str, Any]:
     event_candidates, event_audit = event.base.build_candidates(
         event.load_events(data_dir), panel, all_dates
     )
+    ungated_event_rows = event_candidates.height
+    ungated_event_days = event_candidates.get_column("entry_date").n_unique()
+    if event_gate_by_date is not None:
+        enabled_dates = [day for day, enabled in event_gate_by_date.items() if enabled]
+        event_candidates = event_candidates.filter(
+            pl.col("entry_date").is_in(enabled_dates)
+        )
+    event_audit = {
+        **event_audit,
+        "ungated_daily_candidate_rows": ungated_event_rows,
+        "ungated_active_account_days": ungated_event_days,
+        "gated_daily_candidate_rows": event_candidates.height,
+        "gated_active_account_days": (
+            event_candidates.get_column("entry_date").n_unique()
+            if event_candidates.height
+            else 0
+        ),
+    }
     targets = build_daily_targets(microcap_candidates, event_candidates, all_dates)
     target_counts = (
         targets.group_by("family")
