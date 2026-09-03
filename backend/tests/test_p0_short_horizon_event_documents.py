@@ -4,6 +4,8 @@ import importlib.util
 from datetime import date
 from pathlib import Path
 
+import duckdb
+
 SCRIPT = (
     Path(__file__).resolve().parents[2] / "research" / "collect_p0_short_horizon_event_documents.py"
 )
@@ -81,3 +83,21 @@ def test_event_key_is_stable_for_null_numeric_fields() -> None:
     }
 
     assert study.event_key(event) == study.event_key(dict(event))
+
+
+def test_materialize_joins_event_and_document_keys_without_ambiguity(tmp_path) -> None:
+    study = _load_module()
+    root = tmp_path / "evidence"
+    root.mkdir()
+    connection = duckdb.connect(str(root / "event_documents.duckdb"))
+    study._initialize(connection)
+    connection.execute(
+        "INSERT INTO event_document_targets VALUES (?, ?, ?, ?, ?, ?, ?, current_timestamp)",
+        ["event-1", "A.SZ", date(2020, 1, 1), date(2019, 12, 31), "预增", "NO_MATCH", None],
+    )
+
+    summary = study._materialize(connection, root)
+
+    assert summary["targets"] == 1
+    assert summary["status"] == {"NO_MATCH": 1}
+    connection.close()

@@ -354,8 +354,10 @@ def _materialize(connection: duckdb.DuckDBPyConnection, root: Path) -> dict[str,
         FROM event_document_targets t
         LEFT JOIN event_document_announcements a
           ON a.event_key=t.event_key AND a.selected=true
-        LEFT JOIN event_document_metrics m USING (announcement_id)
-        LEFT JOIN event_document_evidence e USING (event_key, announcement_id)
+        LEFT JOIN event_document_metrics m
+          ON m.announcement_id=a.announcement_id
+        LEFT JOIN event_document_evidence e
+          ON e.event_key=t.event_key AND e.announcement_id=a.announcement_id
         ORDER BY t.ann_date, t.symbol
         """
     ).pl()
