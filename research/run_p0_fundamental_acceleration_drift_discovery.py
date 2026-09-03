@@ -62,7 +62,11 @@ def load_metrics(data_dir: Path) -> pl.DataFrame:
     return frame.select(METRIC_COLUMNS)
 
 
-def build_report_comparisons(metrics: pl.DataFrame) -> pl.DataFrame:
+def build_report_comparisons(
+    metrics: pl.DataFrame,
+    start: date = DEVELOPMENT_START,
+    end: date = DEVELOPMENT_END,
+) -> pl.DataFrame:
     ordered = (
         metrics.with_columns(
             pl.col("period_end")
@@ -75,9 +79,7 @@ def build_report_comparisons(metrics: pl.DataFrame) -> pl.DataFrame:
             .alias("announce_date"),
         )
         .filter(
-            pl.col("announce_date").is_between(
-                DEVELOPMENT_START, DEVELOPMENT_END, closed="both"
-            )
+            pl.col("announce_date").is_between(start, end, closed="both")
             & pl.col("symbol").str.contains(MAIN_BOARD_PATTERN)
         )
         .sort(["symbol", "period_end", "announce_date"])
@@ -120,6 +122,18 @@ def build_report_comparisons(metrics: pl.DataFrame) -> pl.DataFrame:
     return ordered
 
 
+def candidate_expression() -> pl.Expr:
+    return (
+        (pl.col("revenue_yoy") > 0)
+        & (pl.col("net_income_yoy") > 0)
+        & (pl.col("revenue_acceleration") >= MIN_REVENUE_ACCELERATION)
+        & (pl.col("profit_acceleration") >= MIN_PROFIT_ACCELERATION)
+        & (pl.col("roe") > 0)
+        & (pl.col("operating_cash_to_revenue") > 0)
+        & (pl.col("debt_to_asset_ratio") <= MAX_DEBT_RATIO)
+    )
+
+
 def classify_events(comparisons: pl.DataFrame) -> pl.DataFrame:
     positive_level = (
         (pl.col("revenue_yoy") > 0)
@@ -133,7 +147,7 @@ def classify_events(comparisons: pl.DataFrame) -> pl.DataFrame:
     )
     cash_confirmed = pl.col("operating_cash_to_revenue") > 0
     category = (
-        pl.when(positive_level & dual_acceleration & cash_confirmed)
+        pl.when(candidate_expression())
         .then(pl.lit(CANDIDATE))
         .when(positive_level & dual_acceleration & ~cash_confirmed)
         .then(pl.lit(CASH_POOR_CONTROL))
