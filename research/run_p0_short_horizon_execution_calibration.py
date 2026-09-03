@@ -71,9 +71,9 @@ def load_orders(data_dir: Path) -> tuple[pl.DataFrame, dict[str, Any]]:
             order_date = date.fromisoformat(order["date"])
             if not START <= order_date <= END:
                 continue
-            shares = int(order.get("raw_shares") or 0)
+            shares = int(order["raw_shares"]) if order.get("raw_shares") else None
             gross = float(order.get("gross") or 0)
-            if shares <= 0 or gross <= 0:
+            if gross <= 0:
                 continue
             rows.append(
                 {
@@ -94,6 +94,31 @@ def load_orders(data_dir: Path) -> tuple[pl.DataFrame, dict[str, Any]]:
             "overlap_filled_orders": accepted,
         }
     return pl.DataFrame(rows).sort(["account", "date", "order_index"]), audits
+
+
+def load_daily_open(data_dir: Path) -> tuple[pl.DataFrame, dict[str, Any]]:
+    paths = _date_paths(data_dir / "kline_daily_enriched")
+    if not paths:
+        raise ValueError("enriched daily partitions are required")
+    frame = (
+        pl.scan_parquet(paths, hive_partitioning=False)
+        .select("symbol", "date", "open", "close", "raw_close")
+        .with_columns(
+            pl.col("date").cast(pl.Date, strict=False),
+            (pl.col("open") / (pl.col("close") / pl.col("raw_close"))).alias("daily_raw_open"),
+        )
+        .select("symbol", "date", "daily_raw_open")
+        .unique(subset=["symbol", "date"], keep="last")
+        .collect(engine="streaming")
+        .sort(["date", "symbol"])
+    )
+    return frame, {
+        "partition_count": len(paths),
+        "rows": frame.height,
+        "trading_days": frame.get_column("date").n_unique(),
+        "start": frame.get_column("date").min(),
+        "end": frame.get_column("date").max(),
+    }
 
 
 def load_auction(data_dir: Path) -> tuple[pl.DataFrame, dict[str, Any]]:
@@ -149,12 +174,27 @@ def load_minute_0931(data_dir: Path) -> tuple[pl.DataFrame, dict[str, Any]]:
     }
 
 
-def match_orders(orders: pl.DataFrame, auction: pl.DataFrame, minute: pl.DataFrame) -> pl.DataFrame:
+def match_orders(
+    orders: pl.DataFrame,
+    daily: pl.DataFrame,
+    auction: pl.DataFrame,
+    minute: pl.DataFrame,
+) -> pl.DataFrame:
     side_sign = pl.when(pl.col("side") == "BUY").then(1.0).otherwise(-1.0)
     return (
-        orders.join(auction, on=["symbol", "date"], how="left")
+        orders.join(daily, on=["symbol", "date"], how="left")
+        .join(auction, on=["symbol", "date"], how="left")
         .join(minute, on=["symbol", "date"], how="left")
-        .with_columns((pl.col("gross") / pl.col("raw_shares")).alias("daily_fill_price"))
+        .with_columns(
+            pl.when(pl.col("raw_shares").is_not_null() & (pl.col("raw_shares") > 0))
+            .then(pl.col("gross") / pl.col("raw_shares"))
+            .otherwise(pl.col("daily_raw_open"))
+            .alias("daily_fill_price"),
+            pl.when(pl.col("raw_shares").is_not_null() & (pl.col("raw_shares") > 0))
+            .then(pl.lit("gross_div_shares"))
+            .otherwise(pl.lit("daily_raw_open"))
+            .alias("daily_fill_price_source"),
+        )
         .with_columns(
             ((pl.col("auction_open") / pl.col("daily_fill_price") - 1.0).abs() * 10_000).alias(
                 "auction_abs_bps"
@@ -288,9 +328,10 @@ def _json_default(value: Any) -> Any:
 
 def run(data_dir: Path, output: Path) -> dict[str, Any]:
     orders, order_audit = load_orders(data_dir)
+    daily, daily_audit = load_daily_open(data_dir)
     auction, auction_audit = load_auction(data_dir)
     minute, minute_audit = load_minute_0931(data_dir)
-    matched = match_orders(orders, auction, minute)
+    matched = match_orders(orders, daily, auction, minute)
     summary = summarize(matched)
     payload = {
         "schema_version": SCHEMA_VERSION,
@@ -299,6 +340,7 @@ def run(data_dir: Path, output: Path) -> dict[str, Any]:
         "period": {"start": START, "end": END},
         "inputs": {
             "orders": order_audit,
+            "daily_open": daily_audit,
             "auction": auction_audit,
             "minute_0931": minute_audit,
         },

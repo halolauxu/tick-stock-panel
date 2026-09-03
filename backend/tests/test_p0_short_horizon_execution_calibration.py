@@ -31,7 +31,7 @@ def test_calibration_uses_auction_open_and_side_aware_adverse_bps() -> None:
             "date": [date(2026, 1, 5), date(2026, 1, 5)],
             "symbol": ["000001.SZ", "000002.SZ"],
             "side": ["BUY", "SELL"],
-            "raw_shares": [1000, 1000],
+            "raw_shares": [1000, None],
             "gross": [10_000.0, 20_000.0],
         }
     )
@@ -43,6 +43,13 @@ def test_calibration_uses_auction_open_and_side_aware_adverse_bps() -> None:
             "auction_amount": [2_000_000.0, 2_000_000.0],
         }
     )
+    daily = pl.DataFrame(
+        {
+            "symbol": ["000001.SZ", "000002.SZ"],
+            "date": [date(2026, 1, 5), date(2026, 1, 5)],
+            "daily_raw_open": [10.0, 20.0],
+        }
+    )
     minute = pl.DataFrame(
         {
             "symbol": ["000001.SZ", "000002.SZ"],
@@ -52,7 +59,7 @@ def test_calibration_uses_auction_open_and_side_aware_adverse_bps() -> None:
         }
     )
 
-    matched = study.match_orders(orders, auction, minute)
+    matched = study.match_orders(orders, daily, auction, minute)
 
     assert matched.get_column("auction_abs_bps").to_list() == [0.0, 0.0]
     assert matched.get_column("minute_0931_adverse_bps").to_list() == pytest.approx([100.0, 100.0])
