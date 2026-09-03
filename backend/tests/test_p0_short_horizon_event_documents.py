@@ -70,7 +70,7 @@ def test_selects_matching_first_forecast_document() -> None:
         date(2020, 3, 31),
     )
     assert embedded is not None
-    assert embedded["announcement_id"] == "5"
+    assert embedded["announcement_id"] == "4"
 
 
 def test_extracts_reason_section_without_later_boilerplate() -> None:

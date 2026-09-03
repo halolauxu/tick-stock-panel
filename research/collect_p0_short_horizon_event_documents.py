@@ -32,7 +32,7 @@ from app.services.serenity_pilot import (  # noqa: E402
 )
 
 SCHEMA_VERSION = "p0-short-horizon-event-documents-v1"
-SELECTION_VERSION = "V2"
+SELECTION_VERSION = "V3"
 MAX_TOTAL_PDF_BYTES = 512_000_000
 FORECAST_TITLE_PATTERN = re.compile(r"业绩(?:预告|预增|预减|预亏|预盈|扭亏)")
 REVISED_TITLE_PATTERN = re.compile(r"修正|更正|补充")
@@ -126,7 +126,7 @@ def select_forecast_document(rows: list[dict[str, Any]], period_end: date) -> di
             score += 2
         if REVISED_TITLE_PATTERN.search(title):
             score -= 10
-        if is_source_report and "摘要" not in title:
+        if is_source_report and "摘要" in title:
             score += 5
         if "审计报告" in title or "社会责任报告" in title:
             score -= 20
