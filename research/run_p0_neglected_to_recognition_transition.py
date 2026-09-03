@@ -19,7 +19,7 @@ RESEARCH = Path(__file__).resolve().parent
 sys.path.insert(0, str(ROOT / "backend"))
 sys.path.insert(0, str(RESEARCH))
 
-import run_p0_academic_factor_development_screen as academic  # noqa: E402
+import fixed_horizon_account as fixed  # noqa: E402
 import run_p0_main_board_neglected_liquidity_premium as base  # noqa: E402
 import run_p0_main_board_microcap_account as main_board  # noqa: E402
 import run_p0_microcap_baseline as baseline  # noqa: E402
@@ -186,7 +186,7 @@ def run(data_dir: Path, output: Path) -> dict[str, Any]:
         )
     )
     benchmark = base.shared.benchmark_metrics(base.benchmark_universe(panel))
-    weekly, action_dates = base.weekly_signal_panel(panel)
+    weekly, _action_dates = base.weekly_signal_panel(panel)
     ranked = base.rank_investable(weekly)
     del panel, weekly
     gc.collect()
@@ -197,15 +197,22 @@ def run(data_dir: Path, output: Path) -> dict[str, Any]:
     }
     del ranked
     gc.collect()
-    results = {
-        direction: academic.simulate_factor(
-            frame, raw_source, all_dates, action_dates, data_dir
+    results = {}
+    for direction, frame in candidates.items():
+        results[direction] = fixed.simulate(
+            frame,
+            fixed.prepare_quotes(frame, raw_source, data_dir),
+            all_dates,
+            initial_cash=base.shared.INITIAL_CASH,
+            target_positions=base.TARGET_POSITIONS,
+            holding_trading_days=base.HOLD_TRADING_DAYS,
+            maximum_exit_delay=base.MAX_EXIT_DELAY,
+            period_start=base.DEVELOPMENT_START,
+            period_end=base.DEVELOPMENT_END,
         )
-        for direction, frame in candidates.items()
-    }
     decision = evaluate(results[TRANSITION], results[MOTHER], benchmark)
     payload = {
-        "schema_version": "p0-neglected-to-recognition-transition-v1",
+        "schema_version": "p0-neglected-to-recognition-transition-v2",
         "contract_frozen": "2026-09-03",
         "period": {
             "start": base.DEVELOPMENT_START,
@@ -219,7 +226,8 @@ def run(data_dir: Path, output: Path) -> dict[str, Any]:
             "prior_turnover_days": 15,
             "candidate_turnover_ratio": [1.2, 2.0],
             "candidate_return_5d": [0.0, 0.05],
-            "holding_target_trading_days": 5,
+            "holding_trading_days": base.HOLD_TRADING_DAYS,
+            "maximum_exit_delay_trading_days": base.MAX_EXIT_DELAY,
             "target_positions": base.TARGET_POSITIONS,
             "initial_cash_cny": base.shared.INITIAL_CASH,
         },
@@ -260,7 +268,7 @@ def main() -> None:
         "--output",
         type=Path,
         default=Path(
-            "/app/data/research/p0_neglected_to_recognition_transition_v1.json"
+            "/app/data/research/p0_neglected_to_recognition_transition_v2.json"
         ),
     )
     args = parser.parse_args()

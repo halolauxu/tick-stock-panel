@@ -19,7 +19,7 @@ RESEARCH = Path(__file__).resolve().parent
 sys.path.insert(0, str(ROOT / "backend"))
 sys.path.insert(0, str(RESEARCH))
 
-import run_p0_academic_factor_development_screen as academic  # noqa: E402
+import fixed_horizon_account as fixed  # noqa: E402
 import run_p0_industry_momentum_development as shared  # noqa: E402
 import run_p0_main_board_microcap_account as main_board  # noqa: E402
 import run_p0_microcap_baseline as baseline  # noqa: E402
@@ -29,6 +29,8 @@ DEVELOPMENT_END = date(2020, 12, 31)
 MIN_MARKET_CAP = 1_000_000_000.0
 MIN_MEAN_AMOUNT_20D = 50_000_000.0
 TARGET_POSITIONS = 10
+HOLD_TRADING_DAYS = 5
+MAX_EXIT_DELAY = 20
 LOW_TURNOVER = "low_turnover_candidate"
 HIGH_TURNOVER = "high_turnover_control"
 
@@ -265,7 +267,7 @@ def run(data_dir: Path, output: Path) -> dict[str, Any]:
         )
     )
     benchmark = shared.benchmark_metrics(benchmark_universe(panel))
-    weekly, action_dates = weekly_signal_panel(panel)
+    weekly, _action_dates = weekly_signal_panel(panel)
     ranked = rank_investable(weekly)
     del panel, weekly
     gc.collect()
@@ -275,15 +277,22 @@ def run(data_dir: Path, output: Path) -> dict[str, Any]:
     }
     del ranked
     gc.collect()
-    results = {
-        direction: academic.simulate_factor(
-            frame, raw_source, all_dates, action_dates, data_dir
+    results = {}
+    for direction, frame in candidates.items():
+        results[direction] = fixed.simulate(
+            frame,
+            fixed.prepare_quotes(frame, raw_source, data_dir),
+            all_dates,
+            initial_cash=shared.INITIAL_CASH,
+            target_positions=TARGET_POSITIONS,
+            holding_trading_days=HOLD_TRADING_DAYS,
+            maximum_exit_delay=MAX_EXIT_DELAY,
+            period_start=DEVELOPMENT_START,
+            period_end=DEVELOPMENT_END,
         )
-        for direction, frame in candidates.items()
-    }
     decision = evaluate(results[LOW_TURNOVER], results[HIGH_TURNOVER], benchmark)
     payload = {
-        "schema_version": "p0-main-board-neglected-liquidity-premium-v1",
+        "schema_version": "p0-main-board-neglected-liquidity-premium-v2",
         "contract_frozen": "2026-09-03",
         "hypothesis_id": "ah-ai-3778d3454fb706a63bf9",
         "period": {
@@ -298,7 +307,8 @@ def run(data_dir: Path, output: Path) -> dict[str, Any]:
             "size_bins": 5,
             "turnover_tail": 0.10,
             "turnover_lookback_trading_days": 20,
-            "holding_target_trading_days": 5,
+            "holding_trading_days": HOLD_TRADING_DAYS,
+            "maximum_exit_delay_trading_days": MAX_EXIT_DELAY,
             "target_positions": TARGET_POSITIONS,
             "initial_cash_cny": shared.INITIAL_CASH,
         },
@@ -342,7 +352,7 @@ def main() -> None:
         "--output",
         type=Path,
         default=Path(
-            "/app/data/research/p0_main_board_neglected_liquidity_premium_v1.json"
+            "/app/data/research/p0_main_board_neglected_liquidity_premium_v2.json"
         ),
     )
     args = parser.parse_args()
