@@ -25,7 +25,7 @@ def _payload(annualized: float, positive_years: int = 3, trades: int = 400) -> d
                     "mean_cash_ratio": 0.60,
                 },
                 "account": {"trade_count": trades},
-                "intent_execution": {
+                "execution": {
                     "buy": {"execution_rate": 0.95},
                     "sell": {"execution_rate": 0.97},
                 },
@@ -52,4 +52,3 @@ def test_unstable_account_is_terminated() -> None:
 
     assert result["combination_input_passed"] is False
     assert result["verdict"] == "TERMINATE_MAIN_BOARD_FORECAST"
-

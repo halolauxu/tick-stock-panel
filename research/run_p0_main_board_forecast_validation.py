@@ -40,11 +40,11 @@ def evaluate_validation(payload: dict[str, Any]) -> dict[str, Any]:
         "annualized_positive": annualized > 0,
         "all_three_years_positive": int(metrics.get("positive_years") or 0) == 3,
         "at_least_150_round_trips": round_trips >= 150,
-        "buy_intent_execution_at_least_90pct": primary["intent_execution"]["buy"][
+        "buy_execution_at_least_90pct": primary["execution"]["buy"][
             "execution_rate"
         ]
         >= 0.90,
-        "sell_intent_execution_at_least_90pct": primary["intent_execution"]["sell"][
+        "sell_execution_at_least_90pct": primary["execution"]["sell"][
             "execution_rate"
         ]
         >= 0.90,
@@ -142,4 +142,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
