@@ -3,7 +3,7 @@
 运行日期：2026-09-04
 
 服务器输出：`/mnt/data/tick-stock-panel/data/research/p0_short_horizon_event_facts_audit_v1.json`  
-输出 SHA-256：`a6432a48bd36c223e3d2be2a66e885a0f5ae681991182eb3b71f624d4de55a8f`
+输出 SHA-256：`db11e76f7de30c33adc21f6724c663cf49860456fe038b0dd67906fd1e8e44ba`
 
 ## 裁决
 
