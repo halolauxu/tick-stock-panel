@@ -94,14 +94,27 @@ class AlphaAIHypothesisProposer:
             "research_focus": research_focus.strip()[:500],
         }
         prompt = _proposal_prompt(context, count)
-        batch_id = f"ahp-{uuid.uuid4().hex[:24]}"
         prompt_sha = _sha256(prompt)
         context_sha = _sha256(json.dumps(context, ensure_ascii=False, sort_keys=True))
+        request_sha = _sha256(
+            json.dumps(
+                {
+                    "provider": provider,
+                    "model": model,
+                    "prompt_sha256": prompt_sha,
+                    "context_sha256": context_sha,
+                },
+                ensure_ascii=False,
+                sort_keys=True,
+            )
+        )
+        batch_id = f"ahp-{request_sha[:24]}"
         receipt: dict[str, Any] = {
             "batch_id": batch_id,
             "created_at": datetime.now(UTC).isoformat(),
             "provider": provider,
             "model": model,
+            "request_sha256": request_sha,
             "prompt_sha256": prompt_sha,
             "context_sha256": context_sha,
             "outcome_data_exposed": False,
@@ -111,28 +124,65 @@ class AlphaAIHypothesisProposer:
             "raw_response": None,
             "status": "running",
         }
-        try:
-            response = await self.generator(
-                [
-                    {
-                        "role": "system",
-                        "content": (
-                            "你是A股量化研究负责人。只提出可证伪、可用给定字段执行的研究假设；"
-                            "不得承诺收益，不得引用任何现有策略作为底座，不得编造数据或因子。"
-                        ),
-                    },
-                    {"role": "user", "content": prompt},
-                ],
-                temperature=0.4,
-                max_tokens=None,
-                timeout=180.0,
+        final_receipt = _read_receipt(self.data_dir, batch_id)
+        if final_receipt is not None:
+            if final_receipt.get("status") == "accepted":
+                return {
+                    "batch_id": batch_id,
+                    "provider": provider,
+                    "model": model,
+                    "outcome_data_exposed": False,
+                    "items": [
+                        self.store.get(str(hypothesis_id))
+                        for hypothesis_id in final_receipt.get("hypothesis_ids") or []
+                    ],
+                    "rejected": list(final_receipt.get("rejected") or []),
+                    "reused_receipt": True,
+                }
+            raise ValueError(
+                "相同DeepSeek请求已有失败凭证；为防止重复计费，系统不会自动重试"
             )
-        except Exception as exc:
-            receipt.update({"status": "provider_error", "error": str(exc)[:1000]})
-            _write_receipt(self.data_dir, receipt)
-            raise
-        response_sha = _sha256(response)
-        receipt.update({"raw_response": response, "response_sha256": response_sha})
+
+        response_receipt = _read_receipt_stage(self.data_dir, batch_id, "response")
+        if response_receipt is not None and response_receipt.get("raw_response"):
+            receipt = response_receipt
+            response = str(response_receipt["raw_response"])
+        else:
+            if _read_receipt_stage(self.data_dir, batch_id, "running") is not None:
+                raise ValueError(
+                    "相同DeepSeek请求已有未决调用凭证；为防止重复计费，系统不会自动重试"
+                )
+            _write_receipt_stage(self.data_dir, receipt, "running")
+            try:
+                response = await self.generator(
+                    [
+                        {
+                            "role": "system",
+                            "content": (
+                                "你是A股量化研究负责人。只提出可证伪、可用给定字段执行的研究假设；"
+                                "不得承诺收益，不得引用任何现有策略作为底座，不得编造数据或因子。"
+                            ),
+                        },
+                        {"role": "user", "content": prompt},
+                    ],
+                    temperature=0.4,
+                    max_tokens=None,
+                    timeout=180.0,
+                )
+            except Exception as exc:
+                receipt.update({"status": "provider_error", "error": str(exc)[:1000]})
+                _write_receipt(self.data_dir, receipt)
+                raise
+            response_sha = _sha256(response)
+            receipt.update(
+                {
+                    "raw_response": response,
+                    "response_sha256": response_sha,
+                    "status": "response_received",
+                }
+            )
+            _write_receipt_stage(self.data_dir, receipt, "response")
+        response_sha = str(receipt["response_sha256"])
         proposals = _decode_proposals(response)
         if not proposals:
             receipt.update({"status": "contract_rejected", "error": "DeepSeek没有返回可解析的假设"})
@@ -409,10 +459,30 @@ def _finite(value: Any) -> float | None:
     return parsed if math.isfinite(parsed) else None
 
 
-def _write_receipt(data_dir: Path, payload: dict[str, Any]) -> None:
+def _receipt_root(data_dir: Path) -> Path:
     root = data_dir / "alpha_mining" / "hypothesis_proposals"
     root.mkdir(parents=True, exist_ok=True)
-    target = root / f"{payload['batch_id']}.json"
+    return root
+
+
+def _read_json(path: Path) -> dict[str, Any] | None:
+    if not path.is_file():
+        return None
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    return dict(payload) if isinstance(payload, Mapping) else None
+
+
+def _read_receipt(data_dir: Path, batch_id: str) -> dict[str, Any] | None:
+    return _read_json(_receipt_root(data_dir) / f"{batch_id}.json")
+
+
+def _read_receipt_stage(
+    data_dir: Path, batch_id: str, stage: str
+) -> dict[str, Any] | None:
+    return _read_json(_receipt_root(data_dir) / f"{batch_id}.{stage}.json")
+
+
+def _write_immutable_json(target: Path, payload: dict[str, Any]) -> None:
     temporary = target.with_name(f".{target.name}.{uuid.uuid4().hex}.tmp")
     with temporary.open("x", encoding="utf-8") as stream:
         json.dump(payload, stream, ensure_ascii=False, sort_keys=True, indent=2)
@@ -421,6 +491,18 @@ def _write_receipt(data_dir: Path, payload: dict[str, Any]) -> None:
         os.fsync(stream.fileno())
     os.link(temporary, target)
     temporary.unlink(missing_ok=True)
+
+
+def _write_receipt(data_dir: Path, payload: dict[str, Any]) -> None:
+    target = _receipt_root(data_dir) / f"{payload['batch_id']}.json"
+    _write_immutable_json(target, payload)
+
+
+def _write_receipt_stage(
+    data_dir: Path, payload: dict[str, Any], stage: str
+) -> None:
+    target = _receipt_root(data_dir) / f"{payload['batch_id']}.{stage}.json"
+    _write_immutable_json(target, payload)
 
 
 def _sha256(value: str) -> str:

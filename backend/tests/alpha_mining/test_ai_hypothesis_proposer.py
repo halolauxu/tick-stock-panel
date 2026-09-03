@@ -57,6 +57,13 @@ async def test_deepseek_proposals_are_validated_frozen_and_auditable(
     async def fake_generator(messages, **kwargs):
         captured["messages"] = messages
         captured["kwargs"] = kwargs
+        running = list(
+            (tmp_path / "alpha_mining" / "hypothesis_proposals").glob(
+                "*.running.json"
+            )
+        )
+        assert len(running) == 1
+        assert json.loads(running[0].read_text(encoding="utf-8"))["status"] == "running"
         return json.dumps({
             "hypotheses": [{
                 "title": "尾盘承接与缩量卖压衰竭",
@@ -106,6 +113,35 @@ async def test_deepseek_proposals_are_validated_frozen_and_auditable(
     receipt = tmp_path / "alpha_mining" / "hypothesis_proposals" / f"{result['batch_id']}.json"
     assert receipt.is_file()
     assert json.loads(receipt.read_text(encoding="utf-8"))["raw_response"]
+    response_receipt = receipt.with_name(f"{result['batch_id']}.response.json")
+    assert response_receipt.is_file()
+    assert json.loads(response_receipt.read_text(encoding="utf-8"))["status"] == "response_received"
+
+
+@pytest.mark.asyncio
+async def test_same_unresolved_request_is_not_charged_twice(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    first, last = _research_fixture(tmp_path)
+    calls = 0
+
+    async def interrupted_generator(messages, **kwargs):
+        nonlocal calls
+        calls += 1
+        raise RuntimeError("transport interrupted")
+
+    monkeypatch.setattr(proposer_module, "current_ai_provider", lambda: "openai_compat")
+    monkeypatch.setattr(proposer_module, "current_ai_model", lambda: "deepseek-v4-flash")
+    monkeypatch.setattr(proposer_module, "ai_configured", lambda provider=None: True)
+    proposer = AlphaAIHypothesisProposer(tmp_path, generator=interrupted_generator)
+
+    with pytest.raises(RuntimeError, match="transport interrupted"):
+        await proposer.propose(asset_type="stock", start=first, end=last, count=1)
+    with pytest.raises(ValueError, match="不会自动重试"):
+        await proposer.propose(asset_type="stock", start=first, end=last, count=1)
+
+    assert calls == 1
 
 
 @pytest.mark.asyncio
