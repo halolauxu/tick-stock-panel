@@ -1,4 +1,5 @@
 """Run the preregistered P0-B2 CNY 300k micro-cap cash-account study."""
+
 from __future__ import annotations
 
 import argparse
@@ -42,9 +43,10 @@ def affordable_shares(
     if raw_open <= 0 or target <= 0 or cash <= MIN_COMMISSION:
         return 0
     budget = min(target, cash - MIN_COMMISSION)
-    shares = math.floor(
-        budget / (raw_open * (1.0 + baseline.SLIPPAGE_PCT)) / lot_size
-    ) * lot_size
+    shares = (
+        math.floor(budget / (raw_open * (1.0 + baseline.SLIPPAGE_PCT)) / lot_size)
+        * lot_size
+    )
     while shares > 0:
         gross = shares * raw_open
         total = gross * (1.0 + baseline.SLIPPAGE_PCT) + commission(gross)
@@ -56,9 +58,7 @@ def affordable_shares(
 
 def attach_quote_names(source: pl.DataFrame, data_dir: Path) -> pl.DataFrame:
     names = (
-        pl.read_parquet(
-            data_dir / "research" / "historical_stock_names_all_a.parquet"
-        )
+        pl.read_parquet(data_dir / "research" / "historical_stock_names_all_a.parquet")
         .with_columns(
             pl.col("start_date").cast(pl.Date, strict=False),
             pl.col("end_date").cast(pl.Date, strict=False),
@@ -78,8 +78,7 @@ def attach_quote_names(source: pl.DataFrame, data_dir: Path) -> pl.DataFrame:
         )
         .with_columns(
             pl.when(
-                pl.col("end_date").is_null()
-                | (pl.col("date") <= pl.col("end_date"))
+                pl.col("end_date").is_null() | (pl.col("date") <= pl.col("end_date"))
             )
             .then(pl.col("name"))
             .otherwise(None)
@@ -93,16 +92,12 @@ def prepare_quote_panel(source: pl.DataFrame) -> pl.DataFrame:
     dates = source.select("date").unique().sort("date").with_row_index("_index")
     work = source.join(dates, on="date", how="left").sort(["symbol", "date"])
     name_is_excluded = (
-        pl.col("name")
-        .fill_null("")
-        .str.to_uppercase()
-        .str.contains(r"(?:\*?ST|退)")
+        pl.col("name").fill_null("").str.to_uppercase().str.contains(r"(?:\*?ST|退)")
         if "name" in work.columns
         else pl.lit(False)
     )
     main_board_st = name_is_excluded & (
-        pl.col("symbol").str.starts_with("00")
-        | pl.col("symbol").str.starts_with("60")
+        pl.col("symbol").str.starts_with("00") | pl.col("symbol").str.starts_with("60")
     )
     work = work.with_columns(
         (pl.col("close") / pl.col("raw_close")).alias("_adj_factor"),
@@ -117,9 +112,7 @@ def prepare_quote_panel(source: pl.DataFrame) -> pl.DataFrame:
         (pl.col("_index") == pl.col("_prev_index") + 1).alias("_adjacent"),
         (pl.col("open") / pl.col("_adj_factor")).alias("raw_open"),
     )
-    factor_changed = (
-        pl.col("_adj_factor") - pl.col("_prev_adj_factor")
-    ).abs() > 1e-6
+    factor_changed = (pl.col("_adj_factor") - pl.col("_prev_adj_factor")).abs() > 1e-6
     work = work.with_columns(
         pl.when(pl.col("_adjacent"))
         .then(
@@ -135,8 +128,9 @@ def prepare_quote_panel(source: pl.DataFrame) -> pl.DataFrame:
         .alias("_limit_pct"),
         name_is_excluded.alias("is_excluded_name"),
     ).with_columns(
-        polars_limit_price(pl.col("_reference_close"), pl.col("_limit_pct"), up=True)
-        .alias("limit_up_price"),
+        polars_limit_price(
+            pl.col("_reference_close"), pl.col("_limit_pct"), up=True
+        ).alias("limit_up_price"),
         polars_limit_price(
             pl.col("_reference_close"), pl.col("_limit_pct"), up=False
         ).alias("limit_down_price"),
@@ -242,7 +236,9 @@ def _partition_rows(frame: pl.DataFrame, column: str) -> dict[date, pl.DataFrame
     return output
 
 
-def _sell_rejection(position: dict[str, Any], quote: dict[str, Any] | None) -> str | None:
+def _sell_rejection(
+    position: dict[str, Any], quote: dict[str, Any] | None
+) -> str | None:
     if quote is None or not quote.get("exact_quote"):
         return "missing_market_data"
     if not quote.get("entry_volume") or quote["entry_volume"] <= 0:
@@ -275,9 +271,7 @@ def _buy_rejection(
         return "missing_open"
     if limit_up is not None and raw_open >= limit_up - 0.005:
         return "limit_up"
-    capacity = float(
-        quote.get("entry_amount") or 0.0
-    ) * baseline.DAILY_PARTICIPATION
+    capacity = float(quote.get("entry_amount") or 0.0) * baseline.DAILY_PARTICIPATION
     if gross > capacity:
         return "insufficient_capacity"
     return None
@@ -297,6 +291,7 @@ def simulate_account(
     settle_only_after_delist_date: bool = False,
     delist_recovery_per_raw_share: float = 0.0,
     target_exposure_by_date: dict[date, float] | None = None,
+    candidate_weight_column: str | None = None,
 ) -> dict[str, Any]:
     candidate_groups = _partition_rows(candidates, "entry_date")
     quote_groups = _partition_rows(execution_grid, "entry_date")
@@ -320,26 +315,18 @@ def simulate_account(
             else []
         )
         quote_frame = quote_groups.get(entry_date, pl.DataFrame())
-        quotes = {
-            row["symbol"]: row
-            for row in quote_frame.to_dicts()
-        }
+        quotes = {row["symbol"]: row for row in quote_frame.to_dicts()}
         for symbol in list(positions):
             delist_date = (delist_dates or {}).get(symbol)
             if (
                 delist_date is None
                 or entry_date < delist_date
-                or (
-                    settle_only_after_delist_date
-                    and entry_date == delist_date
-                )
+                or (settle_only_after_delist_date and entry_date == delist_date)
             ):
                 continue
             position = positions.pop(symbol)
             last_book_value = position["units"] * position["last_mark"]
-            recovery_value = (
-                position["raw_shares"] * delist_recovery_per_raw_share
-            )
+            recovery_value = position["raw_shares"] * delist_recovery_per_raw_share
             cash += recovery_value
             cash_ledger += recovery_value
             settlements.append(
@@ -389,9 +376,7 @@ def simulate_account(
             )
         target_gross = pre_open_equity * target_exposure
 
-        desired = {
-            row["symbol"] for row in candidate_rows[:target_positions]
-        }
+        desired = {row["symbol"] for row in candidate_rows[:target_positions]}
         sold_today: set[str] = set()
         for symbol in list(positions):
             if symbol in desired:
@@ -405,6 +390,7 @@ def simulate_account(
                 "side": "SELL",
                 "status": "REJECTED" if reason else "FILLED",
                 "reason": reason,
+                "family": position.get("family"),
             }
             if reason:
                 orders.append(order)
@@ -469,14 +455,28 @@ def simulate_account(
             symbol = candidate["symbol"]
             if symbol in positions or symbol in sold_today:
                 continue
-            candidate_target = (
-                min(target_notional, remaining_buy_budget)
-                if target_exposure_by_date is not None
-                else target_notional
+            if candidate_weight_column is not None:
+                candidate_weight = float(candidate.get(candidate_weight_column) or 0.0)
+                if (
+                    not math.isfinite(candidate_weight)
+                    or not 0.0 < candidate_weight <= 1.0
+                ):
+                    raise ValueError(
+                        f"invalid candidate weight for {symbol}: {candidate_weight}"
+                    )
+                candidate_target = min(
+                    pre_open_equity * candidate_weight, remaining_buy_budget
+                )
+            else:
+                candidate_target = (
+                    min(target_notional, remaining_buy_budget)
+                    if target_exposure_by_date is not None
+                    else target_notional
+                )
+            signal_capacity = (
+                float(candidate.get("signal_amount") or 0.0)
+                * baseline.DAILY_PARTICIPATION
             )
-            signal_capacity = float(
-                candidate.get("signal_amount") or 0.0
-            ) * baseline.DAILY_PARTICIPATION
             if candidate_target > signal_capacity:
                 orders.append(
                     {
@@ -493,7 +493,9 @@ def simulate_account(
                 )
                 continue
             quote = quotes.get(symbol)
-            raw_open = float(quote["raw_open"]) if quote and quote.get("raw_open") else 0.0
+            raw_open = (
+                float(quote["raw_open"]) if quote and quote.get("raw_open") else 0.0
+            )
             shares = affordable_shares(
                 raw_open, candidate_target, cash, lot_size=lot_size
             )
@@ -517,11 +519,7 @@ def simulate_account(
                     }
                 )
                 continue
-            reason = (
-                "zero_lot_or_cash"
-                if shares <= 0
-                else _buy_rejection(quote, gross)
-            )
+            reason = "zero_lot_or_cash" if shares <= 0 else _buy_rejection(quote, gross)
             order = {
                 "date": entry_date,
                 "signal_date": candidate["date"],
@@ -531,6 +529,12 @@ def simulate_account(
                 "reason": reason,
                 "rank": candidate["cap_rank"],
                 "target_notional": candidate_target,
+                "target_weight": (
+                    candidate.get(candidate_weight_column)
+                    if candidate_weight_column is not None
+                    else None
+                ),
+                "family": candidate.get("family"),
             }
             if reason:
                 orders.append(order)
@@ -550,6 +554,7 @@ def simulate_account(
                 "raw_shares": shares,
                 "start_date": entry_date,
                 "last_mark": float(quote["close"]),
+                "family": candidate.get("family"),
             }
             order.update(
                 raw_shares=shares,
@@ -576,9 +581,7 @@ def simulate_account(
                 "target_exposure": target_exposure,
                 "target_gross": target_gross,
                 "actual_exposure": (
-                    current_gross / pre_open_equity
-                    if pre_open_equity > 0
-                    else 0.0
+                    current_gross / pre_open_equity if pre_open_equity > 0 else 0.0
                 ),
                 "risk_budget_blocked_slots": (
                     slots
@@ -690,22 +693,17 @@ def build_daily_equity(
             pl.col("position_count").fill_null(0),
             pl.col("stale_positions").fill_null(0),
         )
-        .with_columns(
-            (pl.col("cash") + pl.col("position_value")).alias("equity")
-        )
+        .with_columns((pl.col("cash") + pl.col("position_value")).alias("equity"))
         .with_columns(
             (
-                pl.col("equity")
-                / pl.col("equity").shift(1).fill_null(initial_cash)
+                pl.col("equity") / pl.col("equity").shift(1).fill_null(initial_cash)
                 - 1.0
             ).alias("daily_return"),
             (pl.col("cash") / pl.col("equity")).alias("cash_ratio"),
         )
     )
     final_date = all_dates[-1]
-    ending_symbols = {
-        row["symbol"] for row in simulation["ending_positions"]
-    }
+    ending_symbols = {row["symbol"] for row in simulation["ending_positions"]}
     final_exact = set(
         quotes.filter(pl.col("date") == pl.lit(final_date))
         .get_column("symbol")
@@ -743,9 +741,7 @@ def account_period_metrics(
             if returns and account_total is not None and account_total > -1.0
             else None
         )
-        market_annual = baseline._annualized(
-            market.get_column("market_net").to_list()
-        )
+        market_annual = baseline._annualized(market.get_column("market_net").to_list())
         yearly = []
         positive_years = 0
         for year in sorted(scoped.get_column("date").dt.year().unique().to_list()):
@@ -781,12 +777,8 @@ def execution_summary(orders: list[dict[str, Any]]) -> dict[str, Any]:
     by_side: dict[str, Any] = {}
     for side in ("BUY", "SELL"):
         side_rows = [row for row in orders if row["side"] == side]
-        pretrade = [
-            row for row in side_rows if row["status"] == "PRETRADE_SKIPPED"
-        ]
-        scoped = [
-            row for row in side_rows if row["status"] != "PRETRADE_SKIPPED"
-        ]
+        pretrade = [row for row in side_rows if row["status"] == "PRETRADE_SKIPPED"]
+        scoped = [row for row in side_rows if row["status"] != "PRETRADE_SKIPPED"]
         filled = sum(row["status"] == "FILLED" for row in scoped)
         reasons = Counter(
             row["reason"] for row in scoped if row.get("reason") is not None
@@ -836,9 +828,7 @@ def worst_weeks(daily: pl.DataFrame) -> list[dict[str, Any]]:
         )
         .sort("date")
         .with_columns(
-            (pl.col("equity") / pl.col("equity").shift(1) - 1.0).alias(
-                "weekly_return"
-            )
+            (pl.col("equity") / pl.col("equity").shift(1) - 1.0).alias("weekly_return")
         )
         .drop_nulls("weekly_return")
         .sort("weekly_return")
@@ -898,9 +888,7 @@ def run_independent_account(
     )
     integrity = {
         **stale,
-        "max_cash_reconciliation_error": simulation[
-            "max_cash_reconciliation_error"
-        ],
+        "max_cash_reconciliation_error": simulation["max_cash_reconciliation_error"],
     }
     return {
         "period": period,
@@ -934,8 +922,7 @@ def evaluate_gate(
         account = independent_accounts[period]
         row = account["metrics"]
         checks = {
-            f"{period}_annualized": (row.get("account_annualized") or -99.0)
-            >= 0.15,
+            f"{period}_annualized": (row.get("account_annualized") or -99.0) >= 0.15,
             f"{period}_excess": (row.get("annualized_excess") or -99.0) >= 0.10,
             f"{period}_positive_years": row.get("positive_account_years", 0) >= 2,
         }
@@ -1008,9 +995,7 @@ def run(data_dir: Path, output: Path, *, end: date | None = None) -> dict[str, A
     execution = execution_summary(simulation["orders"])
     integrity = {
         **stale_integrity,
-        "max_cash_reconciliation_error": simulation[
-            "max_cash_reconciliation_error"
-        ],
+        "max_cash_reconciliation_error": simulation["max_cash_reconciliation_error"],
     }
     continuous_account = {
         "period_metrics": metrics,
