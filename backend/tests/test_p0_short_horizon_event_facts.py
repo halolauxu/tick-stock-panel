@@ -27,6 +27,20 @@ def test_reason_classifier_separates_operating_and_one_time_facts() -> None:
     assert study.classify_reason("预计业绩同比上升") == "UNCLASSIFIED"
     assert study.classify_reason(None) == "MISSING"
 
+    classified = pl.DataFrame({"change_reason": [None, "主营产品销量增长"]}).select(
+        pl.col("change_reason")
+        .map_elements(
+            study.classify_reason,
+            return_dtype=pl.String,
+            skip_nulls=False,
+        )
+        .alias("reason_class")
+    )
+    assert classified.get_column("reason_class").to_list() == [
+        "MISSING",
+        "OPERATING",
+    ]
+
 
 def test_prior_financial_join_never_uses_same_day_or_future_report() -> None:
     events = pl.DataFrame(

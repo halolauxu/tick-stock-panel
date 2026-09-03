@@ -263,7 +263,7 @@ def run(data_dir: Path, output: Path) -> dict[str, Any]:
     events = classified.filter(pl.col("category") == industry.NEGATIVE_CONTROL)
     events = events.with_columns(
         pl.col("change_reason")
-        .map_elements(classify_reason, return_dtype=pl.String)
+        .map_elements(classify_reason, return_dtype=pl.String, skip_nulls=False)
         .alias("reason_class")
     )
 
