@@ -193,6 +193,69 @@ def test_simulator_can_disable_stamp_tax_for_etf_account() -> None:
     assert sell["stamp_tax"] == 0.0
 
 
+def test_forced_rebalance_can_close_and_reopen_same_symbol() -> None:
+    d0, d1 = date(2024, 1, 5), date(2024, 1, 8)
+    d2, d3 = date(2024, 1, 12), date(2024, 1, 15)
+    candidates = _candidates(
+        [(d0, d1, "A.SZ", 1), (d2, d3, "A.SZ", 1)]
+    )
+    execution = pl.DataFrame(
+        [
+            _quote(d1, "A.SZ"),
+            _quote(
+                d3,
+                "A.SZ",
+                raw_open=11.0,
+                close=11.0,
+                limit_up=12.1,
+            ),
+        ]
+    )
+
+    result = account.simulate_account(
+        candidates,
+        execution,
+        initial_cash=30_000.0,
+        target_positions=1,
+        force_rebalance_dates={d3},
+        allow_same_day_reentry=True,
+    )
+
+    assert [(row["date"], row["side"]) for row in result["trades"]] == [
+        (d1, "BUY"),
+        (d3, "SELL"),
+        (d3, "BUY"),
+    ]
+    assert result["ending_positions"][0]["start_date"] == d3
+    assert result["max_cash_reconciliation_error"] == pytest.approx(0.0)
+
+
+def test_cost_multiplier_doubles_modeled_friction() -> None:
+    d0, d1 = date(2024, 1, 5), date(2024, 1, 8)
+    d3 = date(2024, 1, 15)
+    candidates = _candidates([(d0, d1, "A.SZ", 1)])
+    execution = pl.DataFrame([_quote(d1, "A.SZ"), _quote(d3, "A.SZ")])
+
+    result = account.simulate_account(
+        candidates,
+        execution,
+        initial_cash=30_000.0,
+        target_positions=1,
+        action_dates=[d1, d3],
+        cost_multiplier=2.0,
+    )
+
+    buy = next(row for row in result["trades"] if row["side"] == "BUY")
+    sell = next(row for row in result["trades"] if row["side"] == "SELL")
+    assert buy["commission"] == pytest.approx(account.commission(buy["gross"]) * 2)
+    assert buy["slippage"] == pytest.approx(
+        buy["gross"] * account.baseline.SLIPPAGE_PCT * 2
+    )
+    assert sell["stamp_tax"] == pytest.approx(
+        sell["gross"] * account.baseline.STAMP_TAX_CURRENT * 2
+    )
+
+
 def test_exposure_budget_caps_buys_without_forcing_desired_sales() -> None:
     d0, d1 = date(2024, 1, 5), date(2024, 1, 8)
     d2, d3 = date(2024, 1, 12), date(2024, 1, 15)

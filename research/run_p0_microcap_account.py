@@ -39,17 +39,26 @@ def affordable_shares(
     cash: float,
     *,
     lot_size: int = LOT_SIZE,
+    cost_multiplier: float = 1.0,
 ) -> int:
-    if raw_open <= 0 or target <= 0 or cash <= MIN_COMMISSION:
+    if cost_multiplier <= 0:
+        raise ValueError("cost_multiplier must be positive")
+    if raw_open <= 0 or target <= 0 or cash <= MIN_COMMISSION * cost_multiplier:
         return 0
-    budget = min(target, cash - MIN_COMMISSION)
+    budget = min(target, cash - MIN_COMMISSION * cost_multiplier)
     shares = (
-        math.floor(budget / (raw_open * (1.0 + baseline.SLIPPAGE_PCT)) / lot_size)
+        math.floor(
+            budget
+            / (raw_open * (1.0 + baseline.SLIPPAGE_PCT * cost_multiplier))
+            / lot_size
+        )
         * lot_size
     )
     while shares > 0:
         gross = shares * raw_open
-        total = gross * (1.0 + baseline.SLIPPAGE_PCT) + commission(gross)
+        total = gross * (1.0 + baseline.SLIPPAGE_PCT * cost_multiplier) + (
+            commission(gross) * cost_multiplier
+        )
         if total <= cash + 1e-9:
             return shares
         shares -= lot_size
@@ -292,7 +301,12 @@ def simulate_account(
     delist_recovery_per_raw_share: float = 0.0,
     target_exposure_by_date: dict[date, float] | None = None,
     candidate_weight_column: str | None = None,
+    force_rebalance_dates: set[date] | None = None,
+    allow_same_day_reentry: bool = False,
+    cost_multiplier: float = 1.0,
 ) -> dict[str, Any]:
+    if cost_multiplier <= 0:
+        raise ValueError("cost_multiplier must be positive")
     candidate_groups = _partition_rows(candidates, "entry_date")
     quote_groups = _partition_rows(execution_grid, "entry_date")
     positions: dict[str, dict[str, Any]] = {}
@@ -377,9 +391,10 @@ def simulate_account(
         target_gross = pre_open_equity * target_exposure
 
         desired = {row["symbol"] for row in candidate_rows[:target_positions]}
+        force_rebalance = entry_date in (force_rebalance_dates or set())
         sold_today: set[str] = set()
         for symbol in list(positions):
-            if symbol in desired:
+            if symbol in desired and not force_rebalance:
                 continue
             position = positions[symbol]
             quote = quotes.get(symbol)
@@ -396,7 +411,7 @@ def simulate_account(
                 orders.append(order)
                 continue
             gross = position["units"] * float(quote["open"])
-            commission_fee = commission(gross)
+            commission_fee = commission(gross) * cost_multiplier
             effective_stamp_tax = (
                 stamp_tax_rate
                 if stamp_tax_rate is not None
@@ -406,8 +421,8 @@ def simulate_account(
                     else baseline.STAMP_TAX_CURRENT
                 )
             )
-            stamp_tax = gross * effective_stamp_tax
-            slippage = gross * baseline.SLIPPAGE_PCT
+            stamp_tax = gross * effective_stamp_tax * cost_multiplier
+            slippage = gross * baseline.SLIPPAGE_PCT * cost_multiplier
             cash_delta = gross - commission_fee - stamp_tax - slippage
             cash += cash_delta
             cash_ledger += cash_delta
@@ -453,7 +468,9 @@ def simulate_account(
             ):
                 break
             symbol = candidate["symbol"]
-            if symbol in positions or symbol in sold_today:
+            if symbol in positions or (
+                symbol in sold_today and not allow_same_day_reentry
+            ):
                 continue
             if candidate_weight_column is not None:
                 candidate_weight = float(candidate.get(candidate_weight_column) or 0.0)
@@ -497,7 +514,11 @@ def simulate_account(
                 float(quote["raw_open"]) if quote and quote.get("raw_open") else 0.0
             )
             shares = affordable_shares(
-                raw_open, candidate_target, cash, lot_size=lot_size
+                raw_open,
+                candidate_target,
+                cash,
+                lot_size=lot_size,
+                cost_multiplier=cost_multiplier,
             )
             gross = shares * raw_open
             if (
@@ -539,8 +560,8 @@ def simulate_account(
             if reason:
                 orders.append(order)
                 continue
-            commission_fee = commission(gross)
-            slippage = gross * baseline.SLIPPAGE_PCT
+            commission_fee = commission(gross) * cost_multiplier
+            slippage = gross * baseline.SLIPPAGE_PCT * cost_multiplier
             cash_delta = -(gross + commission_fee + slippage)
             cash += cash_delta
             cash_ledger += cash_delta
