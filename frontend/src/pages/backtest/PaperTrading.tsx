@@ -133,6 +133,12 @@ function clockTime(value: string | null | undefined) {
   })
 }
 
+function orderSizeLabel(order: PaperTradingAccount['orders'][number]) {
+  if (order.requested_qty > 0) return `${order.requested_qty.toLocaleString()} 股`
+  if (order.target_amount > 0) return `目标 ¥ ${money(order.target_amount)} · 开盘定量`
+  return '等待开盘定量'
+}
+
 function NumericField({
   label, value, onChange, min, max, step, suffix,
 }: {
@@ -253,7 +259,7 @@ function EventTimeline({ account, events }: { account: PaperTradingAccount; even
       badge: `${pendingOrders.length} 笔`,
       icon: ListChecks,
       tone: 'border-accent/35 bg-accent/10 text-accent',
-      rows: pendingOrders.map(order => `${order.name || order.symbol} · ${order.side === 'BUY' ? '买入' : '卖出'} ${order.requested_qty.toLocaleString()} 股`),
+      rows: pendingOrders.map(order => `${order.name || order.symbol} · ${order.side === 'BUY' ? '买入' : '卖出'} · ${orderSizeLabel(order)}`),
     })
   }
 
@@ -793,7 +799,7 @@ export function PaperTrading() {
                   return <tr key={order.id} className="border-t border-border align-top">
                     <td className="px-3 py-2"><div className="font-medium text-foreground">{order.name || order.symbol}</div><div className="font-mono text-[10px] text-muted">{order.symbol} · {order.side}</div></td>
                     <td className="px-3 py-2 text-right"><div>{order.signal_date}</div><div className="text-[10px] text-muted">{order.planned_session === 'NEXT_OPEN' ? '下一交易日开盘' : '下一有效行情'}</div></td>
-                    <td className="px-3 py-2 text-right num"><div>{order.filled_qty} / {order.requested_qty}</div><div className="text-[10px] text-muted">评分 {order.score?.toFixed(2) ?? '—'}</div></td>
+                    <td className="px-3 py-2 text-right num"><div>{order.requested_qty > 0 ? `${order.filled_qty} / ${order.requested_qty}` : '待开盘定量'}</div><div className="text-[10px] text-muted">{order.requested_qty > 0 ? `评分 ${order.score?.toFixed(2) ?? '—'}` : `目标 ¥ ${money(order.target_amount)}`}</div></td>
                     <td className="max-w-[24rem] px-3 py-2 text-right"><div className={order.status.includes('FAILED') || order.status.includes('MISSED') || order.status.includes('UNKNOWN') ? 'text-red-400' : order.status.startsWith('REJECTED') ? 'text-amber-400' : order.status === 'FILLED' ? 'text-emerald-400' : 'text-accent'}>{STATUS_LABELS[order.status] ?? order.status}</div><div className="text-[10px] text-muted">{order.execution_quality ? `${QUALITY_LABELS[order.execution_quality] ?? order.execution_quality} · ${order.execution_quality}` : '尚未执行'}</div><div className="mt-1 text-[9px] leading-3 text-muted">{lifecycle}</div></td>
                     <td className="max-w-[22rem] px-3 py-2 text-right text-[11px] leading-4 text-secondary">{order.reason}</td>
                   </tr>
