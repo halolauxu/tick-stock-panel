@@ -142,8 +142,9 @@ def managed_strategy_snapshot(
     """Return product-facing provenance and live state for the managed account.
 
     The managed portfolio intentionally does not implement ``StrategyDef``.
-    Exposing it through a separate read model keeps ordinary screen/backtest
-    execution from accidentally running a materially different contract.
+    Exposing it through a separate read model keeps ordinary screening and
+    monitoring from running a materially different contract; Backtest uses a
+    dedicated account-level adapter for the verified frozen evidence.
     """
     current = now or cn_now()
     data_dir = paper_service.repo.store.data_dir

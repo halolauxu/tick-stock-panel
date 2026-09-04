@@ -307,6 +307,7 @@ def list_strategies(
     request: Request,
     asset_type: str | None = None,
     timeframe: str | None = None,
+    context: Literal["standard", "backtest"] = "standard",
 ):
     engine = _get_engine(request)
     data_dir = _data_dir(request)
@@ -324,11 +325,25 @@ def list_strategies(
         s = engine.get(sid)
         overrides = all_overrides.get(sid)
         result.append(_strategy_detail(s, overrides, engine))
+    if (
+        context == "backtest"
+        and (asset_type in {None, "stock"})
+        and (timeframe in {None, "1d"})
+    ):
+        from app.services.risk_admitted_forecast_backtest import strategy_detail
+
+        result.append(strategy_detail(data_dir))
     return {"strategies": result, "load_errors": engine.load_errors()}
 
 
 @router.get("/{strategy_id}")
 def get_strategy(strategy_id: str, request: Request):
+    from app.services.risk_admitted_forecast_paper import STRATEGY_ID as MANAGED_STRATEGY_ID
+
+    if strategy_id == MANAGED_STRATEGY_ID:
+        from app.services.risk_admitted_forecast_backtest import strategy_detail
+
+        return strategy_detail(_data_dir(request))
     engine = _get_engine(request)
     s = _get_public_strategy(engine, strategy_id)
     overrides = strategy_config.load_override(_data_dir(request), strategy_id)

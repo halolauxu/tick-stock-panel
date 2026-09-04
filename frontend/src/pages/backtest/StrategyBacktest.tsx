@@ -941,11 +941,11 @@ export function StrategyBacktest() {
   const { data: caps } = useCapabilities()
   const hasMinuteBatch = !!caps?.capabilities?.['kline.minute.batch']
   const toggleMinutePriceFill = () => {
-    if (!hasMinuteBatch) return
+    if (!hasMinuteBatch || strategyDetail.data?.immutable_contract) return
     setMinutePriceFill(value => !value)
   }
   const toggleMinuteExitTrigger = () => {
-    if (!hasMinuteBatch || !minuteExitTriggerSupported) return
+    if (!hasMinuteBatch || !minuteExitTriggerSupported || strategyDetail.data?.immutable_contract) return
     setMinuteExitTrigger(value => !value)
   }
   const [rangeSettingsOpen, setRangeSettingsOpen] = useState(false)
@@ -966,8 +966,8 @@ export function StrategyBacktest() {
   const loadedStrategyRef = useRef<string | null>(null)
 
   const strategies = useQuery({
-    queryKey: QK.screenerStrategies(assetType),
-    queryFn: () => api.screenerStrategies(assetType),
+    queryKey: QK.backtestStrategies(assetType),
+    queryFn: () => api.backtestStrategies(assetType),
   })
   const strategyList = useMemo(() => strategies.data?.presets ?? [], [strategies.data])
   const filteredStrategyList = useMemo(() => (
@@ -1058,6 +1058,31 @@ export function StrategyBacktest() {
     const configKey = `${assetType}:${detail.id}:${configSignature}`
     if (loadedStrategyRef.current === configKey) return
     loadedStrategyRef.current = configKey
+    if (detail.immutable_contract && detail.backtest_defaults) {
+      setSymbols('')
+      setStart(detail.backtest_defaults.start)
+      setEnd(detail.backtest_defaults.end)
+      setEntryFill('open_t+1')
+      setExitFill('open_t+1')
+      setFees('2')
+      setStampTax('0.5')
+      setSlippage('5')
+      setMaxPositions('20')
+      setMaxExposure('100')
+      setInitialCapital('200000')
+      setPositionSizing('equal')
+      setSimMode('position')
+      setHoldingDays('10')
+      setMinutePriceFill(false)
+      setMinuteExitTrigger(false)
+      setRegimeStates([])
+      setRegimeMinScore('')
+      setStrategyParams({})
+      setOverrides({})
+      setRangeSettingsOpen(false)
+      setConfigLoadedKey(configKey)
+      return
+    }
     const storedConfig = storage.strategyBacktestConfigs.get({})[
       strategyBacktestStorageKey(assetType, detail.id)
     ]
@@ -1147,7 +1172,7 @@ export function StrategyBacktest() {
   }, [backtestTask])
 
   const handleRun = () => {
-    if (!selectedStrategy || backtestDataUnavailable) return
+    if (!selectedStrategy || effectiveBacktestDataUnavailable) return
     const requestOverrides = detail
       ? normalizeStrategyOverrides(detail, overrides)
       : overrides
@@ -1252,7 +1277,10 @@ export function StrategyBacktest() {
     : end === TODAY && start === monthsAgo(quickRangeMonths(range))
   )
   const rangeKey = matchedQuickRange?.id ?? 'custom'
-  const rangeTitle = matchedQuickRange ? quickRangeTitle(matchedQuickRange) : '自定义区间'
+  const frozenPeriodTitle = strategyDetail.data?.backtest_periods?.find(
+    period => period.start === start && period.end === end,
+  )?.label
+  const rangeTitle = frozenPeriodTitle ?? (matchedQuickRange ? quickRangeTitle(matchedQuickRange) : '自定义区间')
   const rangeButtonCls = (key: string) => `rounded-btn px-2 py-1 text-[11px] font-medium transition-colors ${rangeKey === key
     ? 'bg-accent/15 text-accent'
     : 'text-muted hover:bg-elevated/70 hover:text-secondary'
@@ -1322,6 +1350,7 @@ export function StrategyBacktest() {
   }, [result?.trades])
 
   const detail = strategyDetail.data
+  const isFrozenPortfolio = detail?.execution_backend === 'frozen_portfolio'
   const matrixStrategy = detail?.execution_backend === 'matrix_native'
   const compositeStrategy = detail?.source === 'composite'
   const visibleAdvancedTabs = useMemo(
@@ -1381,7 +1410,9 @@ export function StrategyBacktest() {
       : scoreMaxValue !== ''
         ? `评分 ≤${scoreMaxValue}`
         : '评分不过滤'
-  const advancedSummary = detail
+  const advancedSummary = isFrozenPortfolio
+    ? '冻结账户规则 · 20槽位 · 微盘5%/事件20% · 次日开盘 · 历史税率'
+    : detail
     ? [
         detail.params.length > 0 ? `参数 ${detail.params.length}` : '无策略参数',
         basicFilter.enabled !== false ? '过滤开' : '过滤关',
@@ -1398,7 +1429,10 @@ export function StrategyBacktest() {
   const selectedStrategyName = detail?.name ?? strategyList.find(st => st.id === selectedStrategy)?.name ?? '未选择策略'
   const selectedStrategySource = detail?.source ?? strategyList.find(st => st.id === selectedStrategy)?.source
   const stockPoolCount = symbols.split(',').map(s => s.trim()).filter(Boolean).length
-  const stockPoolSummary = stockPoolCount > 0 ? `股票池 已限定 ${stockPoolCount} 只` : '股票池 全市场'
+  const stockPoolSummary = isFrozenPortfolio
+    ? '股票池 沪深主板全市场（冻结）'
+    : stockPoolCount > 0 ? `股票池 已限定 ${stockPoolCount} 只` : '股票池 全市场'
+  const effectiveBacktestDataUnavailable = backtestDataUnavailable && !isFrozenPortfolio
   const resultStartDate = result?.config?.start ?? result?.equity_curve?.[0]?.date ?? start
   const resultEndDate = result?.config?.end ?? result?.equity_curve?.[result.equity_curve.length - 1]?.date ?? end
   const resultTradeDays = result?.equity_curve?.length ?? 0
@@ -1472,10 +1506,10 @@ export function StrategyBacktest() {
                 <button
                   type="button"
                   onClick={toggleMinutePriceFill}
-                  disabled={!hasMinuteBatch}
-                  title={!hasMinuteBatch ? '分钟K(批量)数据不可用' : '用首分钟开盘或末分钟收盘作为成交价'}
+                  disabled={!hasMinuteBatch || isFrozenPortfolio}
+                  title={isFrozenPortfolio ? '冻结账户回测不使用分钟成交价' : !hasMinuteBatch ? '分钟K(批量)数据不可用' : '用首分钟开盘或末分钟收盘作为成交价'}
                   className={`group relative inline-flex h-3.5 w-6 items-center rounded-full shrink-0 transition-colors duration-200 ${
-                    !hasMinuteBatch ? 'bg-elevated opacity-50 cursor-not-allowed'
+                    !hasMinuteBatch || isFrozenPortfolio ? 'bg-elevated opacity-50 cursor-not-allowed'
                     : minutePriceFill ? 'bg-amber-500 cursor-pointer'
                     : 'bg-elevated cursor-pointer'
                   }`}
@@ -1491,10 +1525,10 @@ export function StrategyBacktest() {
                 <button
                   type="button"
                   onClick={toggleMinuteExitTrigger}
-                  disabled={!hasMinuteBatch || !minuteExitTriggerSupported}
-                  title={!minuteExitTriggerSupported ? '当前卖出信号不支持分钟触发回放' : '分钟收盘确认卖点，下一分钟开盘卖出'}
+                  disabled={!hasMinuteBatch || !minuteExitTriggerSupported || isFrozenPortfolio}
+                  title={isFrozenPortfolio ? '冻结账户回测不使用分钟卖点' : !minuteExitTriggerSupported ? '当前卖出信号不支持分钟触发回放' : '分钟收盘确认卖点，下一分钟开盘卖出'}
                   className={`group relative inline-flex h-3.5 w-6 items-center rounded-full shrink-0 transition-colors duration-200 ${
-                    !hasMinuteBatch || !minuteExitTriggerSupported ? 'bg-elevated opacity-50 cursor-not-allowed'
+                    !hasMinuteBatch || !minuteExitTriggerSupported || isFrozenPortfolio ? 'bg-elevated opacity-50 cursor-not-allowed'
                     : minuteExitTrigger ? 'bg-accent cursor-pointer'
                     : 'bg-elevated cursor-pointer'
                   }`}
@@ -1572,13 +1606,13 @@ export function StrategyBacktest() {
         <button
           type="button"
           onClick={() => detail && setSettingsOpen(true)}
-          disabled={!detail || strategyDetail.isLoading}
+          disabled={!detail || strategyDetail.isLoading || isFrozenPortfolio}
           className="group w-full rounded-btn border border-border bg-surface px-3 py-2.5 text-left transition-colors hover:border-accent/40 hover:bg-elevated/70 disabled:cursor-not-allowed disabled:opacity-55"
         >
           <span className="flex items-center gap-2 text-xs font-semibold text-foreground">
             <SlidersHorizontal className="h-3.5 w-3.5 text-accent" />
-            策略设置
-            <span className="ml-auto text-[10px] font-normal text-muted group-hover:text-accent">编辑</span>
+            {isFrozenPortfolio ? '冻结合同' : '策略设置'}
+            <span className="ml-auto text-[10px] font-normal text-muted group-hover:text-accent">{isFrozenPortfolio ? '只读' : '编辑'}</span>
           </span>
           <span className="mt-1 flex min-w-0 items-center gap-1.5 text-[11px] font-medium text-secondary">
             <span className="truncate">{selectedStrategyName}</span>
@@ -1628,6 +1662,24 @@ export function StrategyBacktest() {
             </div>
           </div>
 
+          {isFrozenPortfolio ? (
+            <div className="mt-2 grid grid-cols-2 gap-1 rounded-input bg-base/60 p-0.5">
+              {(detail?.backtest_periods ?? []).map(period => (
+                <button
+                  key={period.id}
+                  type="button"
+                  onClick={() => { setStart(period.start); setEnd(period.end) }}
+                  className={`rounded-btn px-2 py-1 text-[10px] font-medium transition-colors ${
+                    start === period.start && end === period.end
+                      ? 'bg-accent/15 text-accent'
+                      : 'text-muted hover:bg-elevated/70 hover:text-secondary'
+                  }`}
+                >
+                  {period.label}
+                </button>
+              ))}
+            </div>
+          ) : <>
           <div className="mt-2 flex items-center gap-1">
             <div className="flex min-w-0 flex-1 rounded-input bg-base/60 p-0.5">
               {visibleQuickRanges.map(range => (
@@ -1700,8 +1752,19 @@ export function StrategyBacktest() {
               </div>
             </div>
           )}
+          </>}
         </div>
 
+        {isFrozenPortfolio ? (
+          <div className="rounded-btn border border-accent/30 bg-accent/5 px-3 py-2.5 text-[10px] leading-4 text-secondary">
+            <div className="font-medium text-accent">账户规则已冻结，普通策略参数不会覆盖</div>
+            <div className="mt-1">20 个槽位；微盘每只 5%；业绩预告事件每只 20%、最多 5 只；事件持有 10 个交易日。</div>
+            <div>买卖均按下一交易日开盘，100 股整数手，佣金 2‱、5‱滑点、印花税按成交日历史税率。</div>
+            <div className={`mt-1 ${detail?.artifact_verified ? 'text-success' : 'text-danger'}`}>
+              {detail?.artifact_verified ? '冻结证据哈希校验通过' : '冻结证据缺失或校验失败，运行会被拒绝'}
+            </div>
+          </div>
+        ) : <>
         <div className="grid grid-cols-2 gap-2">
           <div>
             <div className="mb-1.5 flex items-center gap-1">
@@ -1795,8 +1858,9 @@ export function StrategyBacktest() {
           <span className="font-medium text-foreground">全量模拟</span>：每日将策略选出的全部候选独立买入，不受资金/最大持仓数限制；每一笔仍按策略卖点、止损、移动止盈/止损和最长持仓执行，用于评估策略本身的选股 + 交易规则质量。
         </div>
         )}
+        </>}
 
-        {backtestDataUnavailable && (
+        {effectiveBacktestDataUnavailable && (
           <div className="flex items-start gap-1.5 rounded-btn border border-danger/30 bg-danger/10 px-3 py-2 text-[11px] leading-4 text-danger">
             <AlertTriangle className="mt-0.5 h-3 w-3 shrink-0" />
             <span>缺少{backtestDataLabel}，请先在数据页面同步日K并完成指标计算。</span>
@@ -1816,7 +1880,7 @@ export function StrategyBacktest() {
         ) : (
           <button
             onClick={handleRun}
-            disabled={!selectedStrategy || strategyDetail.isLoading || backtestDataUnavailable}
+            disabled={!selectedStrategy || strategyDetail.isLoading || effectiveBacktestDataUnavailable}
             className="group w-full inline-flex items-center justify-center gap-2.5 rounded-btn border border-accent/40
               bg-gradient-to-r from-accent to-blue-500 px-3 py-2.5 text-white shadow-[0_10px_24px_rgba(59,130,246,0.22)]
               transition-all duration-150 ease-smooth hover:-translate-y-0.5 hover:shadow-[0_14px_28px_rgba(59,130,246,0.28)]
@@ -1834,6 +1898,11 @@ export function StrategyBacktest() {
       <section className="min-w-0 space-y-3 bg-base/15 px-3 py-3 xl:overflow-y-auto">
         {/* 模式切换: 仓位模拟 / 全量模拟 */}
         <div className="flex items-center justify-between gap-2">
+          {isFrozenPortfolio ? (
+            <div className="inline-flex rounded-btn border border-accent/30 bg-accent/10 px-3 py-1.5 text-xs font-medium text-accent">
+              冻结账户回测
+            </div>
+          ) : (
           <div className="inline-flex rounded-btn border border-border bg-surface/80 p-0.5 shadow-sm">
             {([['position', '仓位模拟'], ['full', '全量模拟']] as const).map(([val, label]) => (
               <button
@@ -1851,6 +1920,7 @@ export function StrategyBacktest() {
               </button>
             ))}
           </div>
+          )}
           <div className="flex items-center gap-2">
             {simMode === 'full' && (
               maxHoldDaysValue !== '' ? (
@@ -1893,7 +1963,7 @@ export function StrategyBacktest() {
         </div>
 
         {/* 市场环境过滤: 只在指定环境的交易日入场(强制 T-1, 用前一日环境判定) */}
-        <div className="rounded-btn border border-border bg-surface/50 px-3 py-2 space-y-1.5">
+        {!isFrozenPortfolio && <div className="rounded-btn border border-border bg-surface/50 px-3 py-2 space-y-1.5">
           <div className="flex items-center gap-2">
             <Gauge className="h-3.5 w-3.5 text-accent" />
             <span className="text-xs font-medium text-foreground">环境过滤</span>
@@ -1924,7 +1994,7 @@ export function StrategyBacktest() {
                 className="text-[10px] text-muted hover:text-danger px-1">清除</button>
             )}
           </div>
-        </div>
+        </div>}
 
         {result?.error && (
           <div className="text-sm text-danger bg-danger/10 border border-danger/30 rounded-btn px-3 py-2">

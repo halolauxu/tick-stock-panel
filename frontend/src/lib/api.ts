@@ -643,7 +643,7 @@ export interface StrategyDetail {
   description: string
   tags: string[]
   source: 'builtin' | 'custom' | 'ai' | 'composite'
-  execution_backend: 'polars_expr' | 'matrix_native' | 'python_history_legacy' | 'composite'
+  execution_backend: 'polars_expr' | 'matrix_native' | 'python_history_legacy' | 'composite' | 'frozen_portfolio'
   asset_types: string[]
   timeframes: string[]
   version: string
@@ -667,6 +667,23 @@ export interface StrategyDetail {
   limit: number
   // 叠加策略(composite)专属: 子策略列表与合并模式。非 composite 时为 null。
   composite_children?: CompositeChildInfo[] | null
+  immutable_contract?: boolean
+  artifact_verified?: boolean
+  backtest_defaults?: { start: string; end: string }
+  backtest_periods?: { id: string; label: string; start: string; end: string }[]
+  locked_contract?: {
+    initial_capital: number
+    total_slots: number
+    microcap_weight: number
+    event_weight: number
+    max_event_positions: number
+    event_lifetime_days: number
+    entry_fill: string
+    exit_fill: string
+    commission_pct: number
+    stamp_tax: string
+    slippage_bps: number
+  }
 }
 
 export type ScoringDirection = 'high' | 'low'
@@ -2927,6 +2944,12 @@ export const api = {
   screenerStrategies: async (assetType?: 'stock' | 'etf' | 'index') => {
     const data = await request<{ strategies: StrategyDetail[]; load_errors?: StrategyLoadError[] }>(
       `/api/strategies?${assetType ? `asset_type=${assetType}&` : ''}timeframe=1d`,
+    )
+    return { presets: data.strategies, load_errors: data.load_errors }
+  },
+  backtestStrategies: async (assetType?: 'stock' | 'etf') => {
+    const data = await request<{ strategies: StrategyDetail[]; load_errors?: StrategyLoadError[] }>(
+      `/api/strategies?${assetType ? `asset_type=${assetType}&` : ''}timeframe=1d&context=backtest`,
     )
     return { presets: data.strategies, load_errors: data.load_errors }
   },

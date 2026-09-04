@@ -1013,6 +1013,57 @@ class StrategyBacktestService:
                 elapsed_ms=(time.perf_counter() - t0) * 1000,
             )
 
+        # The frozen micro-cap + forecast portfolio is an account-level
+        # strategy, not a StrategyDef-compatible stock selector.  Dispatch it
+        # to its dedicated adapter before touching the generic registry so the
+        # original strategy/screener/monitor semantics remain unchanged.
+        from app.services.risk_admitted_forecast_paper import (
+            STRATEGY_ID as MANAGED_STRATEGY_ID,
+        )
+
+        if config.strategy_id == MANAGED_STRATEGY_ID:
+            if prepared is not None:
+                return _err("冻结账户组合不支持共享普通策略矩阵")
+            try:
+                from app.services.risk_admitted_forecast_backtest import (
+                    run_artifact_backtest,
+                )
+
+                data_dir = self.engine.repo.store.data_dir
+                payload = run_artifact_backtest(
+                    data_dir,
+                    start=config.start,
+                    end=config.end,
+                    progress_cb=progress_cb,
+                    cancel_event=cancel_event,
+                )
+            except (OSError, ValueError, json.JSONDecodeError) as exc:
+                return _err(str(exc))
+            return StrategyBacktestResult(
+                run_id=run_id,
+                config=payload["config"],
+                stats=result_policy.select_stats(payload["stats"]),
+                equity_curve=payload["equity_curve"] if result_policy.include_curves else [],
+                drawdown_curve=payload["drawdown_curve"] if result_policy.include_curves else [],
+                benchmark_curve=(
+                    payload["benchmark_curve"]
+                    if result_policy.include_benchmark
+                    else []
+                ),
+                trades=payload["trades"] if result_policy.include_trades else [],
+                open_positions=payload["open_positions"] if result_policy.include_trades else [],
+                pending_orders=payload["pending_orders"] if result_policy.include_trades else [],
+                per_symbol_stats=(
+                    payload["per_symbol_stats"]
+                    if result_policy.include_per_symbol_stats
+                    else []
+                ),
+                strategy_info=(
+                    payload["strategy_info"] if result_policy.include_strategy_info else {}
+                ),
+                elapsed_ms=round((time.perf_counter() - t0) * 1000, 1),
+            )
+
         # 获取策略定义
         try:
             s = self.strategy_engine.get(config.strategy_id)

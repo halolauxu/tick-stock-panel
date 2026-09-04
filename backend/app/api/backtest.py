@@ -62,6 +62,12 @@ def _guard_server_backtest_range(start: date, end: date):
         raise HTTPException(status_code=400, detail=BACKTEST_SERVER_GUARD_MESSAGE)
 
 
+def _uses_frozen_portfolio_artifact(strategy_id: str) -> bool:
+    from app.services.risk_admitted_forecast_paper import STRATEGY_ID
+
+    return strategy_id == STRATEGY_ID
+
+
 def _minute_backtest_preflight_error(
     request: Request,
     start: date,
@@ -395,7 +401,8 @@ def strategy_run(req: StrategyBacktestRequest, request: Request):
 
     end = req.end or date.today()
     start = _resolve_start(req, end, FACTOR_DEFAULT_DAYS)
-    _guard_server_backtest_range(start, end)
+    if not _uses_frozen_portfolio_artifact(req.strategy_id):
+        _guard_server_backtest_range(start, end)
     uses_minute_data = (
         (req.minute_price_fill if req.minute_price_fill is not None else req.minute_fill)
         or (
@@ -617,7 +624,7 @@ async def strategy_stream(
 
     # 服务端范围保护
     guard_violated = False
-    if settings.backtest_range_guard:
+    if settings.backtest_range_guard and not _uses_frozen_portfolio_artifact(strategy_id):
         days = (end_date - start_date).days + 1
         if days > BACKTEST_MAX_SERVER_DAYS:
             guard_violated = True
