@@ -997,6 +997,19 @@ def _minute_time_segments(
     return segments
 
 
+def _minute_segment_label(
+    start_time: datetime | None,
+    end_time: datetime | None,
+) -> str:
+    """Format an inclusive trading-date range from an exclusive end boundary."""
+    if not start_time or not end_time:
+        return "最新"
+    display_end = end_time
+    if end_time > start_time and end_time.time() == datetime.min.time():
+        display_end = end_time - timedelta(microseconds=1)
+    return f"{start_time:%Y-%m-%d}~{display_end:%Y-%m-%d}"
+
+
 def _resolve_minute_provider(
     provider_name: str,
 ) -> tuple[object | None, bool, str | None]:
@@ -1208,10 +1221,7 @@ def sync_minute_batch(
     if on_segment is not None and not provider_fallback and callable(stream_minute):
         total_steps = len(time_segments) * len(symbols)
         for seg_idx, (cur_start, cur_end) in enumerate(time_segments):
-            seg_label = (
-                f"{cur_start.strftime('%Y-%m-%d')}~{cur_end.strftime('%Y-%m-%d')}"
-                if cur_start and cur_end else "最新"
-            )
+            seg_label = _minute_segment_label(cur_start, cur_end)
             offset = seg_idx * len(symbols)
 
             def _stream_progress(

@@ -716,7 +716,7 @@ def run_now(
     }
     minute_readiness: dict[str, object] | None = None
     if minute_on and capset.has(Cap.KLINE_MINUTE_BATCH):
-        minute_start = today - _td(days=minute_days)
+        minute_start = today if target_date is not None else today - _td(days=minute_days)
         minute_symbols = _resolve_minute_symbols(capset, repo)
         emit("sync_minute", 92, f"探测 {today} 分钟K是否已发布…")
         minute_readiness = kline_sync.probe_configured_minute_day(minute_symbols, today)

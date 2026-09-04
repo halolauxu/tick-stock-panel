@@ -177,3 +177,10 @@ def test_minute_progress_labels_non_symbol_work_as_provider_requests():
         5_553,
         "2026-08-24~2026-08-27",
     ) == "数据源请求 3/56 · 日期范围 2026-08-24~2026-08-27"
+
+
+def test_minute_segment_label_hides_exclusive_next_midnight():
+    assert kline_sync._minute_segment_label(
+        datetime(2026, 9, 3),
+        datetime(2026, 9, 4),
+    ) == "2026-09-03~2026-09-03"
