@@ -2,7 +2,6 @@ import { useState } from 'react'
 import { Navigate, useSearchParams } from 'react-router-dom'
 import { BarChart3, BookmarkCheck, FlaskConical, ShieldCheck } from 'lucide-react'
 import { PageHeader } from '@/components/PageHeader'
-import { ManagedForwardStrategyPanel } from '@/components/ManagedForwardStrategyPanel'
 import { FactorDiscovery } from './backtest/FactorDiscovery'
 import { ResearchCandidatesDialog } from './backtest/ResearchCandidatesDialog'
 import { RobustnessValidation } from './backtest/RobustnessValidation'
@@ -103,12 +102,7 @@ export function Backtest() {
 
       <main className="min-h-0 flex-1 px-3 pb-3 pt-3 lg:px-4 lg:pb-4">
         {activeTab === 'factor' && <FactorDiscovery />}
-        {activeTab === 'strategy' && (
-          <div className="flex min-h-[44rem] flex-col gap-3">
-            <ManagedForwardStrategyPanel view="backtest" />
-            <div className="min-h-0 flex-1"><StrategyBacktest /></div>
-          </div>
-        )}
+        {activeTab === 'strategy' && <StrategyBacktest />}
         {activeTab === 'robustness' && <RobustnessValidation />}
       </main>
 
