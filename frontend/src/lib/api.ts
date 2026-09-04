@@ -2009,6 +2009,68 @@ export interface PaperTradingReconciliation {
   checked_at: string
 }
 
+export interface ManagedForwardStrategyPeriod {
+  id: 'validation' | 'known_stress'
+  label: string
+  annualized: number
+  total_return: number
+  max_drawdown: number
+  yearly: number[]
+}
+
+export interface ManagedForwardStrategy {
+  id: string
+  name: string
+  version: string
+  kind: 'managed_forward'
+  source: 'frozen_research'
+  account_id: string
+  description: string
+  provenance: {
+    created_by: string
+    introduced_commit: string
+    frozen_at: string
+    research_result_sha256: string
+    artifact_verified: boolean
+    note: string
+  }
+  contract: {
+    initial_capital: number
+    observation_trading_days: number
+    total_slots: number
+    microcap_weight: number
+    event_weight: number
+    max_event_positions: number
+    event_lifetime_days: number
+    rebalance: string
+    execution: string
+  }
+  historical_results: ManagedForwardStrategyPeriod[]
+  live: {
+    account_exists: boolean
+    account_status: 'active' | 'paused' | null
+    lifecycle: {
+      code: 'NOT_STARTED' | 'PAUSED' | 'BLOCKED' | 'WAITING_PIPELINE' | 'DATA_DELAYED' | 'INPUT_DELAYED' | 'WAITING_SEAL' | 'WAITING_OPEN' | 'SEALED_NO_ORDER' | 'OBSERVING'
+      label: string
+      detail: string
+      next_action: string
+      stage: 'data' | 'signal' | 'execution' | 'observe' | 'blocked'
+    }
+    pipeline_schedule: string
+    latest_enriched_date: string | null
+    forecast_covered_through: string | null
+    last_signal_date: string | null
+    last_settlement_date: string | null
+    signal_count: number
+    order_count: number
+    fill_count: number
+    position_count: number
+    pending_order_count: number
+    open_incident_count: number
+    observed_settlement_days: number
+  }
+}
+
 export interface PaperTradingAccount {
   schema_version: number
   id: string
@@ -3266,6 +3328,9 @@ export const api = {
 
   paperAccounts: () =>
     request<{ items: PaperTradingAccount[]; system: PaperTradingSystem }>('/api/paper-trading/accounts'),
+
+  paperManagedStrategies: () =>
+    request<{ items: ManagedForwardStrategy[] }>('/api/paper-trading/managed-strategies'),
 
   paperAccountCreate: (payload: PaperTradingConfig & { name: string }) =>
     request<PaperTradingAccount>('/api/paper-trading/accounts', {

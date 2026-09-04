@@ -75,6 +75,7 @@ export const QK = {
   alphaRun:             (id: string) => ['alpha-mining-run', id] as const,
   alphaResult:          (id: string) => ['alpha-mining-result', id] as const,
   researchCandidates:  ['research-candidates'] as const,
+  managedForwardStrategies: ['managed-forward-strategies'] as const,
   strategyLinkOptions: (assetType?: 'stock' | 'etf') => assetType
     ? ['strategy-link-options', assetType] as const
     : ['strategy-link-options'] as const,

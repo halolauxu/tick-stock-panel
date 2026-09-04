@@ -175,6 +175,33 @@ def test_account_is_persisted_in_transactional_ledger(tmp_path):
     assert loaded["timeline"][0]["event_type"] == "ACCOUNT_CREATED"
 
 
+def test_signal_close_requests_date_for_repository_cache_reconciliation(tmp_path):
+    requested: list[str] = []
+
+    class DateAwareRepo(FakeRepo):
+        def get_daily_asset(
+            self,
+            _asset_type: str,
+            _symbol: str,
+            _start: date,
+            _end: date,
+            columns: list[str],
+        ) -> pl.DataFrame:
+            requested.extend(columns)
+            if "date" not in columns:
+                raise pl.exceptions.ColumnNotFoundError("date")
+            return pl.DataFrame({
+                "date": [SIGNAL_DAY],
+                "raw_close": [10.25],
+                "close": [10.25],
+            })
+
+    service = PaperTradingService(SimpleNamespace(repo=DateAwareRepo(tmp_path)))
+
+    assert service._signal_close("stock", "000001.SZ", SIGNAL_DAY) == 10.25
+    assert requested == ["date", "raw_close", "close"]
+
+
 def test_capital_contribution_updates_budget_and_cash_ledger_idempotently(tmp_path):
     ledger = PaperLedger(tmp_path)
     account = ledger.create_account(
@@ -1542,6 +1569,24 @@ def test_delete_account_api_targets_route_account_id(tmp_path):
     with pytest.raises(paper_api.HTTPException) as exc:
         paper_api.delete_account(first["id"], request)
     assert exc.value.status_code == 404
+
+
+def test_managed_strategy_api_uses_dedicated_read_model(monkeypatch, tmp_path):
+    from app.services import risk_admitted_forecast_paper as managed
+
+    state = SimpleNamespace(repo=FakeRepo(tmp_path))
+    request = SimpleNamespace(app=SimpleNamespace(state=state))
+    monkeypatch.setattr(
+        managed,
+        "managed_strategy_snapshot",
+        lambda _service: {"id": managed.STRATEGY_ID, "kind": "managed_forward"},
+    )
+
+    result = paper_api.managed_strategies(request)
+
+    assert result == {
+        "items": [{"id": managed.STRATEGY_ID, "kind": "managed_forward"}],
+    }
 
 
 def test_create_account_api_freezes_exit_mode_without_running_backtest(monkeypatch, tmp_path):

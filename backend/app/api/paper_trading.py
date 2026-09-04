@@ -185,6 +185,17 @@ def paper_trading_status(request: Request) -> dict:
     return _service(request).system_status()
 
 
+@router.get("/managed-strategies")
+def managed_strategies(request: Request) -> dict:
+    """Expose dedicated forward portfolios without registering fake StrategyDefs."""
+    try:
+        from app.services.risk_admitted_forecast_paper import managed_strategy_snapshot
+
+        return {"items": [managed_strategy_snapshot(_service(request))]}
+    except Exception as exc:
+        _raise_store_error(exc)
+
+
 @router.post("/accounts/{account_id}/reconcile")
 def reconcile_account(account_id: str, request: Request) -> dict:
     try:

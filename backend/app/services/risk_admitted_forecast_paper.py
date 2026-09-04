@@ -13,12 +13,15 @@ import json
 import math
 import os
 import tempfile
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
+from datetime import time as dt_time
+from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
 import polars as pl
 
+from app.market_time import cn_now
 from app.price_limits import (
     polars_is_risk_warning_name,
     polars_limit_price,
@@ -46,6 +49,25 @@ THRESHOLDS = {
     "microcap_liquidity_5d_60d_p10": 0.6401950242931338,
     "microcap_limit_down_3d_p95": 0.06341463414634146,
 }
+FORWARD_OBSERVATION_DAYS = 60
+HISTORICAL_RESULTS = (
+    {
+        "id": "validation",
+        "label": "2021–2023 独立验证",
+        "annualized": 0.4341,
+        "total_return": 1.8295,
+        "max_drawdown": -0.2080,
+        "yearly": (0.4598, 0.3695, 0.4153),
+    },
+    {
+        "id": "known_stress",
+        "label": "2024–2026-08 压力期",
+        "annualized": 0.3218,
+        "total_return": 1.0402,
+        "max_drawdown": -0.3262,
+        "yearly": (0.2314, 0.6296, 0.0167),
+    },
+)
 
 
 def ensure_account(paper_service, baseline_date: date) -> dict[str, Any]:
@@ -110,6 +132,234 @@ def ensure_account(paper_service, baseline_date: date) -> dict[str, Any]:
 
 def is_managed_account(config: dict[str, Any]) -> bool:
     return config.get("strategy_id") == STRATEGY_ID
+
+
+def managed_strategy_snapshot(
+    paper_service,
+    *,
+    now: datetime | None = None,
+) -> dict[str, Any]:
+    """Return product-facing provenance and live state for the managed account.
+
+    The managed portfolio intentionally does not implement ``StrategyDef``.
+    Exposing it through a separate read model keeps ordinary screen/backtest
+    execution from accidentally running a materially different contract.
+    """
+    current = now or cn_now()
+    data_dir = paper_service.repo.store.data_dir
+    result_path = data_dir / "research" / RESULT_FILE
+    artifact_verified = _artifact_verified(result_path)
+    try:
+        account = paper_service.ledger.get_account(ACCOUNT_ID)
+    except KeyError:
+        account = None
+
+    latest_enriched = paper_service.repo.latest_enriched_date("stock")
+    receipt = _read_json(data_dir / "event_data" / "forecast" / "sync_status.json")
+    forecast_covered = _as_date(receipt.get("end_date")) if receipt else None
+    try:
+        state = _load_state(_state_path(data_dir)) or {}
+    except (OSError, ValueError, json.JSONDecodeError):
+        state = {}
+    last_signal = _as_date(
+        (account or {}).get("last_processed_date") or state.get("last_signal_date")
+    )
+    schedule = _pipeline_schedule()
+    lifecycle = _managed_lifecycle(
+        account=account,
+        now=current,
+        schedule=schedule,
+        latest_enriched=latest_enriched,
+        forecast_covered=forecast_covered,
+        last_signal=last_signal,
+    )
+    nav = (account or {}).get("nav") or []
+    last_settlement = _as_date(nav[-1].get("trading_date")) if nav else None
+    summary = (account or {}).get("summary") or {}
+    return {
+        "id": STRATEGY_ID,
+        "name": ACCOUNT_NAME.removesuffix("（前向）"),
+        "version": "V1",
+        "kind": "managed_forward",
+        "source": "frozen_research",
+        "account_id": ACCOUNT_ID,
+        "description": (
+            "沪深主板微盘周调仓为底仓；微盘风险关闭时，使用公司特异性正向业绩预告"
+            "替换部分微盘暴露。"
+        ),
+        "provenance": {
+            "created_by": "自动研究部署",
+            "introduced_commit": "1f2ef35",
+            "frozen_at": "2026-09-03",
+            "research_result_sha256": RESULT_SHA256,
+            "artifact_verified": artifact_verified,
+            "note": "V1 独立前向观察账户；不代表主板短周期 V2 路线通过。",
+        },
+        "contract": {
+            "initial_capital": INITIAL_CAPITAL,
+            "observation_trading_days": FORWARD_OBSERVATION_DAYS,
+            "total_slots": TOTAL_SLOTS,
+            "microcap_weight": MICROCAP_WEIGHT,
+            "event_weight": EVENT_WEIGHT,
+            "max_event_positions": MAX_EVENT_POSITIONS,
+            "event_lifetime_days": EVENT_LIFETIME,
+            "rebalance": "每周五盘后",
+            "execution": "下一交易日开盘 · T+1 · 100股整数手 · 含费用/滑点/容量约束",
+        },
+        "historical_results": [
+            {**row, "yearly": list(row["yearly"])} for row in HISTORICAL_RESULTS
+        ],
+        "live": {
+            "account_exists": account is not None,
+            "account_status": (account or {}).get("status"),
+            "lifecycle": lifecycle,
+            "pipeline_schedule": f"{schedule['hour']:02d}:{schedule['minute']:02d}",
+            "latest_enriched_date": _date_text(latest_enriched),
+            "forecast_covered_through": _date_text(forecast_covered),
+            "last_signal_date": _date_text(last_signal),
+            "last_settlement_date": _date_text(last_settlement),
+            "signal_count": len((account or {}).get("signals") or []),
+            "order_count": len((account or {}).get("orders") or []),
+            "fill_count": len((account or {}).get("fills") or []),
+            "position_count": int(summary.get("position_count") or 0),
+            "pending_order_count": int(summary.get("pending_order_count") or 0),
+            "open_incident_count": int(summary.get("open_incident_count") or 0),
+            "observed_settlement_days": len(nav),
+        },
+    }
+
+
+def _managed_lifecycle(
+    *,
+    account: dict[str, Any] | None,
+    now: datetime,
+    schedule: dict[str, int],
+    latest_enriched: date | None,
+    forecast_covered: date | None,
+    last_signal: date | None,
+) -> dict[str, Any]:
+    code = "WAITING_PIPELINE"
+    label = "等待盘后数据"
+    detail = "盘后数据完成后自动生成当日不可变目标。"
+    next_action = f"{schedule['hour']:02d}:{schedule['minute']:02d} 自动同步并封板"
+    stage = "data"
+
+    if account is None:
+        code, label = "NOT_STARTED", "前向账户尚未创建"
+        detail = "冻结研究文件校验通过后，服务启动会自动创建账户。"
+        next_action = "核对冻结研究文件并创建账户"
+    elif account.get("status") != "active":
+        code, label = "PAUSED", "账户已暂停"
+        detail = "暂停期间不会生成新信号或订单。"
+        next_action = "恢复账户后继续按真实时钟运行"
+    else:
+        open_incidents = [
+            row for row in (account.get("incidents") or []) if row.get("status") == "open"
+        ]
+        pending_orders = [
+            row
+            for row in (account.get("orders") or [])
+            if row.get("status") in {"PLANNED", "PREFLIGHT_OK"}
+        ]
+        if open_incidents:
+            code, label = "BLOCKED", "存在阻断异常"
+            detail = str(open_incidents[0].get("detail") or open_incidents[0].get("title"))
+            next_action = "先处理异常，系统不会制造成交"
+            stage = "blocked"
+        elif pending_orders:
+            code, label = "WAITING_OPEN", "等待下一交易日开盘"
+            scheduled = next(
+                (str(row.get("scheduled_date")) for row in pending_orders if row.get("scheduled_date")),
+                "下一交易日",
+            )
+            detail = f"{len(pending_orders)} 笔订单已经冻结，等待盘前校验和真实开盘行情。"
+            next_action = f"{scheduled} 09:25 校验，09:30 执行"
+            stage = "execution"
+        elif latest_enriched is None:
+            code, label = "WAITING_PIPELINE", "等待首个完整数据日"
+            detail = "尚无可用于策略判定的完整 Enriched 数据。"
+        elif (
+            now.weekday() < 5
+            and latest_enriched < now.date()
+            and now.time() >= dt_time(schedule["hour"], schedule["minute"])
+        ):
+            code, label = "DATA_DELAYED", "盘后数据同步中或延期"
+            detail = f"完整数据仍停留在 {_date_text(latest_enriched)}。"
+            next_action = "等待自动补偿重试；数据完整后自动封板"
+        elif now.weekday() < 5 and latest_enriched < now.date():
+            code, label = "WAITING_PIPELINE", "等待今日盘后数据"
+            detail = f"最近完整数据为 {_date_text(latest_enriched)}，今天尚未到盘后同步时间。"
+        elif forecast_covered is None or forecast_covered < latest_enriched:
+            code, label = "INPUT_DELAYED", "业绩预告输入未齐"
+            detail = (
+                f"业绩预告覆盖到 {_date_text(forecast_covered)}，"
+                f"落后完整行情 {_date_text(latest_enriched)}。"
+            )
+            next_action = "等待业绩预告自动补采；输入未齐不会生成信号"
+        elif last_signal is None or last_signal < latest_enriched:
+            code, label = "WAITING_SEAL", "数据已齐，等待信号封板"
+            detail = f"{_date_text(latest_enriched)} 输入已完整，尚未写入不可变目标。"
+            next_action = "自动生成目标并写入审计账本"
+            stage = "signal"
+        else:
+            fills = account.get("fills") or []
+            positions = account.get("positions") or []
+            code = "OBSERVING" if fills or positions else "SEALED_NO_ORDER"
+            label = "前向观察中" if code == "OBSERVING" else "本轮信号已封板"
+            detail = (
+                "真实成交、持仓和结算正在持续记录。"
+                if code == "OBSERVING"
+                else f"{_date_text(last_signal)} 已完成判定，本轮没有待执行订单。"
+            )
+            next_action = "继续记录下一真实交易日" if code == "OBSERVING" else "等待下一盘后信号"
+            stage = "observe"
+
+    return {
+        "code": code,
+        "label": label,
+        "detail": detail,
+        "next_action": next_action,
+        "stage": stage,
+    }
+
+
+def _pipeline_schedule() -> dict[str, int]:
+    from app.services import preferences
+
+    return preferences.get_pipeline_schedule()
+
+
+def _read_json(path: Path) -> dict[str, Any] | None:
+    if not path.is_file():
+        return None
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def _artifact_verified(path: Path) -> bool:
+    if not path.is_file():
+        return False
+    try:
+        stat = path.stat()
+        return _cached_artifact_sha256(str(path), stat.st_mtime_ns, stat.st_size) == RESULT_SHA256
+    except OSError:
+        return False
+
+
+@lru_cache(maxsize=4)
+def _cached_artifact_sha256(path: str, _mtime_ns: int, _size: int) -> str:
+    digest = hashlib.sha256()
+    with Path(path).open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _date_text(value: date | None) -> str | None:
+    return value.isoformat() if value is not None else None
 
 
 def seal_account(paper_service, account_id: str, signal_date: date) -> dict[str, int]:

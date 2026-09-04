@@ -24,6 +24,7 @@ import { StrategyBuilderDialog } from '@/components/screener/StrategyBuilderDial
 import { StrategyStoreDialog } from '@/components/screener/StrategyStoreDialog'
 import { CompositeStrategyDialog } from '@/components/screener/CompositeStrategyDialog'
 import { ListColumnCustomizer } from '@/components/ListColumnCustomizer'
+import { ManagedForwardStrategyPanel } from '@/components/ManagedForwardStrategyPanel'
 import { useTableSort } from '@/components/stock-table/useTableSort'
 import { resolveCandleConfig } from '@/lib/list-columns'
 import {
@@ -738,6 +739,8 @@ export function Screener() {
       />
 
       <div className="px-8 py-4 space-y-3">
+        {assetType === 'stock' && <ManagedForwardStrategyPanel view="strategy" />}
+
         {/* 策略卡片 */}
         {cardSize !== 'hidden' && (
         <section>

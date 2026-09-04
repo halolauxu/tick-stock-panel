@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useState } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
+import { useSearchParams } from 'react-router-dom'
 import {
   AlertTriangle,
   BriefcaseBusiness,
@@ -23,6 +24,7 @@ import {
 } from 'lucide-react'
 
 import { EmptyState } from '@/components/EmptyState'
+import { ManagedForwardAccountPanel } from '@/components/ManagedForwardStrategyPanel'
 import { Modal } from '@/components/Modal'
 import { toast } from '@/components/Toast'
 import { fmtPct, priceColorClass } from '@/lib/format'
@@ -31,6 +33,7 @@ import {
   type PaperTradingAccount,
   type PaperTradingConfig,
   type PaperTradingEvent,
+  type ManagedForwardStrategy,
   type StrategyDetail,
   type StrategyParamDef,
 } from '@/lib/api'
@@ -91,6 +94,8 @@ const QUALITY_LABELS: Record<string, string> = {
 
 const EVENT_ICONS: Record<string, typeof Clock3> = {
   ACCOUNT_CREATED: WalletCards,
+  FORWARD_CONTRACT_FROZEN: FileClock,
+  FORWARD_TARGETS_FROZEN: FileClock,
   SIGNAL_FROZEN: FileClock,
   SIGNAL_SKIPPED: AlertTriangle,
   ORDER_PLANNED: ListChecks,
@@ -224,7 +229,9 @@ function EventTimeline({ account, events }: { account: PaperTradingAccount; even
   const nextOpenOnly = pendingOrders.length > 0 && pendingOrders.every(order => order.planned_session === 'NEXT_OPEN')
   const fillFees = todayFills.reduce((sum, fill) => sum + fill.fee_amount, 0)
   const skippedSignals = events.filter(event => event.event_type === 'SIGNAL_SKIPPED')
-  const signalSeal = events.find(event => event.event_type === 'SIGNAL_SEAL_COMPLETED')
+  const signalSeal = events.find(event => (
+    event.event_type === 'SIGNAL_SEAL_COMPLETED' || event.event_type === 'FORWARD_TARGETS_FROZEN'
+  ))
 
   const moments: {
     id: string
@@ -269,9 +276,9 @@ function EventTimeline({ account, events }: { account: PaperTradingAccount; even
       at: signalSeal.occurred_at,
       title: signalSeal.title,
       detail: signalSeal.detail,
-      badge: `${Number(signalSeal.payload.final_candidates ?? 0)} 只候选`,
+      badge: `${Number(signalSeal.payload.final_candidates ?? signalSeal.payload.target_count ?? 0)} 只候选`,
       icon: FileClock,
-      tone: Number(signalSeal.payload.final_candidates ?? 0) > 0
+      tone: Number(signalSeal.payload.final_candidates ?? signalSeal.payload.target_count ?? 0) > 0
         ? 'border-accent/35 bg-accent/10 text-accent'
         : 'border-border bg-elevated/50 text-secondary',
     })
@@ -395,7 +402,8 @@ function EventTimeline({ account, events }: { account: PaperTradingAccount; even
 
 export function PaperTrading() {
   const queryClient = useQueryClient()
-  const [selectedAccountId, setSelectedAccountId] = useState<string | null>(null)
+  const [searchParams, setSearchParams] = useSearchParams()
+  const [selectedAccountId, setSelectedAccountId] = useState<string | null>(() => searchParams.get('account'))
   const [opsTab, setOpsTab] = useState<OpsTab>('positions')
   const [drawerOpen, setDrawerOpen] = useState(false)
   const [deleteTarget, setDeleteTarget] = useState<PaperTradingAccount | null>(null)
@@ -422,6 +430,30 @@ export function PaperTrading() {
   const accountItems = useMemo(() => accounts.data?.items ?? [], [accounts.data])
   const account = accountItems.find(item => item.id === selectedAccountId) ?? accountItems[0] ?? null
   const system = accounts.data?.system ?? account?.system
+  const managedStrategies = useQuery({
+    queryKey: QK.managedForwardStrategies,
+    queryFn: api.paperManagedStrategies,
+    refetchInterval: 10_000,
+  })
+  const managedStrategy = (managedStrategies.data?.items ?? []).find(
+    (item: ManagedForwardStrategy) => item.account_id === account?.id,
+  )
+  const trackedByAccount = useMemo(() => {
+    if (!account) return 0
+    const symbols = new Set(account.positions.map(item => item.symbol))
+    account.orders
+      .filter(item => ['PLANNED', 'PREFLIGHT_OK'].includes(item.status))
+      .forEach(item => symbols.add(item.symbol))
+    return symbols.size
+  }, [account])
+
+  const selectAccount = (id: string | null) => {
+    setSelectedAccountId(id)
+    const next = new URLSearchParams(searchParams)
+    if (id) next.set('account', id)
+    else next.delete('account')
+    setSearchParams(next, { replace: true })
+  }
 
   const strategies = useQuery({
     queryKey: QK.screenerStrategies(assetType),
@@ -440,10 +472,12 @@ export function PaperTrading() {
   const detail = strategyDetail.data as StrategyDetail | undefined
 
   useEffect(() => {
-    if (!selectedAccountId && accountItems[0]) setSelectedAccountId(accountItems[0].id)
+    if (!selectedAccountId && accountItems[0]) selectAccount(accountItems[0].id)
     if (selectedAccountId && accountItems.length && !accountItems.some(item => item.id === selectedAccountId)) {
-      setSelectedAccountId(accountItems[0].id)
+      selectAccount(accountItems[0].id)
     }
+    // `searchParams` is intentionally not a dependency: account-list changes own this synchronization.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [accountItems, selectedAccountId])
 
   useEffect(() => {
@@ -455,7 +489,7 @@ export function PaperTrading() {
 
   const refresh = async (id?: string) => {
     await queryClient.invalidateQueries({ queryKey: QK.paperAccounts })
-    if (id) setSelectedAccountId(id)
+    if (id) selectAccount(id)
   }
 
   const createAccount = useMutation({
@@ -537,7 +571,7 @@ export function PaperTrading() {
     onSuccess: async deleted => {
       const next = accountItems.find(item => item.id !== deleted.id)
       setDeleteTarget(null)
-      setSelectedAccountId(next?.id ?? null)
+      selectAccount(next?.id ?? null)
       await refresh(next?.id)
       toast(`已从运营界面移除「${deleted.name}」，审计账本保留`, 'success')
     },
@@ -590,7 +624,7 @@ export function PaperTrading() {
           </div>
           <div>
             <div className="text-[10px] uppercase tracking-wide text-muted">订阅范围</div>
-            <div className="mt-0.5 text-xs text-secondary">{system?.tracked_symbol_count ?? 0} 个订单 / 持仓标的</div>
+            <div className="mt-0.5 text-xs text-secondary">{trackedByAccount} 当前账户 · {system?.tracked_symbol_count ?? 0} 全部账户</div>
           </div>
           <button
             type="button"
@@ -626,7 +660,7 @@ export function PaperTrading() {
               <button
                 key={item.id}
                 type="button"
-                onClick={() => setSelectedAccountId(item.id)}
+                onClick={() => selectAccount(item.id)}
                 className={`shrink-0 rounded-btn border px-3 py-1.5 text-xs ${account?.id === item.id ? 'border-accent bg-accent/15 text-accent' : 'border-border bg-base text-secondary'}`}
               >
                 <span className={`mr-1.5 inline-block h-1.5 w-1.5 rounded-full ${item.status === 'active' ? 'bg-emerald-400' : 'bg-muted'}`} />
@@ -654,6 +688,7 @@ export function PaperTrading() {
                   <h2 className="text-base font-semibold text-foreground">{account.name}</h2>
                   <span className={`rounded border px-1.5 py-0.5 text-[10px] ${account.status === 'active' ? 'border-emerald-400/30 bg-emerald-400/10 text-emerald-400' : 'border-border bg-elevated text-muted'}`}>{account.status === 'active' ? '事件时钟运行中' : '已暂停'}</span>
                   <span className="rounded bg-elevated px-1.5 py-0.5 text-[10px] text-secondary">{account.config.exit_mode === 'intraday' ? '盘中风险模式' : '盘后退出模式'}</span>
+                  {managedStrategy && <span className="rounded bg-accent/10 px-1.5 py-0.5 text-[10px] text-accent">专用前向研究 · {managedStrategy.version}</span>}
                 </div>
                 <div className="mt-1 text-[10px] text-muted">
                   {account.config.strategy_name ?? account.config.strategy_id} · 信号起始 {account.signal_start_date} · 最近封板 {account.last_processed_date ?? '尚未封板'}
@@ -669,12 +704,16 @@ export function PaperTrading() {
                 <button type="button" onClick={() => reconcileAccount.mutate(account.id)} className="inline-flex h-8 items-center gap-1.5 rounded-btn border border-border px-2.5 text-xs text-secondary">
                   <ShieldCheck className="h-3.5 w-3.5" />三账对账
                 </button>
-                <button type="button" onClick={() => setDeleteTarget(account)} className="inline-flex h-8 items-center gap-1.5 rounded-btn border border-red-500/30 bg-red-500/5 px-2.5 text-xs text-red-400">
-                  <Trash2 className="h-3.5 w-3.5" />删除此账户
-                </button>
+                {!managedStrategy && (
+                  <button type="button" onClick={() => setDeleteTarget(account)} className="inline-flex h-8 items-center gap-1.5 rounded-btn border border-red-500/30 bg-red-500/5 px-2.5 text-xs text-red-400">
+                    <Trash2 className="h-3.5 w-3.5" />删除此账户
+                  </button>
+                )}
               </div>
             </div>
           </section>
+
+          {managedStrategy && <ManagedForwardAccountPanel strategy={managedStrategy} />}
 
           {openIncidents.length > 0 && (
             <section className="rounded-card border border-amber-400/35 bg-amber-400/5 px-3 py-2.5">

@@ -279,7 +279,9 @@ class PaperTradingService:
             symbol,
             signal_date,
             signal_date,
-            ["raw_close", "close"],
+            # Repository cache reconciliation always needs ``date`` even when
+            # the consumer only reads prices from the returned row.
+            ["date", "raw_close", "close"],
         )
         if frame.is_empty():
             return None
