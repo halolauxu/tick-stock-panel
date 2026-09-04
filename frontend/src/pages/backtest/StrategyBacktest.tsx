@@ -42,6 +42,7 @@ const monthsAgo = (months: number) => {
 }
 const TODAY = formatDate(new Date())
 const THREE_MONTHS_AGO = monthsAgo(3)
+const FROZEN_PORTFOLIO_ID = 'risk_admitted_idiosyncratic_forecast_v1'
 
 type QuickRangeUnit = 'month' | 'year' | 'all'
 type QuickRangeConfig = { id: string; enabled: boolean; unit: QuickRangeUnit; value: number }
@@ -912,6 +913,11 @@ export function StrategyBacktest() {
   const [assetType, setAssetType] = useState<'stock' | 'etf'>(saved?.assetType ?? 'stock')
   const [start, setStart] = useState(saved?.start ?? THREE_MONTHS_AGO)
   const [end, setEnd] = useState(saved?.end ?? TODAY)
+  const ordinaryRangeRef = useRef({
+    start: saved?.selectedStrategy === FROZEN_PORTFOLIO_ID ? THREE_MONTHS_AGO : (saved?.start ?? THREE_MONTHS_AGO),
+    end: saved?.selectedStrategy === FROZEN_PORTFOLIO_ID ? TODAY : (saved?.end ?? TODAY),
+  })
+  const previousStrategyRef = useRef<string | null>(selectedStrategy)
   // 成交口径: 建仓/清仓可独立配置。向后兼容老 matching (派生为 entry=exit=matching)。
   const [matching] = useState<'close_t' | 'open_t+1'>(saved?.matching ?? 'open_t+1')
   const [entryFill, setEntryFill] = useState<'close_t' | 'open_t+1'>(saved?.entryFill ?? saved?.matching ?? 'open_t+1')
@@ -994,6 +1000,21 @@ export function StrategyBacktest() {
     enabled: !!selectedStrategy,
   })
 
+  // 冻结组合有自己固定的证据窗口，但不能把该窗口写进普通策略的共享回测状态。
+  // 进入时保存普通策略区间，离开时原样恢复；资金、费率、持仓等普通控件从不改动。
+  useEffect(() => {
+    const previous = previousStrategyRef.current
+    if (previous !== FROZEN_PORTFOLIO_ID && selectedStrategy === FROZEN_PORTFOLIO_ID) {
+      ordinaryRangeRef.current = { start, end }
+    } else if (previous === FROZEN_PORTFOLIO_ID && selectedStrategy !== FROZEN_PORTFOLIO_ID) {
+      setStart(ordinaryRangeRef.current.start)
+      setEnd(ordinaryRangeRef.current.end)
+    }
+    previousStrategyRef.current = selectedStrategy
+    // 只响应策略切换；start/end 是切换瞬间需要保存的当前值。
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [selectedStrategy])
+
   const backtestTask = useBacktestTask()
   const isPending = backtestTask?.isPending ?? false
   const backtestProgressTotal = backtestTask?.progress?.total ?? 0
@@ -1059,24 +1080,8 @@ export function StrategyBacktest() {
     if (loadedStrategyRef.current === configKey) return
     loadedStrategyRef.current = configKey
     if (detail.immutable_contract && detail.backtest_defaults) {
-      setSymbols('')
       setStart(detail.backtest_defaults.start)
       setEnd(detail.backtest_defaults.end)
-      setEntryFill('open_t+1')
-      setExitFill('open_t+1')
-      setFees('2')
-      setStampTax('0.5')
-      setSlippage('5')
-      setMaxPositions('20')
-      setMaxExposure('100')
-      setInitialCapital('200000')
-      setPositionSizing('equal')
-      setSimMode('position')
-      setHoldingDays('10')
-      setMinutePriceFill(false)
-      setMinuteExitTrigger(false)
-      setRegimeStates([])
-      setRegimeMinScore('')
       setStrategyParams({})
       setOverrides({})
       setRangeSettingsOpen(false)
