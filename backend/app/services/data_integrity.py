@@ -397,7 +397,8 @@ def launch_integrity_repair(app_state, start_date: date, reason: str) -> tuple[s
     - (id, False)    : 已有 pending/running 任务复用 (singleflight)
     - (id, True)     : 新建并启动
     任务体与 /api/kline/repair_daily 完全一致: run slot + 实时 paused 互斥 +
-    run_repair_daily(override_start_date)。
+    run_repair_daily(override_start_date, end_date=start_date)。完整性门禁每次只
+    修复已确认的缺口日，不把次日盘中行情写进补偿范围；其余缺口由后续扫描续补。
 
     调度自适应: 调用方在事件循环内 (API 端点) → executor 后台执行;
     无事件循环 (boot Timer 线程) → 独立 daemon 线程执行。
@@ -440,8 +441,20 @@ def launch_integrity_repair(app_state, start_date: date, reason: str) -> tuple[s
         # 修复期间暂停实时取数, 防止覆写同一批 parquet 竞态
         if qs:
             with qs.paused():
-                return run_repair_daily(repo, capset, start_date, on_progress=progress)
-        return run_repair_daily(repo, capset, start_date, on_progress=progress)
+                return run_repair_daily(
+                    repo,
+                    capset,
+                    start_date,
+                    end_date=start_date,
+                    on_progress=progress,
+                )
+        return run_repair_daily(
+            repo,
+            capset,
+            start_date,
+            end_date=start_date,
+            on_progress=progress,
+        )
 
     def _execute() -> None:
         try:

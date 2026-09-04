@@ -34,23 +34,40 @@ def run_repair_daily(
     """修正 / 补全数据 — 复用盘后管道,日期范围由用户指定。
 
     通过 run_now(override_start_date=start_date) 把日K/除权/指数的拉取起点
-    统一设为 start_date (到今天),其余流程与盘后管道完全一致。
+    统一设为 start_date。end_date 为空时修到今天；自动完整性修复传入固定
+    end_date，避免次日盘中把尚未收盘的当天混入补偿范围。
 
     Args:
         repo:        数据仓库
         capset:      权限集
         start_date:  用户选定的起始日期
-        end_date:    保留参数(目前盘后管道固定拉到今天, 此值未使用, 为接口兼容保留)
+        end_date:    可选固定截止日；为空时截止今天
         on_progress: 进度回调
 
     Returns:
         run_now() 的完整结果 dict。
     """
-    today = date.today()
+    from app.market_time import cn_now
+
+    today = cn_now().date()
     if start_date > today:
         return {"error": "起始日期不能晚于今天"}
+    if end_date is not None and end_date < start_date:
+        return {"error": "结束日期不能早于起始日期"}
+    if end_date is not None and end_date > today:
+        return {"error": "结束日期不能晚于今天"}
 
-    logger.info("repair_daily: run pipeline with override_start_date=%s", start_date)
+    logger.info(
+        "repair_daily: run pipeline with range=%s~%s",
+        start_date,
+        end_date or today,
+    )
 
     from app.jobs.daily_pipeline import run_now
-    return run_now(repo, capset, on_progress=on_progress, override_start_date=start_date)
+    return run_now(
+        repo,
+        capset,
+        on_progress=on_progress,
+        override_start_date=start_date,
+        target_date=end_date,
+    )
