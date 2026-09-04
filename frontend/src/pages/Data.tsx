@@ -97,7 +97,7 @@ export function Data() {
     },
     refetchInterval: (q: any) => {
       const j = q.state.data
-      return j && (j.status === 'succeeded' || j.status === 'failed') ? false : 1_000
+      return j && ['succeeded', 'deferred', 'failed'].includes(j.status) ? false : 1_000
     },
   })
 
@@ -281,7 +281,7 @@ export function Data() {
   void cardVisibleTick
 
   useEffect(() => {
-    if (job.data && (job.data.status === 'succeeded' || job.data.status === 'failed')) {
+    if (job.data && ['succeeded', 'deferred', 'failed'].includes(job.data.status)) {
       qc.invalidateQueries({ queryKey: QK.dataStatus })
       qc.invalidateQueries({ queryKey: QK.pipelineJobs })
       // 同步任务结束后 regime 覆盖范围可能变化, 一并刷新画像
@@ -289,7 +289,7 @@ export function Data() {
       // 同步重写了指数日K/enriched/日K → 失效消费这些数据的查询。
       // 侧边栏指数查询挂在 Layout 常驻不重挂载 (refetchOnWindowFocus 已关),
       // 不失效会一直显示同步前的旧值; 自选相关查询在页面正打开时同理。
-      if (job.data.status === 'succeeded') {
+      if (job.data.status === 'succeeded' || job.data.status === 'deferred') {
         qc.invalidateQueries({ queryKey: QK.indexQuotes })
         qc.invalidateQueries({ queryKey: ['index-daily'] })
         qc.invalidateQueries({ queryKey: ['watchlist-enriched'] })

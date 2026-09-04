@@ -19,6 +19,7 @@ from app.services.data_integrity import (
     _quote_ts_max_ms,
     earliest_issue_day,
     latest_complete_partition_date,
+    partition_is_complete,
     prune_corrupt_raw_partitions,
     prune_enriched_partitions,
     scan_recent_integrity,
@@ -150,6 +151,16 @@ def test_low_coverage_enriched_partition_falls_back_to_previous_complete_day(tmp
     assert latest_complete_partition_date(
         tmp_path, "kline_daily_enriched",
     ) == FRIDAY
+
+
+def test_exact_target_completeness_is_not_hidden_by_a_later_partition(tmp_path):
+    full_symbols = tuple(f"{i:06d}.SH" for i in range(200))
+    _write_daily_partition(tmp_path, "kline_daily", THURSDAY, None, full_symbols[:5])
+    _write_daily_partition(tmp_path, "kline_daily", FRIDAY, None, full_symbols)
+
+    assert latest_complete_partition_date(tmp_path, "kline_daily") == FRIDAY
+    assert partition_is_complete(tmp_path, "kline_daily", THURSDAY) is False
+    assert partition_is_complete(tmp_path, "kline_daily", FRIDAY) is True
 
 
 def test_data_card_excludes_trailing_low_coverage_partition_from_day_count(tmp_path):

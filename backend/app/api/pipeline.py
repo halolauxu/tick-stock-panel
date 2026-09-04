@@ -14,6 +14,7 @@ from app.api.data import invalidate_storage_cache
 from app.jobs import daily_pipeline
 from app.services.pipeline_jobs import (
     JobCancelledError,
+    has_deferred_stages,
     job_store,
     release_run_slot,
     try_acquire_run_slot,
@@ -69,27 +70,46 @@ async def run_now(request: Request) -> dict:
                 job_store.progress(job_id, stage, pct, msg, stage_pct=stage_pct, skip_log=skip_log)
 
             def _run() -> dict:
+                retry_target = daily_pipeline._oldest_deferred_target()
                 if qs:
                     with qs.paused():
-                        return daily_pipeline.run_now(repo, capset, on_progress=progress)
-                return daily_pipeline.run_now(repo, capset, on_progress=progress)
+                        return daily_pipeline.run_now(
+                            repo,
+                            capset,
+                            on_progress=progress,
+                            override_start_date=retry_target,
+                            target_date=retry_target,
+                        )
+                return daily_pipeline.run_now(
+                    repo,
+                    capset,
+                    on_progress=progress,
+                    override_start_date=retry_target,
+                    target_date=retry_target,
+                )
 
             result = await loop.run_in_executor(_long_task_executor, _run)
             job_store.succeed(job_id, result)
             invalidate_storage_cache()
             repo.refresh_cache()  # 刷新 Polars 缓存
             # 数据与内存视图均完成后再推进模拟账户; 失败与数据任务隔离, 次日可重试。
-            try:
-                from app.services.paper_trading import run_active_accounts
+            if not has_deferred_stages(result):
+                try:
+                    from app.services.paper_trading import run_active_accounts
 
-                summary = await loop.run_in_executor(
-                    _long_task_executor,
-                    run_active_accounts,
-                    request.app.state,
+                    summary = await loop.run_in_executor(
+                        _long_task_executor,
+                        run_active_accounts,
+                        request.app.state,
+                    )
+                    logger.info("manual pipeline paper trading result: %s", summary)
+                except Exception:
+                    logger.exception("manual pipeline paper trading failed; data job remains succeeded")
+            else:
+                logger.warning(
+                    "manual pipeline deferred; paper trading skipped: %s",
+                    result.get("deferred_stages"),
                 )
-                logger.info("manual pipeline paper trading result: %s", summary)
-            except Exception:
-                logger.exception("manual pipeline paper trading failed; data job remains succeeded")
         except JobCancelledError:
             # 已被 reap/手动取消终止: job 状态已由 terminate() 写为 failed,
             # 拉取线程在分块回调处自行退出, 这里无需(也无法)再写状态。

@@ -79,6 +79,50 @@ def test_recent_year_window_falls_back_to_full_calendar_range(monkeypatch, tmp_p
     )
 
 
+def test_targeted_minute_retry_never_expands_end_date_to_today(monkeypatch, tmp_path):
+    """补偿任务按原交易日执行，不能在次日盘中混入尚未收盘的分钟线。"""
+    repo = _Repo(tmp_path, [date(2026, 9, 3)])
+    captured = {}
+
+    monkeypatch.setattr(kline_sync.preferences, "get_minute_data_provider", lambda: "mock")
+    monkeypatch.setattr(kline_sync, "_resolve_minute_provider", lambda _name: (object(), False, None))
+    monkeypatch.setattr(kline_sync, "_cleanup_null_datetime_minute", lambda _repo: None)
+    monkeypatch.setattr(kline_sync, "_migrate_symbol_to_date_partition", lambda _repo: None)
+    monkeypatch.setattr(
+        kline_sync,
+        "_minute_missing_window",
+        lambda _repo, start, end: (
+            captured.update({"target_start": start, "target_end": end})
+            or (datetime(2026, 9, 3), datetime(2026, 9, 4))
+        ),
+    )
+    monkeypatch.setattr(
+        kline_sync,
+        "resolve_limit",
+        lambda *_args, **_kwargs: SimpleNamespace(batch=100, rpm=60),
+    )
+    monkeypatch.setattr(kline_sync.preferences, "get_minute_sync_segment_days", lambda: 20)
+
+    def fake_sync(_symbols, *, start_time, end_time, **_kwargs):
+        captured.update({"fetch_start": start_time, "fetch_end": end_time})
+        return None
+
+    monkeypatch.setattr(kline_sync, "sync_minute_batch", fake_sync)
+
+    written = kline_sync.sync_and_persist_minute(
+        ["600000.SH"],
+        repo,
+        SimpleNamespace(has=lambda _cap: False),
+        target_start_date=date(2026, 9, 3),
+        target_end_date=date(2026, 9, 3),
+    )
+
+    assert written == 0
+    assert captured["target_start"] == date(2026, 9, 3)
+    assert captured["target_end"] == date(2026, 9, 3)
+    assert captured["fetch_end"] == datetime(2026, 9, 4)
+
+
 def test_manual_minute_sync_rejects_unrelated_active_job(monkeypatch):
     request = SimpleNamespace(
         app=SimpleNamespace(

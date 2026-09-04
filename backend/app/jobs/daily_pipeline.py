@@ -17,6 +17,7 @@ from __future__ import annotations
 import logging
 from collections.abc import Callable
 from datetime import date as dt_date
+from datetime import datetime as dt_datetime
 from datetime import time as dt_time
 from pathlib import Path
 
@@ -27,7 +28,7 @@ from apscheduler.triggers.interval import IntervalTrigger
 
 from app.config import settings
 from app.indicators.pipeline import run_pipeline
-from app.market_time import cn_now, is_possible_cn_equity_session
+from app.market_time import CN_TZ, cn_now, is_possible_cn_equity_session
 from app.services import index_sync, instrument_sync, kline_sync
 from app.services import preferences as _prefs
 from app.tickflow.capabilities import Cap, CapabilitySet
@@ -118,6 +119,7 @@ def run_now(
     capset: CapabilitySet,
     on_progress: ProgressCb | None = None,
     override_start_date: dt_date | None = None,
+    target_date: dt_date | None = None,
 ) -> dict:
     """立即执行一次盘后管道,支持进度回调。
 
@@ -126,6 +128,8 @@ def run_now(
 
     override_start_date: 传入时强制走 batch 拉取分支,用该日期作为日K/除权/指数的
         拉取起点(到今天),用于「数据修正/补数据」场景。None 时走原有自动判定逻辑。
+    target_date: 补偿任务的固定截止交易日。None 表示当前北京日期；传入后所有
+        发布探测和数据区间均止于该日，避免次日盘中混入未收盘数据。
     """
     emit = on_progress or _noop
     skipped: list[str] = []
@@ -153,7 +157,7 @@ def run_now(
     #   无任何数据 → batch K-line API 拉首次 1 年
     from datetime import date as _date, timedelta as _td, datetime as _dt
     latest_daily = repo.latest_daily_date()
-    today = _date.today()
+    today = target_date or cn_now().date()
     today_exists = latest_daily and latest_daily >= today
     new_daily_days = 0
 
@@ -283,11 +287,14 @@ def run_now(
         logger.info("sync_daily: [%s ~ %s] done", start_date, today)
     _invalidate("daily")
 
-    from app.services.data_integrity import latest_complete_partition_date
+    from app.services.data_integrity import (
+        latest_complete_partition_date,
+        partition_is_complete,
+    )
     latest_complete_daily = latest_complete_partition_date(
         repo.store.data_dir, "kline_daily",
     )
-    if latest_complete_daily is None or latest_complete_daily < today:
+    if not partition_is_complete(repo.store.data_dir, "kline_daily", today):
         deferred.append("sync_daily")
         emit(
             "sync_daily",
@@ -343,7 +350,11 @@ def run_now(
     can_sync_adj = capset.has(Cap.ADJ_FACTOR) or adj_provider != "tickflow"
     if can_sync_adj:
         from datetime import datetime, timedelta
-        adj_end = datetime.now()
+        adj_end = (
+            datetime.combine(today, datetime.max.time())
+            if target_date is not None
+            else datetime.now()
+        )
         if daily_range_start is not None:
             adj_start = datetime.combine(daily_range_start, datetime.min.time())
         else:
@@ -734,12 +745,14 @@ def run_now(
             written_minute = kline_sync.sync_and_persist_minute(
                 minute_symbols, repo, capset, days=minute_days,
                 on_chunk_done=_minute_chunk_progress,
+                target_start_date=today if target_date is not None else None,
+                target_end_date=today if target_date is not None else None,
             )
             # 每日自动更新不能以“目录存在/写入成功”代替数据正确。盘后任务校验本次
             # 覆盖范围内所有已有日K交易日；盘中手动运行时不把尚未收盘的今天判坏。
             validation_end = today
             current_cn = kline_sync.cn_now()
-            if (current_cn.hour, current_cn.minute) < (15, 5):
+            if target_date is None and (current_cn.hour, current_cn.minute) < (15, 5):
                 validation_end = today - _td(days=1)
             validation_start = today - _td(days=max(minute_days, 7))
             minute_validation = kline_sync.validate_minute_partitions(
@@ -843,6 +856,7 @@ def run_now(
     _invalidate(None)  # 兜底:全清
 
     result = {
+        "target_date": today.isoformat(),
         "universe_size": len(universe),
         "daily_days": new_daily_days,
         "daily_latest_complete": (
@@ -965,7 +979,13 @@ def _run_tracked(fn, job_label: str) -> bool:
     重任务执行槽: 再挡一层僵尸并发(reap 后线程仍活时不得并行写 parquet)。
     返回 True 仅表示任务已成功并且执行槽已释放。
     """
-    from app.services.pipeline_jobs import JobCancelledError, job_store, release_run_slot, try_acquire_run_slot
+    from app.services.pipeline_jobs import (
+        JobCancelledError,
+        has_deferred_stages,
+        job_store,
+        release_run_slot,
+        try_acquire_run_slot,
+    )
 
     job_id, is_new = job_store.create()
     if not is_new:
@@ -985,8 +1005,16 @@ def _run_tracked(fn, job_label: str) -> bool:
         job_store.start(job_id)
         result = fn(on_progress=progress)
         job_store.succeed(job_id, result)
-        succeeded = True
-        logger.info("scheduled %s completed: job_id=%s", job_label, job_id)
+        succeeded = not has_deferred_stages(result)
+        if succeeded:
+            logger.info("scheduled %s completed: job_id=%s", job_label, job_id)
+        else:
+            logger.warning(
+                "scheduled %s deferred: job_id=%s stages=%s",
+                job_label,
+                job_id,
+                result.get("deferred_stages"),
+            )
     except JobCancelledError:
         # 已由 terminate() 标记失败(卡死/手动取消), 拉取线程在分块回调处自行退出
         logger.warning("scheduled %s cancelled: job_id=%s", job_label, job_id)
@@ -998,10 +1026,10 @@ def _run_tracked(fn, job_label: str) -> bool:
     return succeeded
 
 
-def _scheduled_pipeline_task(pipeline_fn) -> None:
+def _scheduled_pipeline_task(pipeline_fn) -> bool:
     """Freeze the newly sealed day of paper signals after the pipeline succeeds."""
     if not _run_tracked(pipeline_fn, "daily_pipeline"):
-        return
+        return False
     service = getattr(_get_app_state(), "paper_trading_service", None)
     if service is not None:
         try:
@@ -1023,6 +1051,56 @@ def _scheduled_pipeline_task(pipeline_fn) -> None:
         logger.info("scheduled mining result: %s", result)
     except Exception:
         logger.exception("scheduled mining enqueue failed; daily pipeline remains succeeded")
+    return True
+
+
+def _oldest_deferred_target() -> dt_date | None:
+    """Return the oldest pipeline target whose newest receipt is still deferred."""
+    from app.services.pipeline_jobs import job_store
+
+    newest_state: dict[dt_date, bool] = {}
+    legacy_target_seen = False
+    for job in job_store.list_recent(limit=50):
+        result = job.get("result")
+        if not isinstance(result, dict):
+            continue
+        raw_target = result.get("target_date")
+        if not raw_target and result.get("deferred_stages") and job.get("started_at"):
+            if legacy_target_seen:
+                continue
+            legacy_target_seen = True
+            # 兼容升级前的延期回执：旧版本尚未写 target_date，按任务启动时刻
+            # 转为北京时间日期，确保部署后已有缺口也能进入补偿队列。
+            try:
+                started = str(job["started_at"]).replace("Z", "+00:00")
+                raw_target = dt_datetime.fromisoformat(started).astimezone(CN_TZ).date()
+            except (TypeError, ValueError):
+                raw_target = None
+        if not raw_target:
+            continue
+        try:
+            target = (
+                raw_target
+                if isinstance(raw_target, dt_date)
+                else dt_date.fromisoformat(str(raw_target))
+            )
+        except ValueError:
+            continue
+        # list_recent 是从新到旧；同一目标日只采信最新一次回执。
+        if target not in newest_state:
+            newest_state[target] = bool(result.get("deferred_stages"))
+    unresolved = [target for target, pending in newest_state.items() if pending]
+    return min(unresolved) if unresolved else None
+
+
+def _scheduled_deferred_retry_task(run_target: Callable[[dt_date], object]) -> bool:
+    """Retry one unresolved target; no-op after all target receipts resolve."""
+    target = _oldest_deferred_target()
+    if target is None:
+        return False
+    logger.info("retrying deferred daily pipeline target %s", target)
+    run_target(target)
+    return True
 
 
 # ================================================================
@@ -1402,7 +1480,7 @@ def start_scheduler(repo: KlineRepository, capset: CapabilitySet) -> AsyncIOSche
     _register_paper_clock_jobs(scheduler)
 
     # 盘后: 日 K + enriched（时间由偏好决定）
-    def _pipeline_then_refresh(on_progress=None):
+    def _pipeline_then_refresh(on_progress=None, target: dt_date | None = None):
         # 与手动触发 (/api/pipeline/run) 对齐: 管道落盘后重建 Polars 内存缓存,
         # 否则 live_agg 的昨日连板数等基准列会停留在旧交易日, 次日开盘连板梯队
         # 整体少算一档 (仅手动触发或重启才会刷缓存, cron 调度路径此前漏了这步)。
@@ -1415,9 +1493,21 @@ def start_scheduler(repo: KlineRepository, capset: CapabilitySet) -> AsyncIOSche
         try:
             if qs:
                 with qs.paused():
-                    result = run_now(repo, capset_live, on_progress=on_progress)
+                    result = run_now(
+                        repo,
+                        capset_live,
+                        on_progress=on_progress,
+                        override_start_date=target,
+                        target_date=target,
+                    )
             else:
-                result = run_now(repo, capset_live, on_progress=on_progress)
+                result = run_now(
+                    repo,
+                    capset_live,
+                    on_progress=on_progress,
+                    override_start_date=target,
+                    target_date=target,
+                )
         finally:
             # 即便有阶段软失败(run_now 末尾抛 PipelineStageError), 已落盘的日K/enriched
             # 仍需刷进内存缓存, 否则 live_agg 基准列停留在旧交易日。放 finally 保证部分
@@ -1434,6 +1524,39 @@ def start_scheduler(repo: KlineRepository, capset: CapabilitySet) -> AsyncIOSche
         misfire_grace_time=3600,
         replace_existing=True,
     )
+
+    # 数据源发布晚于主管道时，按原目标交易日补偿。任务先查持久化回执；没有
+    # unresolved target 时只是毫秒级 no-op，不重复拉取。次日上午的两次兜底
+    # 也固定到原交易日，绝不把盘中分钟线混入完整分区。
+    def _retry_target(target: dt_date) -> bool:
+        return _scheduled_pipeline_task(
+            lambda on_progress=None: _pipeline_then_refresh(on_progress, target),
+        )
+
+    primary_total = sched["hour"] * 60 + sched["minute"]
+    retry_slots = [
+        ((primary_total + 60) % (24 * 60), "after_1h"),
+        ((primary_total + 120) % (24 * 60), "after_2h"),
+        (8 * 60 + 30, "morning"),
+        (12 * 60 + 30, "midday"),
+    ]
+    seen_retry_times: set[int] = set()
+    for retry_total, retry_name in retry_slots:
+        if retry_total in seen_retry_times or retry_total == primary_total:
+            continue
+        seen_retry_times.add(retry_total)
+        scheduler.add_job(
+            lambda: _scheduled_deferred_retry_task(_retry_target),
+            trigger=CronTrigger(
+                day_of_week="mon-sun",
+                hour=retry_total // 60,
+                minute=retry_total % 60,
+                timezone="Asia/Shanghai",
+            ),
+            id=f"daily_pipeline_retry_{retry_name}",
+            misfire_grace_time=1800,
+            replace_existing=True,
+        )
 
     # 盘后: 五档盘口 sealed 定版(时间由偏好决定, 默认15:02, 范围15:01~18:00)
     depth_sched = preferences.get_depth_finalize_time()

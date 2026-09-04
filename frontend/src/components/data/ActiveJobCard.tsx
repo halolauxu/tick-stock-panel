@@ -1,6 +1,6 @@
 import { useRef, useMemo, useEffect } from 'react'
 import { motion } from 'framer-motion'
-import { Loader2, CheckCircle2, XCircle } from 'lucide-react'
+import { Loader2, CheckCircle2, XCircle, Clock3 } from 'lucide-react'
 import { formatDuration, formatLogTime } from '@/lib/format'
 import { Pill } from './StatCard'
 import type { PipelineJob } from '@/lib/api'
@@ -67,11 +67,12 @@ export function ActiveJobCard({ job }: { job: PipelineJob }) {
     running:   { icon: Loader2,     color: 'text-accent',   label: '运行中', spinning: true,  border: 'border-accent/40', bg: 'bg-accent/5' },
     pending:   { icon: Loader2,     color: 'text-muted',    label: '排队中', spinning: true,  border: 'border-border',    bg: 'bg-surface' },
     succeeded: { icon: CheckCircle2, color: 'text-bear',     label: '完成',   spinning: false, border: 'border-bear/30',   bg: 'bg-bear/5' },
+    deferred:  { icon: Clock3,      color: 'text-warning',  label: '部分完成，待自动补采', spinning: false, border: 'border-warning/40', bg: 'bg-warning/5' },
     failed:    { icon: XCircle,     color: 'text-danger',   label: '失败',   spinning: false, border: 'border-danger/40', bg: 'bg-danger/5' },
   } as const
   const meta = statusMap[job.status]
   const Icon = meta.icon
-  const isDone = job.status === 'succeeded' || job.status === 'failed'
+  const isDone = job.status === 'succeeded' || job.status === 'deferred' || job.status === 'failed'
   const stageLabel = isDone ? meta.label : (STAGE_LABELS[job.stage] ?? job.stage)
 
   return (
@@ -118,7 +119,7 @@ export function ActiveJobCard({ job }: { job: PipelineJob }) {
 
       <LogViewer log={job.log} />
 
-      {job.status === 'succeeded' && job.result && (() => {
+      {(job.status === 'succeeded' || job.status === 'deferred') && job.result && (() => {
         if (job.result.dataset === 'minute') {
           return (
             <div className="mt-3 grid grid-cols-1 md:grid-cols-4 gap-3 text-xs">
@@ -152,6 +153,12 @@ export function ActiveJobCard({ job }: { job: PipelineJob }) {
           </div>
         )
       })()}
+      {job.status === 'deferred' && job.result && (
+        <div className="mt-3 rounded-btn border border-warning/40 bg-warning/5 px-3 py-2 text-xs text-warning">
+          数据源尚未完整发布；待补采：{(job.result.deferred_stages ?? []).map(stage => STAGE_LABELS[stage] ?? stage).join('、') || '未知阶段'}。
+          系统会按原交易日自动重试，不会把次日盘中数据混入。
+        </div>
+      )}
       {job.status === 'failed' && job.error && (
         <div className="mt-3 rounded-btn border border-danger/40 bg-danger/5 px-3 py-2 text-xs text-danger">
           {job.error}

@@ -118,6 +118,36 @@ def latest_complete_partition_date(
     return None
 
 
+def partition_is_complete(
+    data_dir: Path,
+    table: str,
+    target_day: date,
+    *,
+    lookback_partitions: int = 30,
+) -> bool:
+    """Check one exact partition against the same coverage contract as the UI."""
+    base = Path(data_dir) / table
+    target = base / f"date={target_day.isoformat()}"
+    if not target.exists():
+        return False
+    parts: list[tuple[date, Path]] = []
+    for part in base.glob("date=*"):
+        try:
+            parts.append((date.fromisoformat(part.name[5:]), part))
+        except ValueError:
+            continue
+    if not parts:
+        return False
+    parts.sort(key=lambda item: item[0])
+    recent = parts[-max(1, lookback_partitions):]
+    counts = {day: _partition_symbol_count(part) for day, part in recent}
+    target_count = counts.get(target_day, _partition_symbol_count(target))
+    baseline = max(counts.values(), default=0)
+    if baseline < MIN_COVERAGE_BASE_ROWS:
+        return target_count > 0
+    return target_count >= baseline * MIN_PARTITION_COVERAGE_RATIO
+
+
 def _quote_ts_max_ms(part_dir: Path) -> int | None:
     """读单个日期分区的 max(quote_ts); 列不存在/全 null/无统计 → None。
 

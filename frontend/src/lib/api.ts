@@ -4006,7 +4006,7 @@ export const api = {
 // ===== Pipeline =====
 export interface PipelineJob {
   id: string
-  status: 'pending' | 'running' | 'succeeded' | 'failed'
+  status: 'pending' | 'running' | 'succeeded' | 'deferred' | 'failed'
   stage: string
   progress: number          // 0-100 整体进度
   stage_pct: number         // 0-100 当前阶段内进度
@@ -4015,6 +4015,7 @@ export interface PipelineJob {
   finished_at: string | null
   duration_s: number | null
   result: {
+    target_date?: string
     universe_size?: number
     daily_days?: number
     adj_factor_symbols?: number
@@ -4033,6 +4034,7 @@ export interface PipelineJob {
     latest_date?: string
     complete_days?: number
     skipped_stages?: string[]
+    deferred_stages?: string[]
   } | null
   error: string | null
 }

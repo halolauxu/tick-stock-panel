@@ -590,7 +590,7 @@ export function Dashboard() {
     },
     refetchInterval: (q: any) => {
       const j = q.state.data
-      return j && (j.status === 'succeeded' || j.status === 'failed') ? false : 1_000
+      return j && ['succeeded', 'deferred', 'failed'].includes(j.status) ? false : 1_000
     },
   })
   useEffect(() => {

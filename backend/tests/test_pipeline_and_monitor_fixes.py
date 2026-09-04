@@ -4,6 +4,8 @@
 """
 from __future__ import annotations
 
+from datetime import date
+
 import polars as pl
 import pytest
 
@@ -49,6 +51,102 @@ def test_create_new_after_terminal(monkeypatch, tmp_path):
     jid2, new2 = store.create()
     assert jid2 != jid1
     assert new2 is True
+
+
+def test_job_store_marks_deferred_pipeline_as_distinct_terminal(monkeypatch, tmp_path):
+    """数据源延期不是完整成功，但也不应伪装成执行失败。"""
+    monkeypatch.setattr(preferences, "load", lambda: {})
+    store = JobStore(store_dir=tmp_path / "jobs")
+    job_id, _ = store.create()
+    store.start(job_id)
+
+    store.succeed(job_id, {
+        "target_date": "2026-09-03",
+        "deferred_stages": ["sync_daily", "sync_minute"],
+    })
+
+    job = store.get(job_id)
+    assert job is not None
+    assert job["status"] == "deferred"
+    assert store.active_id() is None
+
+
+def test_oldest_unresolved_pipeline_target_is_retried_first(monkeypatch):
+    """新交易日的延期记录不能覆盖仍未补齐的更早交易日。"""
+    jobs = [
+        {"result": {"target_date": "2026-09-04", "deferred_stages": ["sync_minute"]}},
+        {"result": {"target_date": "2026-09-03", "deferred_stages": []}},
+        {"result": {"target_date": "2026-09-03", "deferred_stages": ["sync_daily"]}},
+        {"result": {"target_date": "2026-09-02", "deferred_stages": ["sync_auction"]}},
+    ]
+    monkeypatch.setattr(pipeline_jobs.job_store, "list_recent", lambda limit=50: jobs)
+
+    assert daily_pipeline._oldest_deferred_target() == date(2026, 9, 2)
+
+
+def test_deferred_retry_is_noop_after_target_resolves(monkeypatch):
+    jobs = [
+        {"result": {"target_date": "2026-09-03", "deferred_stages": []}},
+        {"result": {"target_date": "2026-09-03", "deferred_stages": ["sync_minute"]}},
+    ]
+    monkeypatch.setattr(pipeline_jobs.job_store, "list_recent", lambda limit=50: jobs)
+    calls = []
+
+    assert daily_pipeline._scheduled_deferred_retry_task(
+        lambda target: calls.append(target),
+    ) is False
+    assert calls == []
+
+
+def test_deferred_retry_migrates_legacy_receipt_target_from_started_at(monkeypatch):
+    """部署前的延期回执没有 target_date，也必须能在升级后自动补偿。"""
+    jobs = [{
+        "started_at": "2026-09-03T13:00:00Z",
+        "result": {"deferred_stages": ["sync_minute"]},
+    }]
+    monkeypatch.setattr(pipeline_jobs.job_store, "list_recent", lambda limit=50: jobs)
+
+    assert daily_pipeline._oldest_deferred_target() == date(2026, 9, 3)
+
+
+def test_run_tracked_does_not_treat_deferred_result_as_success(monkeypatch):
+    """延期终态不得触发依赖完整行情的模拟交易或挖掘。"""
+    calls: list[tuple[str, object]] = []
+
+    class FakeStore:
+        def create(self):
+            return "job-deferred", True
+
+        def start(self, job_id):
+            calls.append(("start", job_id))
+
+        def progress(self, *args, **kwargs):
+            return None
+
+        def succeed(self, job_id, result):
+            calls.append(("succeed", result))
+
+        def fail(self, job_id, error):
+            calls.append(("fail", error))
+
+    monkeypatch.setattr(pipeline_jobs, "job_store", FakeStore())
+    monkeypatch.setattr(pipeline_jobs, "try_acquire_run_slot", lambda owner="": True)
+    monkeypatch.setattr(
+        pipeline_jobs,
+        "release_run_slot",
+        lambda owner=None: calls.append(("release", owner)),
+    )
+
+    result = daily_pipeline._run_tracked(
+        lambda on_progress=None: {
+            "target_date": "2026-09-03",
+            "deferred_stages": ["sync_minute"],
+        },
+        "daily_pipeline",
+    )
+
+    assert result is False
+    assert [name for name, _ in calls] == ["start", "succeed", "release"]
 
 
 def test_run_slot_is_exclusive():

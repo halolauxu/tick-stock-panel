@@ -1658,12 +1658,15 @@ def sync_and_persist_minute(
     extend_backward: bool = False,
     force_full_days: bool = False,
     target_start_date: date | None = None,
+    target_end_date: date | None = None,
 ) -> int:
     """同步分钟 K 并存到 Parquet(前复权价格, SDK 端 adjust=qfq)。返回写入行数。
 
     使用 start_time / end_time 区间拉取, 确保所有标的覆盖同一时间段。
     on_chunk_done(current, total) 每个 chunk 完成后回调。
     force_full_days=True 时强制回溯 days 自然日 (不增量补, 用于个股补齐历史)。
+    target_start_date/target_end_date 用于固定区间补偿；结束日不得隐式扩到今天，
+    避免次日盘中重试时写入尚未收盘的分钟线。
     """
     minute_provider = preferences.get_minute_data_provider()
     # resolver 调用统一走 _resolve_minute_provider, 与 _try_custom_minute 共用异常边界。
@@ -1689,13 +1692,15 @@ def sync_and_persist_minute(
     now = datetime.now()
 
     if target_start_date is not None:
-        target_end_date = cn_today()
-        target_window = _minute_missing_window(repo, target_start_date, target_end_date)
+        fixed_end_date = target_end_date or cn_today()
+        if fixed_end_date < target_start_date:
+            raise ValueError("target_end_date must not be before target_start_date")
+        target_window = _minute_missing_window(repo, target_start_date, fixed_end_date)
         if target_window is None:
             logger.info(
                 "minute K target window already complete: %s ~ %s",
                 target_start_date,
-                target_end_date,
+                fixed_end_date,
             )
             return 0
         start_time, end_time = target_window

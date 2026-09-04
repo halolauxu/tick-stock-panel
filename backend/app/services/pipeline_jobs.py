@@ -3,7 +3,7 @@
 设计:
   - job_store/ 文件夹,每个 job 一个 {id}.json,最多保留 max_jobs 个文件
   - running/pending 状态的 job 仅存内存(高频读写)
-  - succeeded/failed 后写入独立文件并从内存释放
+  - succeeded/deferred/failed 后写入独立文件并从内存释放
   - 列表查询 = 内存中的活跃 job + 磁盘文件扫描,按时间排序
   - 单个查询 = 内存优先,没有则读磁盘
   - 创建新 job 前检查文件数量,>= max_jobs 时删除最老的文件
@@ -21,7 +21,12 @@ from typing import Any, Literal
 
 logger = logging.getLogger(__name__)
 
-JobStatus = Literal["pending", "running", "succeeded", "failed"]
+JobStatus = Literal["pending", "running", "succeeded", "deferred", "failed"]
+
+
+def has_deferred_stages(result: Any) -> bool:
+    """Return whether a pipeline result still has source-publication work pending."""
+    return isinstance(result, dict) and bool(result.get("deferred_stages"))
 
 # 卡死判定阈值(秒)。语义是「进度停滞」而非「总时长」:
 # running 期间只要 progress() 还在上报(每个分块都会回调), 就永远不算卡死 ——
@@ -264,7 +269,9 @@ class JobStore:
             j = self._active_jobs.pop(job_id, None)
             if not j:
                 return
-            j["status"] = "succeeded"
+            # 数据源尚未发布属于可补偿终态，不是完整成功，也不是执行异常。
+            # 独立状态让 UI、下游模拟交易和补偿调度都能 fail-closed。
+            j["status"] = "deferred" if has_deferred_stages(result) else "succeeded"
             j["finished_at"] = datetime.utcnow().isoformat(timespec="seconds") + "Z"
             j["progress"] = 100
             j["result"] = result
