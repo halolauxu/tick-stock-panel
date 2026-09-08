@@ -17,6 +17,9 @@ import { QK } from '@/lib/queryKeys'
 const pct = (value: number) => `${value >= 0 ? '+' : ''}${(value * 100).toFixed(2)}%`
 
 function lifecycleTone(code: string) {
+  if (code === 'SEAL_OVERDUE') {
+    return 'border-red-500/40 bg-red-500/10 text-red-300'
+  }
   if (code === 'BLOCKED' || code === 'DATA_DELAYED' || code === 'INPUT_DELAYED') {
     return 'border-amber-400/35 bg-amber-400/10 text-amber-300'
   }

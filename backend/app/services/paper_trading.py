@@ -380,30 +380,58 @@ class PaperTradingService:
         trading_date = current.date()
         quotes = quotes if quotes is not None else self._quotes_from_cache()
         tracked = self.subscription_symbols()
+        # The canary proves the execution path, so only actual order/position
+        # symbols are mandatory.  ``000001.SH`` is fetched as an optional
+        # market probe, but some stock-quote providers route indices through a
+        # different endpoint; making it mandatory produced a false critical
+        # incident every morning even when every executable stock was ready.
         required = set(tracked)
-        if tracked:
-            required.add("000001.SH")
         missing = sorted(
             symbol
             for symbol in required
             if not self._quote_ready_for_preflight(quotes.get(symbol), trading_date)
         )
         ready = not missing
+        market_observed = self._market_is_observed(trading_date, quotes)
         accounts = [
             item for item in self.ledger.list_accounts() if item["status"] == "active"
         ]
         for account in accounts:
+            account_required = {
+                str(row["symbol"])
+                for row in [
+                    *account["positions"],
+                    *(
+                        order
+                        for order in account["orders"]
+                        if order["status"] not in TERMINAL_ORDER_STATUSES
+                    ),
+                ]
+            }
+            account_missing = sorted(
+                symbol
+                for symbol in account_required
+                if not self._quote_ready_for_preflight(quotes.get(symbol), trading_date)
+            )
+            account_ready = not account_missing
             incident_key = f"account:{account['id']}:QUOTE_CHAIN_NOT_READY:{trading_date}"
-            if ready:
+            if account_ready:
                 self.ledger.resolve_incident(incident_key)
             else:
                 self.ledger.open_incident(
                     account_id=account["id"],
                     incident_key=incident_key,
                     code="QUOTE_CHAIN_NOT_READY",
-                    severity="critical",
-                    title="开盘行情链路未就绪",
-                    detail=f"09:20 探针未取得当日有效行情: {', '.join(missing)}",
+                    severity="critical" if market_observed else "warning",
+                    title=(
+                        "开盘行情链路未就绪"
+                        if market_observed else "尚未确认今日开市"
+                    ),
+                    detail=(
+                        f"市场已有当日行情，但以下账户标的缺失: {', '.join(account_missing)}"
+                        if market_observed
+                        else "尚无任何带当日时间戳的有效行情；不猜测交易日"
+                    ),
                     entity_type="account",
                     entity_id=account["id"],
                 )
@@ -411,18 +439,32 @@ class PaperTradingService:
                 account["id"],
                 event_key=(
                     f"{account['id']}:QUOTE_CHAIN:"
-                    f"{'READY' if ready else 'NOT_READY'}:{trading_date}"
+                    f"{'READY' if account_ready else 'NOT_READY'}:{trading_date}"
                 ),
-                event_type="QUOTE_CHAIN_READY" if ready else "QUOTE_CHAIN_NOT_READY",
+                event_type=(
+                    "QUOTE_CHAIN_READY" if account_ready else "QUOTE_CHAIN_NOT_READY"
+                ),
                 trading_date=trading_date,
-                severity="info" if ready else "critical",
-                title="开盘行情链路已就绪" if ready else "开盘行情链路未就绪",
-                detail=(
-                    f"已验证 {len(required)} 个执行/市场探针标的"
-                    if ready
-                    else f"缺少当日有效行情: {', '.join(missing)}"
+                severity=(
+                    "info" if account_ready
+                    else "critical" if market_observed
+                    else "warning"
                 ),
-                payload={"required": sorted(required), "missing": missing},
+                title=(
+                    "开盘行情链路已就绪" if account_ready else "开盘行情链路未就绪"
+                ),
+                detail=(
+                    f"已验证本账户 {len(account_required)} 个订单/持仓标的"
+                    if account_ready
+                    else (
+                        f"缺少当日有效行情: {', '.join(account_missing)}"
+                        if market_observed else "尚未观察到今日市场行情"
+                    )
+                ),
+                payload={
+                    "required": sorted(account_required),
+                    "missing": account_missing,
+                },
             )
         return {
             "ready": ready,
@@ -466,12 +508,22 @@ class PaperTradingService:
                 self.ledger.resolve_incident(
                     f"account:{account['id']}:TRADING_DAY_UNCONFIRMED:{trading_date}"
                 )
-            tracked_ready = all(
-                self._quote_ready_for_preflight(quotes.get(symbol), trading_date)
-                for symbol in self.subscription_symbols()
-            )
-            if tracked_ready:
-                for account in self.ledger.list_accounts():
+            for account in self.ledger.list_accounts():
+                account_symbols = {
+                    str(row["symbol"])
+                    for row in [
+                        *account["positions"],
+                        *(
+                            order
+                            for order in account["orders"]
+                            if order["status"] not in TERMINAL_ORDER_STATUSES
+                        ),
+                    ]
+                }
+                if all(
+                    self._quote_ready_for_preflight(quotes.get(symbol), trading_date)
+                    for symbol in account_symbols
+                ):
                     self.ledger.resolve_incident(
                         f"account:{account['id']}:QUOTE_CHAIN_NOT_READY:{trading_date}"
                     )
@@ -574,10 +626,21 @@ class PaperTradingService:
         quote: dict[str, Any],
         trading_date: date,
     ) -> tuple[str | None, str]:
+        trade_status = str(
+            quote.get("trade_status") or quote.get("status") or ""
+        ).strip().lower()
+        explicitly_suspended = bool(quote.get("is_suspended")) or trade_status in {
+            "suspended", "halted", "停牌",
+        }
+        if explicitly_suspended:
+            return "REJECTED_SUSPENDED", "行情源明确标记该标的停牌"
         values = [quote.get(key) for key in ("open", "high", "low", "last_price")]
         volume = quote.get("volume")
         if not all(_valid_price(value) for value in values) or volume in (None, 0):
-            return "REJECTED_SUSPENDED", "开盘行情无有效 OHLC 或成交量为零"
+            return (
+                "UNKNOWN_MARKET_DATA",
+                "09:31 前没有可靠开盘成交证据，且行情源未明确标记停牌",
+            )
         previous = self._reference_close(order, quote)
         if previous is None:
             return "UNKNOWN_MARKET_DATA", "缺少昨收, 无法验证涨跌停价格"
@@ -684,13 +747,30 @@ class PaperTradingService:
                 price = float(quote.get("open") or quote["last_price"])
                 requested = int(order["requested_qty"])
                 account = self.ledger.get_account(order["account_id"])
+                positions = {p["symbol"]: p for p in account["positions"]}
+                position = positions.get(order["symbol"])
                 if order["side"] == "BUY":
                     model = _account_cost_model(account["config"])
                     affordable = round_lot_quantity(account["summary"]["cash"], price, model)
                     if requested <= 0:
-                        requested = round_lot_quantity(float(order["target_amount"]), price, model)
+                        desired_total = round_lot_quantity(
+                            float(order["target_amount"]), price, model
+                        )
+                        requested = max(
+                            desired_total - int(position["quantity"] if position else 0),
+                            0,
+                        )
                     quantity = min(requested, affordable)
                     if quantity <= 0:
+                        if position and float(order["target_weight"] or 0) > 0 and requested == 0:
+                            self.ledger.terminal_order(
+                                order["id"],
+                                status="CANCELLED",
+                                reason="开盘价折算后当前持仓已达到冻结目标",
+                                quality=quality,
+                                severity="info",
+                            )
+                            continue
                         self.ledger.terminal_order(
                             order["id"],
                             status="REJECTED_INSUFFICIENT_CASH",
@@ -700,10 +780,24 @@ class PaperTradingService:
                         summary["rejected"] += 1
                         continue
                 else:
-                    positions = {p["symbol"]: p for p in account["positions"]}
-                    position = positions.get(order["symbol"])
-                    quantity = min(requested, int(position["available_qty"]) if position else 0)
+                    available = int(position["available_qty"]) if position else 0
+                    if position and float(order["target_weight"] or 0) > 0:
+                        desired_total = max(
+                            int(float(order["target_amount"]) / price / 100) * 100,
+                            0,
+                        )
+                        requested = max(int(position["quantity"]) - desired_total, 0)
+                    quantity = min(requested, available)
                     if quantity <= 0:
+                        if position and float(order["target_weight"] or 0) > 0 and requested == 0:
+                            self.ledger.terminal_order(
+                                order["id"],
+                                status="CANCELLED",
+                                reason="开盘价折算后当前持仓已达到冻结目标",
+                                quality=quality,
+                                severity="info",
+                            )
+                            continue
                         self.ledger.terminal_order(
                             order["id"],
                             status="EXECUTION_FAILED",
@@ -721,6 +815,7 @@ class PaperTradingService:
                         source=str(quote.get("source") or "realtime"),
                         quality=quality,
                         previous_close=self._reference_close(order, quote),
+                        complete=quantity >= requested,
                     )
                     if quantity < requested:
                         summary["partial"] += 1
@@ -849,7 +944,25 @@ class PaperTradingService:
             if date.fromisoformat(order["signal_date"]) != current.date():
                 continue
             quote = quotes.get(order["symbol"])
-            if quote is None:
+            if quote is None or quote.get("_quote_dt") is None:
+                continue
+            payload = json.loads(order.get("payload_json") or "{}")
+            trigger_at = _quote_datetime(payload.get("trigger_quote_at"))
+            quote_at = _as_cn(quote["_quote_dt"])
+            # A trigger quote is not also a fill.  Only a strictly later
+            # exchange timestamp qualifies as the next observable price.
+            if trigger_at is not None and quote_at <= trigger_at:
+                continue
+            blocked, reason = self._blocked_status(order, quote, current.date())
+            if blocked == "UNKNOWN_MARKET_DATA":
+                continue
+            if blocked:
+                self.ledger.terminal_order(
+                    order["id"],
+                    status=blocked,
+                    reason=reason,
+                    quality="ON_TIME",
+                )
                 continue
             self.ledger.assign_due_date(order["id"], current.date(), {"next_quote": True})
             try:
@@ -864,6 +977,29 @@ class PaperTradingService:
                 )
             except Exception as exc:
                 self.ledger.terminal_order(order["id"], status="EXECUTION_FAILED", reason=str(exc))
+
+    def _finalize_intraday_orders(self, trading_date: date) -> int:
+        """Close unfilled same-day risk orders without routing them to open recovery."""
+        finalized = 0
+        for row in self.ledger.planned_orders():
+            order = dict(row)
+            if (
+                order["planned_session"] != "NEXT_QUOTE"
+                or order["status"] not in {"PLANNED", "PREFLIGHT_OK"}
+                or date.fromisoformat(order["signal_date"]) != trading_date
+            ):
+                continue
+            self.ledger.terminal_order(
+                order["id"],
+                status="CANCELLED",
+                reason=(
+                    "盘中退出已触发，但收盘前未取得严格晚于触发时刻的可靠行情；"
+                    "保留退出意图并于下一交易日按 T+1/开盘规则处理"
+                ),
+                quality="NO_LATER_INTRADAY_QUOTE",
+            )
+            finalized += 1
+        return finalized
 
     def _regime_allows(self, signal_date: date, config: dict[str, Any]) -> bool:
         regime_filter = config.get("regime_filter")
@@ -911,8 +1047,6 @@ class PaperTradingService:
         account = self.ledger.get_account(account_id)
         if account["status"] != "active":
             return {"signals": 0, "orders": 0}
-        if account.get("last_processed_date") == signal_date.isoformat():
-            return {"signals": 0, "orders": 0}
         config = account["config"]
         from app.services import risk_admitted_forecast_paper
 
@@ -920,6 +1054,8 @@ class PaperTradingService:
             return risk_admitted_forecast_paper.seal_account(
                 self, account_id, signal_date
             )
+        if account.get("last_processed_date") == signal_date.isoformat():
+            return {"signals": 0, "orders": 0}
         if not self._regime_allows(signal_date, config):
             self.ledger.record_account_event(
                 account_id,
@@ -1174,13 +1310,143 @@ class PaperTradingService:
                     logger.exception("paper signal seal failed: %s", row["id"])
         return summary
 
-    def settle_all(self, *, trading_date: date | None = None) -> dict[str, int]:
-        current_date = trading_date or _as_cn().date()
-        summary = {"settled": 0, "failed": 0, "imbalanced": 0}
+    def seal_ready_signals(self, *, now: datetime | None = None) -> dict[str, int]:
+        """Recover a ready signal seal independently from the long data job.
+
+        Daily/enriched data plus strategy-specific receipts are the only seal
+        prerequisites.  Optional minute-history collection must never keep a
+        ready next-open decision waiting indefinitely.
+        """
+        current = _as_cn(now)
+        summary = {"processed": 0, "skipped": 0, "failed": 0, "orders": 0}
         with self._lock:
-            for row in self.ledger.list_account_rows():
+            for row in self.ledger.list_account_rows(active_only=True):
+                config = json.loads(row["config_json"])
+                latest = self.repo.latest_enriched_date(config.get("asset_type", "stock"))
+                if latest is None or latest > current.date():
+                    summary["skipped"] += 1
+                    continue
+                if latest == current.date() and current.time() < SIGNAL_SEAL_TIME:
+                    summary["skipped"] += 1
+                    continue
+                last_signal = (
+                    date.fromisoformat(row["last_signal_date"])
+                    if row["last_signal_date"] else None
+                )
+                from app.services import risk_admitted_forecast_paper as managed
+
+                is_managed = managed.is_managed_account(config)
+                checkpoint = (
+                    managed.checkpoint_signal_date(self.repo.store.data_dir)
+                    if is_managed else last_signal
+                )
+                if last_signal is not None and last_signal >= latest and checkpoint == latest:
+                    summary["skipped"] += 1
+                    continue
+                if is_managed and not managed.inputs_ready(self.repo.store.data_dir, latest):
+                    summary["skipped"] += 1
+                    continue
                 try:
-                    self.ledger.settle_account(row["id"], current_date, source="15:05_close")
+                    result = self.seal_account_signals(row["id"], latest)
+                    summary["processed"] += 1
+                    summary["orders"] += result["orders"]
+                    self.ledger.resolve_incident(
+                        f"account:{row['id']}:SIGNAL_FAILURE:{latest}"
+                    )
+                except Exception as exc:
+                    summary["failed"] += 1
+                    self.ledger.open_incident(
+                        account_id=row["id"],
+                        incident_key=f"account:{row['id']}:SIGNAL_FAILURE:{latest}",
+                        code="SIGNAL_FAILURE",
+                        severity="critical",
+                        title="封板信号生成失败",
+                        detail=str(exc),
+                        entity_type="account",
+                        entity_id=row["id"],
+                    )
+                    logger.exception("ready paper signal recovery failed: %s", row["id"])
+        return summary
+
+    def settle_all(
+        self,
+        *,
+        trading_date: date | None = None,
+        restatement_accounts: set[str] | None = None,
+    ) -> dict[str, int]:
+        current_date = trading_date or _as_cn().date()
+        summary = {
+            "settled": 0,
+            "failed": 0,
+            "imbalanced": 0,
+            "intraday_finalized": 0,
+        }
+        with self._lock:
+            summary["intraday_finalized"] = self._finalize_intraday_orders(current_date)
+            rows = self.ledger.list_account_rows()
+            accounts = [self.ledger.get_account(row["id"]) for row in rows]
+            market_observed = is_possible_cn_equity_session(current_date) and any(
+                (quote_at := _quote_datetime(position.get("quote_at"))) is not None
+                and quote_at.date() == current_date
+                for account in accounts
+                for position in account["positions"]
+            )
+            if not market_observed:
+                for account in accounts:
+                    self.ledger.open_incident(
+                        account_id=account["id"],
+                        incident_key=(
+                            f"account:{account['id']}:TRADING_DAY_UNCONFIRMED:{current_date}"
+                        ),
+                        code="TRADING_DAY_UNCONFIRMED",
+                        severity="warning",
+                        title="尚未确认今日开市",
+                        detail="没有任何持仓标的的当日行情，暂不生成收盘结算",
+                        entity_type="account",
+                        entity_id=account["id"],
+                    )
+                summary["failed"] = len(accounts)
+                return summary
+            for row, account in zip(rows, accounts, strict=True):
+                try:
+                    self.ledger.resolve_incident(
+                        f"account:{row['id']}:TRADING_DAY_UNCONFIRMED:{current_date}"
+                    )
+                    missing_marks = [
+                        position["symbol"]
+                        for position in account["positions"]
+                        if (
+                            (quote_at := _quote_datetime(position.get("quote_at"))) is None
+                            or quote_at.date() != current_date
+                            or quote_at.time() < dt_time(15, 0)
+                        )
+                    ]
+                    incident_key = (
+                        f"account:{row['id']}:SETTLEMENT_MARKS_INCOMPLETE:{current_date}"
+                    )
+                    if missing_marks:
+                        self.ledger.open_incident(
+                            account_id=row["id"],
+                            incident_key=incident_key,
+                            code="SETTLEMENT_MARKS_INCOMPLETE",
+                            severity="critical",
+                            title="收盘估值行情不完整",
+                            detail=(
+                                "以下持仓没有当日 15:00 收盘证据，结算保持待处理: "
+                                + ", ".join(sorted(missing_marks))
+                            ),
+                            entity_type="account",
+                            entity_id=row["id"],
+                        )
+                        summary["failed"] += 1
+                        continue
+                    self.ledger.resolve_incident(incident_key)
+                    self.ledger.settle_account(
+                        row["id"],
+                        current_date,
+                        source="15:05_close",
+                        restatement=row["id"] in (restatement_accounts or set()),
+                    )
                     check = self.ledger.reconcile(row["id"])
                     summary["settled"] += 1
                     summary["imbalanced"] += int(not check["ok"])
@@ -1636,22 +1902,50 @@ class PaperTradingService:
                         continue
                     account = self.ledger.get_account(order["account_id"])
                     price = float(minute["open"])
-                    quantity = int(order["requested_qty"])
+                    requested = int(order["requested_qty"])
+                    positions = {p["symbol"]: p for p in account["positions"]}
+                    position = positions.get(order["symbol"])
                     if order["side"] == "BUY":
                         affordable = round_lot_quantity(
                             account["summary"]["cash"],
                             price,
                             _account_cost_model(account["config"]),
                         )
-                        quantity = min(quantity or affordable, affordable)
+                        if requested <= 0:
+                            desired_total = round_lot_quantity(
+                                float(order["target_amount"]),
+                                price,
+                                _account_cost_model(account["config"]),
+                            )
+                            requested = max(
+                                desired_total
+                                - int(position["quantity"] if position else 0),
+                                0,
+                            )
+                        quantity = min(requested, affordable)
                     else:
-                        positions = {p["symbol"]: p for p in account["positions"]}
-                        position = positions.get(order["symbol"])
-                        quantity = min(
-                            quantity,
-                            int(position["available_qty"]) if position else 0,
-                        )
+                        available = int(position["available_qty"]) if position else 0
+                        if position and float(order["target_weight"] or 0) > 0:
+                            desired_total = max(
+                                int(float(order["target_amount"]) / price / 100) * 100,
+                                0,
+                            )
+                            requested = max(
+                                int(position["quantity"]) - desired_total,
+                                0,
+                            )
+                        quantity = min(requested, available)
                     if quantity <= 0:
+                        if position and float(order["target_weight"] or 0) > 0 and requested == 0:
+                            self.ledger.terminal_order(
+                                order["id"],
+                                status="CANCELLED",
+                                reason="恢复时按真实开盘价折算，持仓已达到冻结目标",
+                                quality="RECOVERED_LATE",
+                                severity="info",
+                            )
+                            result["resolved"] += 1
+                            continue
                         status = (
                             "REJECTED_INSUFFICIENT_CASH"
                             if order["side"] == "BUY"
@@ -1679,6 +1973,7 @@ class PaperTradingService:
                             source=quote["source"],
                             quality="RECOVERED_LATE",
                             previous_close=self._reference_close(order, quote),
+                            complete=quantity >= requested,
                         )
                         current_quote = (
                             fresh_recovery_quotes.get(str(order["symbol"]))
@@ -1700,16 +1995,18 @@ class PaperTradingService:
                         )
                         result["resolved"] += 1
             if current.time() >= SETTLEMENT_TIME:
-                recovered_accounts.update(
-                    self.ledger.accounts_needing_settlement_restatement(current.date())
+                # The minute recovery clock also retries delayed settlement.
+                # It only settles once every holding has an observed close,
+                # and the ledger operation itself is idempotent.
+                self.settle_all(
+                    trading_date=current.date(),
+                    restatement_accounts=(
+                        recovered_accounts
+                        | self.ledger.accounts_needing_settlement_restatement(
+                            current.date()
+                        )
+                    ),
                 )
-                for account_id in sorted(recovered_accounts):
-                    self.ledger.settle_account(
-                        account_id,
-                        current.date(),
-                        source="15:05_close",
-                        restatement=True,
-                    )
         return result
 
     def sync_account(self, account_id: str) -> dict[str, Any]:
@@ -1766,6 +2063,34 @@ class PaperTradingService:
             account["summary"]["critical_incident_count"] for account in accounts
         )
         tracked_symbols = len(self.subscription_symbols())
+        signal_seal_overdue = 0
+        signal_input_delayed = 0
+        from app.services import risk_admitted_forecast_paper as managed
+
+        for row in self.ledger.list_account_rows(active_only=True):
+            config = json.loads(row["config_json"])
+            latest = self.repo.latest_enriched_date(config.get("asset_type", "stock"))
+            seal_is_due = latest is not None and (
+                latest < now.date()
+                or (latest == now.date() and now.time() >= SIGNAL_SEAL_TIME)
+            )
+            if not seal_is_due:
+                continue
+            last_signal = (
+                date.fromisoformat(row["last_signal_date"])
+                if row["last_signal_date"] else None
+            )
+            is_managed = managed.is_managed_account(config)
+            checkpoint = (
+                managed.checkpoint_signal_date(self.repo.store.data_dir)
+                if is_managed else last_signal
+            )
+            if last_signal is not None and last_signal >= latest and checkpoint == latest:
+                continue
+            if is_managed and not managed.inputs_ready(self.repo.store.data_dir, latest):
+                signal_input_delayed += 1
+            else:
+                signal_seal_overdue += 1
         quote_age = quote_status.get("quote_age_ms")
         stale = bool(
             tracked_symbols
@@ -1774,7 +2099,12 @@ class PaperTradingService:
         )
         health = (
             "ERROR" if critical_incidents
-            else "DEGRADED" if incidents or (tracked_symbols and stale and phase == "TRADING")
+            else "DEGRADED" if (
+                incidents
+                or signal_seal_overdue
+                or signal_input_delayed
+                or (tracked_symbols and stale and phase == "TRADING")
+            )
             else "HEALTHY"
         )
         return {
@@ -1788,6 +2118,8 @@ class PaperTradingService:
             "tracked_symbol_count": tracked_symbols,
             "open_incident_count": incidents,
             "critical_incident_count": critical_incidents,
+            "signal_seal_overdue_count": signal_seal_overdue,
+            "signal_input_delayed_count": signal_input_delayed,
             "ledger_path": self.ledger.path.name,
         }
 

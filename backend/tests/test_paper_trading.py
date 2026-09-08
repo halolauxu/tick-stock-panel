@@ -392,6 +392,7 @@ def test_scheduler_registers_and_dispatches_all_exchange_clock_boundaries():
         finalize_open_window=lambda: calls.append("deadline"),
         settle_all=lambda: calls.append("settlement"),
         recover_missed_open=lambda: calls.append("recovery"),
+        seal_ready_signals=lambda: calls.append("signal-recovery"),
     )
     daily_pipeline.set_app_state(SimpleNamespace(paper_trading_service=service))
 
@@ -403,10 +404,14 @@ def test_scheduler_registers_and_dispatches_all_exchange_clock_boundaries():
         "paper_open_deadline",
         "paper_settlement",
         "paper_evidence_recovery",
+        "paper_signal_recovery",
     ):
         jobs[job_id]["func"]()
 
-    assert calls == ["canary", "preflight", "open", "deadline", "settlement", "recovery"]
+    assert calls == [
+        "canary", "preflight", "open", "deadline", "settlement", "recovery",
+        "signal-recovery",
+    ]
     assert "hour='9', minute='20'" in str(jobs["paper_quote_canary"]["trigger"])
     assert str(jobs["paper_preflight"]["trigger"]).startswith("cron[day_of_week='mon-fri'")
     assert "hour='9', minute='30', second='5,25,45'" in str(
@@ -467,8 +472,52 @@ def test_quote_canary_opens_and_resolves_a_visible_incident(tmp_path):
     )
     after_recovery = service.account(account["id"])
 
-    assert ready == {"ready": True, "required": 2, "available": 2, "missing": []}
+    assert ready == {"ready": True, "required": 1, "available": 1, "missing": []}
     assert after_recovery["summary"]["critical_incident_count"] == 0
+
+
+def test_quote_canary_isolates_missing_symbols_to_the_affected_account(tmp_path):
+    service = _service(tmp_path)
+    first, _ = _account_with_buy_order(service)
+    second = service.ledger.create_account(
+        name="第二账户", baseline_date=SIGNAL_DAY, config=_config()
+    )
+    service.ledger.record_signal_and_order(
+        account_id=second["id"], strategy_id="n_day_low_reversal",
+        symbol="600000.SH", name="浦发银行", side="BUY",
+        signal_date=SIGNAL_DAY, score=80, reason="strategy_entry",
+        signal_ref="second", requested_qty=1_000, target_amount=10_000,
+        target_weight=0.05, planned_session="NEXT_OPEN",
+    )
+    at = datetime(2026, 8, 27, 9, 20, tzinfo=CN_TZ)
+
+    result = service.probe_quote_chain(
+        now=at,
+        quotes={"000001.SZ": _quote(at=at)},
+    )
+
+    assert result["missing"] == ["600000.SH"]
+    assert service.account(first["id"])["summary"]["critical_incident_count"] == 0
+    assert service.account(second["id"])["summary"]["critical_incident_count"] == 1
+
+
+def test_quote_canary_does_not_call_an_unconfirmed_holiday_a_feed_failure(tmp_path):
+    service = _service(tmp_path)
+    account, _ = _account_with_buy_order(service)
+
+    result = service.probe_quote_chain(
+        now=datetime(2026, 8, 27, 9, 20, tzinfo=CN_TZ),
+        quotes={},
+    )
+    current = service.account(account["id"])
+
+    assert result["ready"] is False
+    assert current["summary"]["critical_incident_count"] == 0
+    assert any(
+        incident["code"] == "QUOTE_CHAIN_NOT_READY"
+        and incident["severity"] == "warning"
+        for incident in current["incidents"]
+    )
 
 
 def test_preflight_requires_each_orders_own_current_quote(tmp_path):
@@ -947,7 +996,8 @@ def test_today_pnl_keeps_realized_sell_after_position_closes(tmp_path, monkeypat
 @pytest.mark.parametrize(
     ("quote", "expected"),
     [
-        (_quote(volume=0), "REJECTED_SUSPENDED"),
+        (_quote(volume=0), "UNKNOWN_MARKET_DATA"),
+        ({**_quote(volume=0), "is_suspended": True}, "REJECTED_SUSPENDED"),
         (
             {**_quote(price=11.0, previous=10.0), "high": 11.0, "low": 11.0},
             "REJECTED_LIMIT_UP",
@@ -964,7 +1014,7 @@ def test_open_executor_has_explicit_blocked_terminal_states(tmp_path, quote, exp
         finalize_missing=True,
     )
 
-    assert result["rejected"] == 1
+    assert result["unknown" if expected == "UNKNOWN_MARKET_DATA" else "rejected"] == 1
     assert service.account(account["id"])["orders"][0]["status"] == expected
 
 
@@ -1473,6 +1523,82 @@ def test_intraday_stop_on_same_day_buy_is_t1_locked_and_not_sold(tmp_path):
     )
 
 
+def test_intraday_exit_requires_a_strictly_later_quote(tmp_path):
+    service = _service(tmp_path)
+    account, order_id = _account_with_buy_order(
+        service,
+        config=_config(exit_mode="intraday", overrides={"stop_loss": 0.05}),
+    )
+    service.ledger.assign_due_date(order_id, SIGNAL_DAY, {})
+    service.ledger.execute_fill(
+        order_id,
+        price=10,
+        quantity=1_000,
+        quote_at=datetime(2026, 8, 26, 9, 30, tzinfo=CN_TZ),
+        source="open_quote",
+    )
+    trigger_time = datetime(2026, 8, 27, 10, 5, tzinfo=CN_TZ)
+    trigger = {
+        "symbol": "000001.SZ", "timestamp": trigger_time,
+        "open": 9.4, "high": 9.45, "low": 9.35, "close": 9.4,
+        "prev_close": 10.0, "volume": 20_000,
+    }
+
+    service.on_quote_records([trigger], source="minute_k")
+    service.on_quote_records([trigger], source="minute_k")
+    before_later_quote = service.account(account["id"])
+
+    assert len(before_later_quote["fills"]) == 1
+    assert any(
+        order["planned_session"] == "NEXT_QUOTE" and order["status"] == "PLANNED"
+        for order in before_later_quote["orders"]
+    )
+
+    service.on_quote_records(
+        [{**trigger, "timestamp": datetime(2026, 8, 27, 10, 6, tzinfo=CN_TZ), "close": 9.38}],
+        source="minute_k",
+    )
+    after_later_quote = service.account(account["id"])
+
+    assert len(after_later_quote["fills"]) == 2
+    assert after_later_quote["positions"] == []
+
+
+def test_intraday_order_without_later_quote_is_closed_but_exit_intent_survives(tmp_path):
+    service = _service(tmp_path)
+    account, order_id = _account_with_buy_order(
+        service,
+        config=_config(exit_mode="intraday", overrides={"stop_loss": 0.05}),
+    )
+    service.ledger.assign_due_date(order_id, SIGNAL_DAY, {})
+    service.ledger.execute_fill(
+        order_id,
+        price=10,
+        quantity=1_000,
+        quote_at=datetime(2026, 8, 26, 9, 30, tzinfo=CN_TZ),
+        source="open_quote",
+    )
+    service.on_quote_records(
+        [{
+            "symbol": "000001.SZ",
+            "timestamp": datetime(2026, 8, 27, 15, 0, tzinfo=CN_TZ),
+            "open": 9.4, "high": 9.45, "low": 9.35, "close": 9.4,
+            "prev_close": 10.0, "volume": 20_000,
+        }],
+        source="minute_k",
+    )
+
+    result = service.settle_all(trading_date=TRADE_DAY)
+    current = service.account(account["id"])
+    intraday_order = next(
+        order for order in current["orders"] if order["planned_session"] == "NEXT_QUOTE"
+    )
+
+    assert result["intraday_finalized"] == 1
+    assert intraday_order["status"] == "CANCELLED"
+    assert current["positions"][0]["pending_exit_reason"] == "stop_loss"
+
+
 def test_settlement_and_reconciliation_are_idempotent(tmp_path):
     service = _service(tmp_path)
     account, order_id = _account_with_buy_order(service)
@@ -1492,6 +1618,42 @@ def test_settlement_and_reconciliation_are_idempotent(tmp_path):
     assert current["reconciliation"]["ok"] is True
 
 
+def test_settlement_waits_until_every_position_has_a_real_close_mark(tmp_path):
+    service = _service(tmp_path)
+    account, order_id = _account_with_buy_order(service)
+    service.ledger.assign_due_date(order_id, TRADE_DAY, {})
+    service.ledger.execute_fill(
+        order_id, price=10, quantity=1_000, quote_at=OPEN_TIME, source="open_quote"
+    )
+
+    delayed = service.settle_all(trading_date=TRADE_DAY)
+    before_close = service.account(account["id"])
+
+    assert delayed["failed"] == 1
+    assert before_close["nav"] == []
+    assert any(
+        incident["code"] == "SETTLEMENT_MARKS_INCOMPLETE"
+        and incident["status"] == "open"
+        for incident in before_close["incidents"]
+    )
+
+    close_at = datetime(2026, 8, 27, 15, 0, tzinfo=CN_TZ)
+    service.ledger.update_marks(
+        {"000001.SZ": {"last_price": 10.2, "quote_at": close_at.isoformat()}},
+        source="realtime",
+    )
+    settled = service.settle_all(trading_date=TRADE_DAY)
+    after_close = service.account(account["id"])
+
+    assert settled["settled"] == 1
+    assert len(after_close["nav"]) == 1
+    assert not any(
+        incident["code"] == "SETTLEMENT_MARKS_INCOMPLETE"
+        and incident["status"] == "open"
+        for incident in after_close["incidents"]
+    )
+
+
 def test_signal_day_without_orders_is_marked_once(tmp_path):
     ledger = PaperLedger(tmp_path)
     account = ledger.create_account(
@@ -1502,6 +1664,113 @@ def test_signal_day_without_orders_is_marked_once(tmp_path):
     ledger.mark_signal_day(account["id"], SIGNAL_DAY)
 
     assert ledger.get_account(account["id"])["last_processed_date"] == "2026-08-26"
+
+
+def test_signal_recovery_seals_a_prior_ready_day_before_market_open(tmp_path, monkeypatch):
+    from app.services import risk_admitted_forecast_paper as managed
+
+    service = _service(tmp_path)
+    account = service.ledger.create_account(
+        name="前向恢复模拟盘",
+        baseline_date=SIGNAL_DAY,
+        account_id=managed.ACCOUNT_ID,
+        config={
+            "strategy_id": managed.STRATEGY_ID,
+            "asset_type": "stock",
+            "initial_capital": managed.INITIAL_CAPITAL,
+        },
+    )
+    calls: list[tuple[str, date]] = []
+    monkeypatch.setattr(managed, "inputs_ready", lambda *_args: True)
+    monkeypatch.setattr(managed, "checkpoint_signal_date", lambda *_args: None)
+    monkeypatch.setattr(
+        service,
+        "seal_account_signals",
+        lambda account_id, signal_date: (
+            calls.append((account_id, signal_date)) or {"signals": 0, "orders": 0}
+        ),
+    )
+
+    result = service.seal_ready_signals(
+        now=datetime(2026, 8, 27, 8, 45, tzinfo=CN_TZ)
+    )
+
+    assert result == {"processed": 1, "skipped": 0, "failed": 0, "orders": 0}
+    assert calls == [(account["id"], SIGNAL_DAY)]
+
+
+def test_creating_one_order_does_not_claim_the_whole_signal_day_completed(tmp_path):
+    ledger = PaperLedger(tmp_path)
+    account = ledger.create_account(
+        name="原子封板模拟盘", baseline_date=SIGNAL_DAY, config=_config()
+    )
+
+    ledger.record_signal_and_order(
+        account_id=account["id"], strategy_id="atomic-seal",
+        symbol="000001.SZ", name="平安银行", side="BUY",
+        signal_date=SIGNAL_DAY, score=1, reason="first-of-many",
+        signal_ref="batch", requested_qty=100, target_amount=1_000,
+        target_weight=0.1, planned_session="NEXT_OPEN",
+    )
+
+    assert ledger.get_account(account["id"])["last_processed_date"] is None
+
+
+def test_target_weight_buy_sizes_only_the_delta_of_an_existing_position(tmp_path):
+    service = _service(tmp_path)
+    account, first_order = _account_with_buy_order(
+        service, config=_config(initial_capital=50_000)
+    )
+    service.ledger.assign_due_date(first_order, SIGNAL_DAY, {})
+    service.ledger.execute_fill(
+        first_order, price=10, quantity=1_000,
+        quote_at=datetime(2026, 8, 26, 9, 30, tzinfo=CN_TZ), source="open_quote",
+    )
+    _, rebalance_order, _ = service.ledger.record_signal_and_order(
+        account_id=account["id"], strategy_id="target-portfolio",
+        symbol="000001.SZ", name="平安银行", side="BUY",
+        signal_date=SIGNAL_DAY, score=1, reason="target_increase",
+        signal_ref="target-30k", requested_qty=0, target_amount=30_000,
+        target_weight=0.6, planned_session="NEXT_OPEN",
+    )
+    service.ledger.assign_due_date(rebalance_order, TRADE_DAY, {})
+
+    result = service.execute_open_orders(
+        now=OPEN_TIME, quotes={"000001.SZ": _quote(price=10, at=OPEN_TIME)}
+    )
+
+    assert result["filled"] == 1
+    # The target is cash-inclusive, so commission/slippage keep one lot of
+    # headroom instead of overdrawing the account.
+    assert service.account(account["id"])["positions"][0]["quantity"] == 2_900
+
+
+def test_target_weight_sell_sizes_to_the_remaining_target_at_open(tmp_path):
+    service = _service(tmp_path)
+    account, first_order = _account_with_buy_order(
+        service, config=_config(initial_capital=50_000)
+    )
+    service.ledger.assign_due_date(first_order, SIGNAL_DAY, {})
+    service.ledger.execute_fill(
+        first_order, price=10, quantity=4_000,
+        quote_at=datetime(2026, 8, 26, 9, 30, tzinfo=CN_TZ), source="open_quote",
+    )
+    service.ledger.unlock_positions(TRADE_DAY)
+    _, rebalance_order, _ = service.ledger.record_signal_and_order(
+        account_id=account["id"], strategy_id="target-portfolio",
+        symbol="000001.SZ", name="平安银行", side="SELL",
+        signal_date=SIGNAL_DAY, score=None, reason="target_decrease",
+        signal_ref="target-20k", requested_qty=4_000, target_amount=20_000,
+        target_weight=0.4, planned_session="NEXT_OPEN",
+    )
+    service.ledger.assign_due_date(rebalance_order, TRADE_DAY, {})
+
+    result = service.execute_open_orders(
+        now=OPEN_TIME, quotes={"000001.SZ": _quote(price=10, at=OPEN_TIME)}
+    )
+
+    assert result["filled"] == 1
+    assert service.account(account["id"])["positions"][0]["quantity"] == 2_000
 
 
 def test_delete_only_hides_selected_account_and_retains_audit_ledger(tmp_path):

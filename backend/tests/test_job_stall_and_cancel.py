@@ -105,6 +105,7 @@ def test_running_job_is_recovered_as_failed_after_restart(tmp_path):
     first.progress(jid, "sync_minute", 92, "当前分段标的 206/5553", stage_pct=3)
 
     restarted = JobStore(store_dir=store_dir)
+    restarted.recover_interrupted_jobs()
     recovered = restarted.get(jid)
 
     assert recovered is not None
@@ -122,10 +123,21 @@ def test_completed_job_is_not_rewritten_after_restart(tmp_path):
     first.succeed(jid, {"minute_rows": 241})
 
     restarted = JobStore(store_dir=store_dir)
+    restarted.recover_interrupted_jobs()
     completed = restarted.get(jid)
 
     assert completed["status"] == "succeeded"
     assert completed["result"] == {"minute_rows": 241}
+
+
+def test_importing_job_store_from_a_helper_process_does_not_fail_live_job(tmp_path):
+    store_dir = tmp_path / "jobs"
+    owner = JobStore(store_dir=store_dir)
+    jid = _make_running_job(owner, timeout_s=60)
+
+    observer = JobStore(store_dir=store_dir)
+
+    assert observer.get(jid)["status"] == "running"
 
 
 # ── 协作式取消 ──────────────────────────────────────────────────────────

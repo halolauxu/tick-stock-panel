@@ -110,7 +110,6 @@ class JobStore:
         self._active_id: str | None = None
         self._lock = threading.Lock()
         self._store_dir.mkdir(parents=True, exist_ok=True)
-        self._recover_interrupted_jobs()
 
     # ===== persistence =====
 
@@ -131,7 +130,7 @@ class JobStore:
             except Exception:
                 pass
 
-    def _recover_interrupted_jobs(self) -> None:
+    def recover_interrupted_jobs(self) -> int:
         """进程启动时把遗留的活跃记录明确标为“服务重启中断”。
 
         数据任务在线程内运行，进程退出后不可能继续。运行态若只放内存，页面会在
@@ -157,6 +156,7 @@ class JobStore:
             recovered += 1
         if recovered:
             logger.warning("recovered %d interrupted pipeline job(s) after service restart", recovered)
+        return recovered
 
     def _read_file(self, job_id: str) -> dict[str, Any] | None:
         """从磁盘读取单个 job 文件。"""

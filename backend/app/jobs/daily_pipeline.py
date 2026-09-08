@@ -1030,20 +1030,28 @@ def _scheduled_pipeline_task(pipeline_fn) -> bool:
     """Freeze the newly sealed day of paper signals after the pipeline succeeds."""
     if not _run_tracked(pipeline_fn, "daily_pipeline"):
         return False
-    service = getattr(_get_app_state(), "paper_trading_service", None)
-    if service is not None:
+    state = _get_app_state()
+    if state is not None:
         try:
-            recovery = service.recover_missed_open()
-            logger.info("scheduled paper evidence recovery result: %s", recovery)
+            from app.services.paper_trading import get_service
+
+            service = get_service(state)
+            try:
+                recovery = service.recover_missed_open()
+                logger.info("scheduled paper evidence recovery result: %s", recovery)
+            except Exception:
+                logger.exception(
+                    "scheduled paper evidence recovery failed; signal sealing will continue"
+                )
+            try:
+                result = service.seal_ready_signals()
+                logger.info("scheduled paper signal seal result: %s", result)
+            except Exception:
+                logger.exception(
+                    "scheduled paper signal seal failed; daily pipeline remains succeeded"
+                )
         except Exception:
-            logger.exception(
-                "scheduled paper evidence recovery failed; signal sealing will continue"
-            )
-        try:
-            result = service.seal_daily_signals()
-            logger.info("scheduled paper signal seal result: %s", result)
-        except Exception:
-            logger.exception("scheduled paper signal seal failed; daily pipeline remains succeeded")
+            logger.exception("scheduled paper service unavailable; pipeline remains succeeded")
     try:
         from app.services.mining_schedule import run_weekly_mining
 
@@ -1307,11 +1315,13 @@ def _register_review_job(scheduler, repo, hour: int, minute: int) -> None:
 
 def _paper_clock_call(method: str) -> None:
     state = _get_app_state()
-    service = getattr(state, "paper_trading_service", None) if state else None
-    if service is None:
+    if state is None:
         logger.warning("paper clock %s skipped: service not ready", method)
         return
     try:
+        from app.services.paper_trading import get_service
+
+        service = get_service(state)
         quotes = None
         if method in {
             "probe_quote_chain",
@@ -1384,6 +1394,15 @@ def _register_paper_clock_jobs(scheduler) -> None:
         lambda: _paper_clock_call("recover_missed_open"),
         trigger=IntervalTrigger(minutes=1),
         id="paper_evidence_recovery",
+        misfire_grace_time=60,
+        coalesce=True,
+        max_instances=1,
+        replace_existing=True,
+    )
+    scheduler.add_job(
+        lambda: _paper_clock_call("seal_ready_signals"),
+        trigger=IntervalTrigger(minutes=1),
+        id="paper_signal_recovery",
         misfire_grace_time=60,
         coalesce=True,
         max_instances=1,

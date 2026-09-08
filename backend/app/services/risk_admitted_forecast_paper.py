@@ -69,6 +69,26 @@ HISTORICAL_RESULTS = (
     },
 )
 
+_FROZEN_ACCOUNT_CONTRACT = {
+    "strategy_id": STRATEGY_ID,
+    "asset_type": "stock",
+    "entry_fill": "open_t+1",
+    "exit_fill": "open_t+1",
+    "commission_pct": 0.0002,
+    "stamp_tax_pct": 0.0005,
+    "slippage_bps": 5.0,
+    "max_positions": TOTAL_SLOTS,
+    "max_exposure_pct": 1.0,
+    "initial_capital": INITIAL_CAPITAL,
+    "position_sizing": "frozen_target_weight",
+    "holding_days": EVENT_LIFETIME,
+    "minute_fill": False,
+    "exit_mode": "eod",
+    "enforce_t_plus_one": True,
+    "forward_only": True,
+    "research_result_sha256": RESULT_SHA256,
+}
+
 
 def ensure_account(paper_service, baseline_date: date) -> dict[str, Any]:
     """Create the one immutable 200k forward account, idempotently."""
@@ -76,12 +96,16 @@ def ensure_account(paper_service, baseline_date: date) -> dict[str, Any]:
     try:
         account = paper_service.ledger.get_account(ACCOUNT_ID)
         config = account["config"]
-        if (
-            config.get("strategy_id") != STRATEGY_ID
-            or config.get("research_result_sha256") != RESULT_SHA256
-            or float(config.get("initial_capital") or 0.0) != INITIAL_CAPITAL
-        ):
+        mismatches = {
+            key: {"expected": expected, "actual": config.get(key)}
+            for key, expected in _FROZEN_ACCOUNT_CONTRACT.items()
+            if config.get(key) != expected
+        }
+        if mismatches:
             raise ValueError("现有前向账户合同与冻结策略不一致，拒绝静默覆盖")
+        paper_service.ledger.resolve_incident(
+            f"account:{ACCOUNT_ID}:FORWARD_CONTRACT_MISMATCH"
+        )
         return account
     except KeyError:
         account = paper_service.ledger.create_account(
@@ -89,27 +113,11 @@ def ensure_account(paper_service, baseline_date: date) -> dict[str, Any]:
             baseline_date=baseline_date,
             account_id=ACCOUNT_ID,
             config={
-                "strategy_id": STRATEGY_ID,
+                **_FROZEN_ACCOUNT_CONTRACT,
                 "strategy_name": ACCOUNT_NAME,
-                "asset_type": "stock",
                 "symbols": None,
                 "params": {},
                 "overrides": {},
-                "entry_fill": "open_t+1",
-                "exit_fill": "open_t+1",
-                "commission_pct": 0.0002,
-                "stamp_tax_pct": 0.0005,
-                "slippage_bps": 5.0,
-                "max_positions": TOTAL_SLOTS,
-                "max_exposure_pct": 1.0,
-                "initial_capital": INITIAL_CAPITAL,
-                "position_sizing": "frozen_target_weight",
-                "holding_days": EVENT_LIFETIME,
-                "minute_fill": False,
-                "exit_mode": "eod",
-                "enforce_t_plus_one": True,
-                "forward_only": True,
-                "research_result_sha256": RESULT_SHA256,
             },
         )
         paper_service.ledger.record_account_event(
@@ -132,6 +140,21 @@ def ensure_account(paper_service, baseline_date: date) -> dict[str, Any]:
 
 def is_managed_account(config: dict[str, Any]) -> bool:
     return config.get("strategy_id") == STRATEGY_ID
+
+
+def inputs_ready(data_dir: Path, signal_date: date) -> bool:
+    """Return whether every point-in-time input needed by the sealer is frozen."""
+    receipt = _read_json(data_dir / "event_data" / "forecast" / "sync_status.json")
+    covered = _as_date(receipt.get("end_date")) if receipt else None
+    return covered is not None and covered >= signal_date
+
+
+def checkpoint_signal_date(data_dir: Path) -> date | None:
+    try:
+        state = _load_state(_state_path(data_dir)) or {}
+    except (OSError, ValueError, json.JSONDecodeError):
+        return None
+    return _as_date(state.get("last_signal_date"))
 
 
 def managed_strategy_snapshot(
@@ -162,8 +185,11 @@ def managed_strategy_snapshot(
         state = _load_state(_state_path(data_dir)) or {}
     except (OSError, ValueError, json.JSONDecodeError):
         state = {}
-    last_signal = _as_date(
-        (account or {}).get("last_processed_date") or state.get("last_signal_date")
+    account_signal = _as_date((account or {}).get("last_processed_date"))
+    state_signal = _as_date(state.get("last_signal_date"))
+    last_signal = account_signal or state_signal
+    state_consistent = account_signal == state_signal or (
+        account_signal is None and state_signal is None
     )
     schedule = _pipeline_schedule()
     lifecycle = _managed_lifecycle(
@@ -173,6 +199,7 @@ def managed_strategy_snapshot(
         latest_enriched=latest_enriched,
         forecast_covered=forecast_covered,
         last_signal=last_signal,
+        state_consistent=state_consistent,
     )
     nav = (account or {}).get("nav") or []
     last_settlement = _as_date(nav[-1].get("trading_date")) if nav else None
@@ -218,6 +245,7 @@ def managed_strategy_snapshot(
             "latest_enriched_date": _date_text(latest_enriched),
             "forecast_covered_through": _date_text(forecast_covered),
             "last_signal_date": _date_text(last_signal),
+            "signal_state_consistent": state_consistent,
             "last_settlement_date": _date_text(last_settlement),
             "signal_count": len((account or {}).get("signals") or []),
             "order_count": len((account or {}).get("orders") or []),
@@ -238,6 +266,7 @@ def _managed_lifecycle(
     latest_enriched: date | None,
     forecast_covered: date | None,
     last_signal: date | None,
+    state_consistent: bool = True,
 ) -> dict[str, Any]:
     code = "WAITING_PIPELINE"
     label = "等待盘后数据"
@@ -262,7 +291,12 @@ def _managed_lifecycle(
             for row in (account.get("orders") or [])
             if row.get("status") in {"PLANNED", "PREFLIGHT_OK"}
         ]
-        if open_incidents:
+        if not state_consistent:
+            code, label = "BLOCKED", "信号账本与状态不一致"
+            detail = "不可变账本和前向状态的封板日期不一致，必须先自动恢复并复核。"
+            next_action = "运行封板恢复；一致前不生成新订单"
+            stage = "blocked"
+        elif open_incidents:
             code, label = "BLOCKED", "存在阻断异常"
             detail = str(open_incidents[0].get("detail") or open_incidents[0].get("title"))
             next_action = "先处理异常，系统不会制造成交"
@@ -298,10 +332,20 @@ def _managed_lifecycle(
             )
             next_action = "等待业绩预告自动补采；输入未齐不会生成信号"
         elif last_signal is None or last_signal < latest_enriched:
-            code, label = "WAITING_SEAL", "数据已齐，等待信号封板"
+            seal_due = dt_time(schedule["hour"], schedule["minute"])
+            overdue = now.date() > latest_enriched or (
+                now.date() == latest_enriched
+                and now.weekday() < 5
+                and now.time() >= seal_due
+            )
+            code = "SEAL_OVERDUE" if overdue else "WAITING_SEAL"
+            label = "信号封板逾期" if overdue else "数据已齐，等待信号封板"
             detail = f"{_date_text(latest_enriched)} 输入已完整，尚未写入不可变目标。"
-            next_action = "自动生成目标并写入审计账本"
-            stage = "signal"
+            next_action = (
+                "补偿执行器应立即封板；完成前不能显示健康"
+                if overdue else "自动生成目标并写入审计账本"
+            )
+            stage = "blocked" if overdue else "signal"
         else:
             fills = account.get("fills") or []
             positions = account.get("positions") or []
@@ -363,11 +407,55 @@ def _date_text(value: date | None) -> str | None:
     return value.isoformat() if value is not None else None
 
 
+def _record_target_events(
+    paper_service,
+    account_id: str,
+    signal_date: date,
+    plan: dict[str, Any],
+    *,
+    signals: int,
+    orders: int,
+) -> None:
+    targets = plan.get("targets") or []
+    paper_service.ledger.record_account_event(
+        account_id,
+        event_key=f"{account_id}:TARGETS:{signal_date}",
+        event_type="FORWARD_TARGETS_FROZEN",
+        trading_date=signal_date,
+        title="专用组合目标已冻结",
+        detail=(
+            f"目标 {len(targets)} 只：事件 {plan.get('event_count', 0)} 只、"
+            f"微盘 {plan.get('microcap_count', 0)} 只；次日订单 {orders} 笔"
+        ),
+        payload={
+            "decision_id": plan["decision_id"],
+            "risk": plan.get("risk"),
+            "target_count": len(targets),
+            "event_count": plan.get("event_count", 0),
+            "microcap_count": plan.get("microcap_count", 0),
+            "signals": signals,
+            "orders": orders,
+        },
+    )
+    if plan.get("recovered_gap_dates"):
+        paper_service.ledger.record_account_event(
+            account_id,
+            event_key=f"{account_id}:SIGNAL_GAP_RECOVERED:{signal_date}",
+            event_type="SIGNAL_GAP_RECOVERED",
+            trading_date=signal_date,
+            severity="warning",
+            title="跨日信号状态已补偿推进",
+            detail=(
+                "未倒填历史订单；已按每个缺失交易日推进风险和事件状态，"
+                "仅生成当前仍有效的最新目标。"
+            ),
+            payload={"recovered_gap_dates": plan["recovered_gap_dates"]},
+        )
+
+
 def seal_account(paper_service, account_id: str, signal_date: date) -> dict[str, int]:
     account = paper_service.ledger.get_account(account_id)
     if account["status"] != "active":
-        return {"signals": 0, "orders": 0}
-    if account.get("last_processed_date") == signal_date.isoformat():
         return {"signals": 0, "orders": 0}
     baseline = date.fromisoformat(account["baseline_date"])
     if signal_date < baseline:
@@ -375,12 +463,64 @@ def seal_account(paper_service, account_id: str, signal_date: date) -> dict[str,
 
     state_path = _state_path(paper_service.repo.store.data_dir)
     previous = _load_state(state_path)
+    account_signal = _as_date(account.get("last_processed_date"))
+    state_signal = _as_date((previous or {}).get("last_signal_date"))
+    if account_signal and account_signal > signal_date:
+        raise ValueError("账户账本日期晚于待封板日，拒绝倒写")
+    if state_signal and state_signal > signal_date:
+        raise ValueError("前向状态日期晚于待封板日，拒绝倒写")
+    if account_signal == signal_date and state_signal == signal_date:
+        return {"signals": 0, "orders": 0}
+
+    # Repair the two possible crash boundaries without recreating fills.  The
+    # ledger remains the source of truth; the state/decision files are a
+    # deterministic strategy checkpoint, never evidence that an order filled.
+    if state_signal == signal_date and account_signal != signal_date:
+        decision = _read_json(_decision_path(paper_service.repo.store.data_dir, signal_date))
+        if not decision or decision.get("decision_id") != previous.get("last_decision_id"):
+            raise ValueError("前向状态已推进但不可变决策缺失，拒绝直接标记封板")
+        day_signals = [
+            row for row in account["signals"]
+            if _as_date(row.get("signal_date")) == signal_date
+        ]
+        day_orders = [
+            row for row in account["orders"]
+            if _as_date(row.get("signal_date")) == signal_date
+        ]
+        _record_target_events(
+            paper_service,
+            account_id,
+            signal_date,
+            decision,
+            signals=len(day_signals),
+            orders=len(day_orders),
+        )
+        paper_service.ledger.record_account_event(
+            account_id,
+            event_key=f"{account_id}:SIGNAL_CHECKPOINT_RECOVERED:{signal_date}",
+            event_type="SIGNAL_CHECKPOINT_RECOVERED",
+            trading_date=signal_date,
+            severity="warning",
+            title="封板账本检查点已恢复",
+            detail="订单批次和策略状态已存在；服务重启后补记账户封板日期。",
+        )
+        paper_service.ledger.mark_signal_day(account_id, signal_date)
+        return {"signals": 0, "orders": 0}
+
     plan, next_state = build_forward_plan(
         paper_service.repo.store.data_dir,
         signal_date,
         baseline_date=baseline,
         previous_state=previous,
     )
+    if account_signal == signal_date:
+        _write_decision(
+            paper_service.repo.store.data_dir,
+            {**plan, "forward_state": next_state},
+        )
+        _atomic_json(state_path, next_state)
+        return {"signals": 0, "orders": 0}
+
     positions = {row["symbol"]: row for row in account["positions"]}
     live_orders = [
         row
@@ -400,9 +540,43 @@ def seal_account(paper_service, account_id: str, signal_date: date) -> dict[str,
             "CANCELLED",
         }
     ]
+    # A newer target snapshot supersedes every still-live order from an older
+    # signal day.  Keeping both could buy an exited symbol or apply two target
+    # snapshots at the same open.
+    for order in live_orders:
+        if _as_date(order.get("signal_date")) != signal_date:
+            paper_service.ledger.terminal_order(
+                order["id"],
+                status="CANCELLED",
+                reason=f"已由 {signal_date.isoformat()} 最新冻结目标替代",
+                severity="info",
+            )
+    live_orders = [
+        row for row in live_orders if _as_date(row.get("signal_date")) == signal_date
+    ]
     pending_buy = {row["symbol"] for row in live_orders if row["side"] == "BUY"}
     pending_sell = {row["symbol"] for row in live_orders if row["side"] == "SELL"}
     targets = {row["symbol"]: row for row in plan["targets"]}
+    order_by_id = {row["id"]: row for row in account["orders"]}
+    position_families: dict[str, str] = {
+        str(row["symbol"]): "main_board_microcap"
+        for row in (previous or {}).get("microcap_targets", [])
+    }
+    position_families.update({
+        str(row["symbol"]): "idiosyncratic_forecast"
+        for row in (previous or {}).get("active_events", [])
+    })
+    for signal in account["signals"]:
+        order = order_by_id.get(signal.get("order_id"))
+        family = (signal.get("payload") or {}).get("family")
+        if (
+            signal["symbol"] not in position_families
+            and signal["side"] == "BUY"
+            and family
+            and order
+            and order["status"] in {"FILLED", "PARTIALLY_FILLED"}
+        ):
+            position_families[signal["symbol"]] = str(family)
     signals = 0
     orders = 0
 
@@ -421,20 +595,39 @@ def seal_account(paper_service, account_id: str, signal_date: date) -> dict[str,
             reason="frozen_target_exit",
             signal_ref=plan["decision_id"],
             requested_qty=int(position["quantity"]),
-            target_amount=float(position["market_value"]),
+            target_amount=0.0,
             target_weight=0.0,
             planned_session="NEXT_OPEN",
-            payload={"family": position.get("family"), "decision": plan["decision_id"]},
+            payload={
+                "family": position_families.get(symbol),
+                "decision": plan["decision_id"],
+            },
         )
         signals += int(created)
         orders += int(created)
 
     equity = float(account["summary"]["equity"])
     for symbol, target in sorted(targets.items(), key=lambda item: (item[1]["rank"], item[0])):
-        if symbol in positions or symbol in pending_buy:
+        if symbol in pending_buy:
             continue
         target_amount = equity * float(target["target_weight"])
         capacity = float(target.get("signal_amount") or 0.0) * 0.01
+        position = positions.get(symbol)
+        rebalance = bool(plan["weekly_rebalance"]) or (
+            position is not None
+            and position_families.get(symbol) != target["family"]
+        )
+        if position is not None and not rebalance:
+            continue
+        current_qty = int(position["quantity"]) if position else 0
+        current_value = float(position["market_value"]) if position else 0.0
+        last_price = float(position.get("last_price") or 0.0) if position else 0.0
+        desired_qty = (
+            max(int(target_amount / last_price / 100) * 100, 0)
+            if last_price > 0 else None
+        )
+        if position is not None and desired_qty == current_qty:
+            continue
         payload = {
             "family": target["family"],
             "rank": target["rank"],
@@ -442,7 +635,8 @@ def seal_account(paper_service, account_id: str, signal_date: date) -> dict[str,
             "capacity": capacity,
             "risk_on": plan["risk"]["risk_on"],
         }
-        if target_amount > capacity:
+        required_increase = max(target_amount - current_value, 0.0)
+        if required_increase > capacity:
             _, created = paper_service.ledger.record_skipped_signal(
                 account_id=account_id,
                 strategy_id=STRATEGY_ID,
@@ -459,19 +653,32 @@ def seal_account(paper_service, account_id: str, signal_date: date) -> dict[str,
             )
             signals += int(created)
             continue
+        side = "BUY"
+        reason = "frozen_target_entry"
+        requested_qty = 0
+        if position is not None and desired_qty is not None and desired_qty < current_qty:
+            if symbol in pending_sell:
+                continue
+            side = "SELL"
+            reason = "frozen_target_rebalance_decrease"
+            # The opening executor derives the exact sell delta from the
+            # frozen target amount at the observed open price.
+            requested_qty = current_qty
+        elif position is not None:
+            reason = "frozen_target_rebalance_increase"
         _, _, created = paper_service.ledger.record_signal_and_order(
             account_id=account_id,
             strategy_id=STRATEGY_ID,
             symbol=symbol,
             name=str(target.get("name") or symbol),
-            side="BUY",
+            side=side,
             signal_date=signal_date,
             score=float(-target["rank"]),
-            reason="frozen_target_entry",
+            reason=reason,
             signal_ref=plan["decision_id"],
             # Zero tells the opening clock to size from the frozen CNY target
             # at the observed next-open price rather than today's close.
-            requested_qty=0,
+            requested_qty=requested_qty,
             target_amount=target_amount,
             target_weight=float(target["target_weight"]),
             planned_session="NEXT_OPEN",
@@ -480,29 +687,20 @@ def seal_account(paper_service, account_id: str, signal_date: date) -> dict[str,
         signals += int(created)
         orders += int(created)
 
-    paper_service.ledger.record_account_event(
+    _write_decision(
+        paper_service.repo.store.data_dir,
+        {**plan, "forward_state": next_state},
+    )
+    _atomic_json(state_path, next_state)
+    _record_target_events(
+        paper_service,
         account_id,
-        event_key=f"{account_id}:TARGETS:{signal_date}",
-        event_type="FORWARD_TARGETS_FROZEN",
-        trading_date=signal_date,
-        title="专用组合目标已冻结",
-        detail=(
-            f"目标 {len(targets)} 只：事件 {plan['event_count']} 只、"
-            f"微盘 {plan['microcap_count']} 只；次日订单 {orders} 笔"
-        ),
-        payload={
-            "decision_id": plan["decision_id"],
-            "risk": plan["risk"],
-            "target_count": len(targets),
-            "event_count": plan["event_count"],
-            "microcap_count": plan["microcap_count"],
-            "signals": signals,
-            "orders": orders,
-        },
+        signal_date,
+        plan,
+        signals=signals,
+        orders=orders,
     )
     paper_service.ledger.mark_signal_day(account_id, signal_date)
-    _atomic_json(state_path, next_state)
-    _write_decision(paper_service.repo.store.data_dir, plan)
     return {"signals": signals, "orders": orders}
 
 
@@ -520,8 +718,6 @@ def build_forward_plan(
         raise ValueError(f"缺少 {signal_date} 完整 enriched 数据")
     features = build_daily_features(panel)
     feature_by_date = {row["date"]: row for row in features.to_dicts()}
-    current = panel.filter(pl.col("date") == signal_date)
-
     state = previous_state or _bootstrap_state(data_dir, baseline_date)
     last_signal = _as_date(state.get("last_signal_date"))
     new_dates = [day for day in dates if last_signal is None or day > last_signal]
@@ -530,7 +726,8 @@ def build_forward_plan(
 
     active_events = [dict(row) for row in state.get("active_events", [])]
     microcap_targets = [dict(row) for row in state.get("microcap_targets", [])]
-    skipped_gap_dates: list[str] = []
+    recovered_gap_dates: list[str] = []
+    rebalance_dates: list[str] = []
     risk = {
         "risk_on": bool(state.get("risk_on", True)),
         "off_days": int(state.get("off_days", 0)),
@@ -547,22 +744,22 @@ def build_forward_plan(
         if feature is None:
             raise ValueError(f"缺少 {day} 风险状态特征")
         risk, last_risk = advance_risk_state(risk, feature)
+        current_day = panel.filter(pl.col("date") == day)
+        if day >= baseline_date and not risk["risk_on"]:
+            new_events = _idiosyncratic_events_for_date(data_dir, day, current_day)
+            by_key = {(row["symbol"], row["ann_date"]): row for row in active_events}
+            for row in new_events:
+                by_key[(row["symbol"], row["ann_date"])] = {**row, "age": 0}
+            active_events = list(by_key.values())
+        if day.weekday() == 4:
+            microcap_targets = _microcap_targets(current_day)
+            rebalance_dates.append(day.isoformat())
         if day != signal_date:
-            skipped_gap_dates.append(day.isoformat())
+            recovered_gap_dates.append(day.isoformat())
 
-    if signal_date >= baseline_date and not risk["risk_on"]:
-        new_events = _idiosyncratic_events_for_date(data_dir, signal_date, current)
-        by_key = {(row["symbol"], row["ann_date"]): row for row in active_events}
-        for row in new_events:
-            by_key[(row["symbol"], row["ann_date"])] = {**row, "age": 0}
-        active_events = list(by_key.values())
-
-    # The historical contract rebalances on the last observed session of an
-    # ISO week.  Forward execution uses Friday; a holiday-shortened week is
-    # explicitly left as a missed rebalance rather than guessed.
-    weekly_rebalance = signal_date.weekday() == 4
-    if weekly_rebalance:
-        microcap_targets = _microcap_targets(current)
+    # If a service outage crossed a Friday, restore the latest portfolio on
+    # the next seal.  No order is backdated to the missed session.
+    weekly_rebalance = bool(rebalance_dates)
 
     latest_by_symbol: dict[str, dict[str, Any]] = {}
     for row in active_events:
@@ -628,7 +825,8 @@ def build_forward_plan(
         "research_result_sha256": RESULT_SHA256,
         "risk": {**risk, "features": last_risk},
         "weekly_rebalance": weekly_rebalance,
-        "skipped_gap_dates": skipped_gap_dates,
+        "rebalance_dates": rebalance_dates,
+        "recovered_gap_dates": recovered_gap_dates,
         "targets": targets,
         "event_count": len(active_events),
         "microcap_count": sum(row["family"] == "main_board_microcap" for row in targets),
@@ -1174,6 +1372,17 @@ def _state_path(data_dir: Path) -> Path:
     return data_dir / "research" / "forward" / STRATEGY_ID / "state.json"
 
 
+def _decision_path(data_dir: Path, signal_date: date) -> Path:
+    return (
+        data_dir
+        / "research"
+        / "forward"
+        / STRATEGY_ID
+        / "decisions"
+        / f"{signal_date.isoformat()}.json"
+    )
+
+
 def _load_state(path: Path) -> dict[str, Any] | None:
     if not path.exists():
         return None
@@ -1184,14 +1393,7 @@ def _load_state(path: Path) -> dict[str, Any] | None:
 
 
 def _write_decision(data_dir: Path, plan: dict[str, Any]) -> None:
-    path = (
-        data_dir
-        / "research"
-        / "forward"
-        / STRATEGY_ID
-        / "decisions"
-        / f"{plan['signal_date']}.json"
-    )
+    path = _decision_path(data_dir, date.fromisoformat(plan["signal_date"]))
     if path.exists():
         current = json.loads(path.read_text(encoding="utf-8"))
         if current.get("decision_id") != plan["decision_id"]:

@@ -111,6 +111,14 @@ async def _application_lifespan(app: FastAPI):
     repo = KlineRepository(store)
     app.state.datastore = store
     app.state.repo = repo
+    # Recovery is an application-startup action, not an import side effect.
+    # Helper/maintenance processes may import ``pipeline_jobs`` while this
+    # server still owns a live job and must never mark it interrupted.
+    from app.services.pipeline_jobs import job_store
+
+    recovered_pipeline_jobs = job_store.recover_interrupted_jobs()
+    if recovered_pipeline_jobs:
+        logger.warning("recovered %d interrupted pipeline jobs", recovered_pipeline_jobs)
     from app.services.mining_manager import MiningJobManager
 
     mining_manager = MiningJobManager(store.data_dir)
@@ -266,12 +274,27 @@ async def _application_lifespan(app: FastAPI):
 
     # The frozen overlay owns one forward-only paper account. Creation is
     # idempotent, hash-gated, and never replays historical fills on startup.
+    from app.services.risk_admitted_forecast_paper import ACCOUNT_ID, ensure_account
+
     try:
-        from app.services.risk_admitted_forecast_paper import ensure_account
         ensured = ensure_account(paper_trading_service, cn_today())
         logger.info("forecast overlay paper account ready: %s", ensured["id"])
     except Exception as exc:  # noqa: BLE001
         logger.warning("forecast overlay paper account not started: %s", exc)
+        try:
+            paper_trading_service.ledger.get_account(ACCOUNT_ID)
+            paper_trading_service.ledger.open_incident(
+                account_id=ACCOUNT_ID,
+                incident_key=f"account:{ACCOUNT_ID}:FORWARD_CONTRACT_MISMATCH",
+                code="FORWARD_CONTRACT_MISMATCH",
+                severity="critical",
+                title="前向账户合同校验失败",
+                detail=str(exc),
+                entity_type="account",
+                entity_id=ACCOUNT_ID,
+            )
+        except KeyError:
+            pass
 
     def _refresh_paper_quotes_on_boot() -> None:
         try:
@@ -288,6 +311,9 @@ async def _application_lifespan(app: FastAPI):
 
     def _recover_paper_open() -> None:
         try:
+            sealed = paper_trading_service.seal_ready_signals()
+            if any(sealed.values()):
+                logger.warning("paper signal recovery result: %s", sealed)
             result = paper_trading_service.recover_missed_open()
             if any(result.values()):
                 logger.warning("paper open recovery result: %s", result)

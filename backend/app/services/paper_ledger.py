@@ -603,10 +603,10 @@ class PaperLedger:
                     title=f"{name or symbol} 订单计划已生成",
                     detail=f"{side} {requested_qty} 股, 等待真实执行时钟",
                 )
-            conn.execute(
-                "UPDATE accounts SET last_signal_date=?,updated_at=? WHERE id=?",
-                (signal_date.isoformat(), frozen, account_id),
-            )
+            # A single intent/order is not proof that the whole signal-day
+            # batch completed.  The caller advances ``last_signal_date`` only
+            # after every intent, order and audit event has been persisted.
+            # This keeps a crash half way through a multi-order seal retryable.
         return signal_id, order_id, created
 
     def record_skipped_signal(
@@ -939,6 +939,7 @@ class PaperLedger:
         source: str,
         quality: str = "ON_TIME",
         previous_close: float | None = None,
+        complete: bool | None = None,
     ) -> str:
         if price <= 0 or quantity <= 0:
             raise ValueError("成交价和数量必须为正数")
@@ -1125,7 +1126,12 @@ class PaperLedger:
                             order["account_id"], order["symbol"],
                         ),
                     )
-            order_status = "FILLED" if quantity >= int(order["requested_qty"]) else "PARTIALLY_FILLED"
+            order_status = (
+                "FILLED"
+                if complete is True
+                or (complete is None and quantity >= int(order["requested_qty"]))
+                else "PARTIALLY_FILLED"
+            )
             conn.execute(
                 """UPDATE orders SET filled_qty=?,status=?,reason=?,execution_quality=?,
                     terminal_at=?,updated_at=? WHERE id=?""",
@@ -1223,7 +1229,7 @@ class PaperLedger:
             return result.rowcount
 
     def planned_orders(self, *, account_id: str | None = None) -> list[sqlite3.Row]:
-        sql = """SELECT o.*,s.signal_date,s.reason AS signal_reason,s.score
+        sql = """SELECT o.*,s.signal_date,s.reason AS signal_reason,s.score,s.payload_json
             FROM orders o JOIN signal_intents s ON s.id=o.signal_id
             WHERE o.status IN ('PLANNED','PREFLIGHT_OK','MISSED_EXECUTION')"""
         params: tuple[Any, ...] = ()

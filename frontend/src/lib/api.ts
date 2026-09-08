@@ -1894,6 +1894,8 @@ export interface PaperTradingSystem {
   tracked_symbol_count: number
   open_incident_count: number
   critical_incident_count: number
+  signal_seal_overdue_count?: number
+  signal_input_delayed_count?: number
   ledger_path: string
 }
 
@@ -2067,7 +2069,7 @@ export interface ManagedForwardStrategy {
     account_exists: boolean
     account_status: 'active' | 'paused' | null
     lifecycle: {
-      code: 'NOT_STARTED' | 'PAUSED' | 'BLOCKED' | 'WAITING_PIPELINE' | 'DATA_DELAYED' | 'INPUT_DELAYED' | 'WAITING_SEAL' | 'WAITING_OPEN' | 'SEALED_NO_ORDER' | 'OBSERVING'
+      code: 'NOT_STARTED' | 'PAUSED' | 'BLOCKED' | 'WAITING_PIPELINE' | 'DATA_DELAYED' | 'INPUT_DELAYED' | 'WAITING_SEAL' | 'SEAL_OVERDUE' | 'WAITING_OPEN' | 'SEALED_NO_ORDER' | 'OBSERVING'
       label: string
       detail: string
       next_action: string
@@ -2077,6 +2079,7 @@ export interface ManagedForwardStrategy {
     latest_enriched_date: string | null
     forecast_covered_through: string | null
     last_signal_date: string | null
+    signal_state_consistent?: boolean
     last_settlement_date: string | null
     signal_count: number
     order_count: number

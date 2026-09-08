@@ -424,7 +424,7 @@ def test_successful_pipeline_runs_paper_accounts_before_mining(monkeypatch):
                 "recovered": 0,
                 "waiting_evidence": 0,
             },
-            seal_daily_signals=lambda: calls.append(("paper", "sealed")) or {
+            seal_ready_signals=lambda: calls.append(("paper", "sealed")) or {
                 "processed": 1,
                 "failed": 0,
                 "orders": 2,
