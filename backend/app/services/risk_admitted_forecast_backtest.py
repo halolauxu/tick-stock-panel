@@ -14,6 +14,8 @@ import hashlib
 import json
 import math
 import statistics
+import subprocess
+import sys
 from collections import defaultdict
 from collections.abc import Callable
 from datetime import date
@@ -50,13 +52,30 @@ FROZEN_PERIODS = (
     },
 )
 DEFAULT_PERIOD_ID = "known_stress"
+ROLLING_SCHEMA = "risk-admitted-idiosyncratic-forecast-rolling-v1"
+ROLLING_START = date(2024, 1, 1)
+FROZEN_THROUGH = date(2026, 8, 28)
 
 
 def strategy_detail(data_dir: Path) -> dict[str, Any]:
     """Return a read-only strategy descriptor used only by Backtest."""
     path = data_dir / "research" / RESULT_FILE
     verified = _verified(path, RESULT_SHA256)
-    default = next(row for row in FROZEN_PERIODS if row["id"] == DEFAULT_PERIOD_ID)
+    periods = [dict(row) for row in FROZEN_PERIODS]
+    latest = _latest_rolling_end(data_dir)
+    if latest is not None and latest > FROZEN_THROUGH:
+        periods.append(
+            {
+                "id": "rolling_observation",
+                "label": f"冻结合同延伸至 {latest:%m-%d}",
+                "start": FROZEN_PERIODS[-1]["start"],
+                "end": latest.isoformat(),
+                "evidence_scope": "post_freeze_observation",
+            }
+        )
+    default = periods[-1] if periods[-1]["id"] == "rolling_observation" else next(
+        row for row in periods if row["id"] == DEFAULT_PERIOD_ID
+    )
     return {
         "id": STRATEGY_ID,
         "name": STRATEGY_NAME,
@@ -91,7 +110,7 @@ def strategy_detail(data_dir: Path) -> dict[str, Any]:
         "immutable_contract": True,
         "artifact_verified": verified,
         "backtest_defaults": {"start": default["start"], "end": default["end"]},
-        "backtest_periods": [dict(row) for row in FROZEN_PERIODS],
+        "backtest_periods": periods,
         "locked_contract": {
             "initial_capital": INITIAL_CAPITAL,
             "total_slots": TOTAL_SLOTS,
@@ -127,7 +146,25 @@ def run_artifact_backtest(
     if not _verified(path, expected_sha256):
         raise ValueError("冻结账户回测证据缺失或哈希不一致，拒绝返回未经验证的结果")
     payload = json.loads(path.read_text(encoding="utf-8"))
-    period_id, period = _select_period(payload, start, end)
+    if end > FROZEN_THROUGH:
+        period_id, period, evidence = _load_rolling_period(
+            data_dir,
+            frozen_payload=payload,
+            start=start,
+            end=end,
+            expected_sha256=expected_sha256,
+            progress_cb=progress_cb,
+            cancel_event=cancel_event,
+        )
+    else:
+        period_id, period = _select_period(payload, start, end)
+        evidence = {
+            "scope": "frozen_evidence",
+            "period_id": period_id,
+            "artifact_sha256": expected_sha256,
+            "artifact_verified": True,
+            "contract_frozen": payload.get("contract_frozen"),
+        }
 
     _check_cancel(cancel_event)
     _progress(progress_cb, "正在读取账户净值与逐笔成交", 1, 3, start)
@@ -189,12 +226,7 @@ def run_artifact_backtest(
             **stats,
             "mode": "position",
             "execution_backend": EXECUTION_BACKEND,
-            "frozen_evidence": {
-                "period_id": period_id,
-                "artifact_sha256": expected_sha256,
-                "artifact_verified": True,
-                "contract_frozen": payload.get("contract_frozen"),
-            },
+            "frozen_evidence": evidence,
         },
         "equity_curve": equity_curve,
         "drawdown_curve": drawdown_curve,
@@ -238,6 +270,193 @@ def _select_period(payload: dict[str, Any], start: date, end: date) -> tuple[str
         f"{row['label']} {row['start']} 至 {row['end']}" for row in FROZEN_PERIODS
     )
     raise ValueError(f"所选区间未包含在同一个冻结证据窗口内。可用窗口：{supported}")
+
+
+def _load_rolling_period(
+    data_dir: Path,
+    *,
+    frozen_payload: dict[str, Any],
+    start: date,
+    end: date,
+    expected_sha256: str,
+    progress_cb: Callable[[dict[str, Any]], None] | None,
+    cancel_event: Any,
+) -> tuple[str, dict[str, Any], dict[str, Any]]:
+    if start < date.fromisoformat(FROZEN_PERIODS[-1]["start"]):
+        raise ValueError("冻结合同延伸回放只能从 2024-01-02 及之后开始")
+    latest = _latest_rolling_end(data_dir)
+    # 已有的按日缓存仍需允许读取, 避免仅因测试/启动瞬间未加载数据状态而误拒绝。
+    path = _rolling_path(data_dir, end)
+    if not path.is_file():
+        if latest is None or end > latest:
+            available = latest.isoformat() if latest is not None else "暂无完整数据"
+            raise ValueError(f"结束日期超过最新完整交易日，可回放至 {available}")
+        _generate_rolling_artifact(
+            data_dir,
+            end=end,
+            output=path,
+            contract_sha256=expected_sha256,
+            progress_cb=progress_cb,
+            cancel_event=cancel_event,
+        )
+    try:
+        rolling_payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError("冻结合同延伸回放文件损坏，请重新生成") from exc
+    if rolling_payload.get("schema_version") != ROLLING_SCHEMA:
+        raise ValueError("冻结合同延伸回放版本不兼容")
+    if rolling_payload.get("contract_sha256") != expected_sha256:
+        raise ValueError("冻结合同延伸回放使用了不同策略合同，拒绝混合结果")
+    period = rolling_payload.get("result")
+    if not isinstance(period, dict):
+        raise ValueError("冻结合同延伸回放缺少账户结果")
+    declared = period.get("period") or {}
+    if str(declared.get("end") or "")[:10] < end.isoformat():
+        raise ValueError("冻结合同延伸回放尚未覆盖所选结束日期")
+    _validate_frozen_prefix(frozen_payload, period)
+    observed = [
+        str(row.get("date"))[:10]
+        for row in period.get("daily_equity") or []
+        if str(row.get("date"))[:10] > FROZEN_THROUGH.isoformat()
+        and str(row.get("date"))[:10] <= end.isoformat()
+    ]
+    if not observed:
+        raise ValueError("所选区间没有冻结后的完整交易日记录")
+    return (
+        "rolling_observation",
+        period,
+        {
+            "scope": "frozen_contract_extension",
+            "period_id": "rolling_observation",
+            "artifact_sha256": _sha256(path),
+            "artifact_verified": True,
+            "contract_sha256": expected_sha256,
+            "contract_frozen": frozen_payload.get("contract_frozen"),
+            "frozen_through": FROZEN_THROUGH.isoformat(),
+            "observed_from": min(observed),
+            "observed_through": max(observed),
+            "generated_at": rolling_payload.get("generated_at"),
+        },
+    )
+
+
+def _validate_frozen_prefix(
+    frozen_payload: dict[str, Any], rolling_period: dict[str, Any]
+) -> None:
+    frozen = (frozen_payload.get("results") or {}).get(DEFAULT_PERIOD_ID) or {}
+    for key in ("daily_equity", "orders", "settlements"):
+        frozen_rows = _rows_through(frozen.get(key) or [], FROZEN_THROUGH)
+        rolling_rows = _rows_through(rolling_period.get(key) or [], FROZEN_THROUGH)
+        if frozen_rows != rolling_rows:
+            raise ValueError(f"冻结区间一致性校验失败：{key} 与原始证据不一致")
+
+
+def _rows_through(rows: list[dict[str, Any]], cutoff: date) -> list[str]:
+    selected = [
+        row
+        for row in rows
+        if str(row.get("date") or row.get("trading_date") or "")[:10]
+        <= cutoff.isoformat()
+    ]
+    return sorted(
+        json.dumps(row, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        for row in selected
+    )
+
+
+def _latest_rolling_end(data_dir: Path) -> date | None:
+    from app.services.data_integrity import latest_complete_partition_date
+
+    daily = latest_complete_partition_date(data_dir, "kline_daily")
+    receipt_path = data_dir / "event_data" / "forecast" / "sync_status.json"
+    try:
+        receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+        forecast = date.fromisoformat(str(receipt.get("end_date"))[:10])
+    except (OSError, ValueError, json.JSONDecodeError, TypeError):
+        forecast = None
+    if daily is None or forecast is None:
+        return None
+    return min(daily, forecast)
+
+
+def _rolling_path(data_dir: Path, end: date) -> Path:
+    return (
+        data_dir
+        / "research"
+        / "rolling"
+        / f"risk_admitted_idiosyncratic_forecast_{end.isoformat()}.json"
+    )
+
+
+def _research_script() -> Path:
+    here = Path(__file__).resolve()
+    candidates = (
+        here.parents[3] / "research" / "run_risk_admitted_rolling_replay.py",
+        here.parents[2] / "research" / "run_risk_admitted_rolling_replay.py",
+    )
+    for path in candidates:
+        if path.is_file():
+            return path
+    raise ValueError("延伸回放执行程序未随服务部署")
+
+
+def _generate_rolling_artifact(
+    data_dir: Path,
+    *,
+    end: date,
+    output: Path,
+    contract_sha256: str,
+    progress_cb: Callable[[dict[str, Any]], None] | None,
+    cancel_event: Any,
+) -> None:
+    _check_cancel(cancel_event)
+    _progress(progress_cb, "正在按冻结合同生成最新数据回放", 1, 3, end)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    command = [
+        sys.executable,
+        str(_research_script()),
+        "--data-dir",
+        str(data_dir),
+        "--end",
+        end.isoformat(),
+        "--contract-sha256",
+        contract_sha256,
+        "--output",
+        str(output),
+    ]
+    process = subprocess.Popen(
+        command,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+    )
+    output_text = ""
+    while True:
+        try:
+            output_text, _ = process.communicate(timeout=0.2)
+            break
+        except subprocess.TimeoutExpired:
+            if cancel_event is None or not cancel_event.is_set():
+                continue
+            process.terminate()
+            try:
+                process.communicate(timeout=10)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.communicate()
+            raise ValueError("cancelled") from None
+    output_lines = output_text.splitlines()
+    if process.returncode != 0 or not output.is_file():
+        detail = output_lines[-1] if output_lines else f"exit={process.returncode}"
+        raise ValueError(f"冻结合同延伸回放生成失败：{detail}")
+
+
+def _sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 def _curves(

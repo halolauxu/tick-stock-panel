@@ -12,6 +12,7 @@ from app.api.strategy import get_strategy, list_strategies
 from app.backtest.strategy import StrategyBacktestConfig, StrategyBacktestService
 from app.services.risk_admitted_forecast_backtest import (
     EXECUTION_BACKEND,
+    ROLLING_SCHEMA,
     run_artifact_backtest,
     strategy_detail,
 )
@@ -84,6 +85,39 @@ def _artifact(tmp_path: Path) -> tuple[Path, str]:
     return path, hashlib.sha256(path.read_bytes()).hexdigest()
 
 
+def _rolling_artifact(tmp_path: Path, contract_sha256: str) -> Path:
+    path = (
+        tmp_path
+        / "research"
+        / "rolling"
+        / "risk_admitted_idiosyncratic_forecast_2026-09-08.json"
+    )
+    path.parent.mkdir(parents=True)
+    frozen = json.loads((tmp_path / "research" / RESULT_FILE).read_text(encoding="utf-8"))
+    period = frozen["results"]["known_stress"]
+    payload = {
+        "schema_version": ROLLING_SCHEMA,
+        "contract_sha256": contract_sha256,
+        "generated_at": "2026-09-09T00:00:00+08:00",
+        "result": {
+            **period,
+            "period": {"start": "2024-01-01", "end": "2026-09-08"},
+            "daily_equity": [
+                *period["daily_equity"],
+                {
+                    "date": "2026-09-08",
+                    "equity": 210_000,
+                    "cash": 210_000,
+                    "position_count": 0,
+                    "cash_ratio": 1.0,
+                },
+            ],
+        },
+    }
+    path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+    return path
+
+
 def test_artifact_adapter_restores_native_backtest_contract(tmp_path: Path):
     _, digest = _artifact(tmp_path)
 
@@ -112,6 +146,62 @@ def test_artifact_adapter_fails_closed_on_tamper(tmp_path: Path):
             tmp_path,
             start=date(2024, 1, 2),
             end=date(2024, 1, 4),
+            expected_sha256=digest,
+        )
+
+
+def test_artifact_adapter_extends_frozen_contract_with_rolling_replay(
+    tmp_path: Path,
+    monkeypatch,
+):
+    _, digest = _artifact(tmp_path)
+    rolling_path = _rolling_artifact(tmp_path, digest)
+    monkeypatch.setattr(
+        "app.services.risk_admitted_forecast_backtest.RESULT_SHA256",
+        digest,
+    )
+    monkeypatch.setattr(
+        "app.services.risk_admitted_forecast_backtest._rolling_path",
+        lambda _data_dir, _end: rolling_path,
+    )
+
+    result = run_artifact_backtest(
+        tmp_path,
+        start=date(2024, 1, 2),
+        end=date(2026, 9, 8),
+        expected_sha256=digest,
+    )
+
+    evidence = result["stats"]["frozen_evidence"]
+    assert evidence["scope"] == "frozen_contract_extension"
+    assert evidence["frozen_through"] == "2026-08-28"
+    assert evidence["observed_through"] == "2026-09-08"
+    assert result["equity_curve"][-1]["date"] == "2026-09-08"
+
+
+def test_rolling_replay_fails_closed_when_frozen_prefix_changes(
+    tmp_path: Path,
+    monkeypatch,
+):
+    _, digest = _artifact(tmp_path)
+    rolling_path = _rolling_artifact(tmp_path, digest)
+    payload = json.loads(rolling_path.read_text(encoding="utf-8"))
+    payload["result"]["daily_equity"][0]["equity"] = 123
+    rolling_path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+    monkeypatch.setattr(
+        "app.services.risk_admitted_forecast_backtest.RESULT_SHA256",
+        digest,
+    )
+    monkeypatch.setattr(
+        "app.services.risk_admitted_forecast_backtest._rolling_path",
+        lambda _data_dir, _end: rolling_path,
+    )
+
+    with pytest.raises(ValueError, match="冻结区间一致性校验失败"):
+        run_artifact_backtest(
+            tmp_path,
+            start=date(2024, 1, 2),
+            end=date(2026, 9, 8),
             expected_sha256=digest,
         )
 
@@ -159,6 +249,24 @@ def test_managed_detail_does_not_require_generic_strategy_registration(tmp_path:
     assert result["id"] == STRATEGY_ID
     assert result["execution_backend"] == EXECUTION_BACKEND
     assert strategy_detail(tmp_path)["backtest_defaults"]["end"] == "2026-08-28"
+
+
+def test_managed_detail_exposes_latest_complete_rolling_period(tmp_path: Path, monkeypatch):
+    monkeypatch.setattr(
+        "app.services.risk_admitted_forecast_backtest._latest_rolling_end",
+        lambda _data_dir: date(2026, 9, 8),
+    )
+
+    detail = strategy_detail(tmp_path)
+
+    assert detail["backtest_defaults"]["end"] == "2026-09-08"
+    assert detail["backtest_periods"][-1] == {
+        "id": "rolling_observation",
+        "label": "冻结合同延伸至 09-08",
+        "start": "2024-01-02",
+        "end": "2026-09-08",
+        "evidence_scope": "post_freeze_observation",
+    }
 
 
 def test_strategy_backtest_service_dispatches_before_generic_registry(monkeypatch, tmp_path: Path):

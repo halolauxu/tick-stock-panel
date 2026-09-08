@@ -670,7 +670,13 @@ export interface StrategyDetail {
   immutable_contract?: boolean
   artifact_verified?: boolean
   backtest_defaults?: { start: string; end: string }
-  backtest_periods?: { id: string; label: string; start: string; end: string }[]
+  backtest_periods?: {
+    id: string
+    label: string
+    start: string
+    end: string
+    evidence_scope?: 'post_freeze_observation'
+  }[]
   locked_contract?: {
     initial_capital: number
     total_slots: number

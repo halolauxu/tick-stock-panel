@@ -119,6 +119,9 @@ RUN if [ "$USE_CN_MIRROR" = "1" ]; then \
 # (<root>/backend/app/) 推导的, 容器内会错算到 /。这里用环境变量显式指定
 # 三个关键路径, 确保 static / tiers / data 都指向容器内正确位置。
 COPY backend/app ./app
+# 冻结合同的最新数据延伸回放复用研究期同一套账户规则。研究代码随镜像只读发布，
+# 运行结果写入挂载的数据卷，不覆盖哈希冻结的原始证据。
+COPY research ./research
 # stock-sdk 插件依赖: 从 stocksdk-builder 拷入。
 # INCLUDE_STOCKSDK=0(默认) 时, stocksdk-builder 产出空目录,此处拷入空目录,
 # 即最终镜像不含 stock-sdk 依赖,插件默认不可用。

@@ -1497,6 +1497,13 @@ export function StrategyBacktest() {
   ]
     .map(([key, label]) => ({ key, label, value: Number(executionStats[key] ?? 0) }))
     .filter(item => item.value > 0)
+  const frozenEvidence = result?.stats?.frozen_evidence as {
+    scope?: string
+    frozen_through?: string
+    observed_from?: string
+    observed_through?: string
+  } | undefined
+  const isRollingObservation = frozenEvidence?.scope === 'frozen_contract_extension'
 
   return (
     <div className="h-full min-h-0 overflow-hidden rounded-card border border-border bg-surface/80 grid grid-cols-1 xl:grid-cols-[18rem_minmax(0,1fr)]">
@@ -1905,7 +1912,7 @@ export function StrategyBacktest() {
         <div className="flex items-center justify-between gap-2">
           {isFrozenPortfolio ? (
             <div className="inline-flex rounded-btn border border-accent/30 bg-accent/10 px-3 py-1.5 text-xs font-medium text-accent">
-              冻结账户回测
+              {isRollingObservation ? '冻结合同延伸回放' : '冻结证据复现'}
             </div>
           ) : (
           <div className="inline-flex rounded-btn border border-border bg-surface/80 p-0.5 shadow-sm">
@@ -1966,6 +1973,18 @@ export function StrategyBacktest() {
             )}
           </div>
         </div>
+
+        {isFrozenPortfolio && (
+          <div className={`rounded-btn border px-3 py-2 text-[11px] leading-4 ${
+            isRollingObservation
+              ? 'border-warning/35 bg-warning/10 text-warning'
+              : 'border-border bg-surface/50 text-secondary'
+          }`}>
+            {isRollingObservation
+              ? `原冻结证据截止 ${frozenEvidence?.frozen_through}；${frozenEvidence?.observed_from} 至 ${frozenEvidence?.observed_through} 为同一冻结合同的最新数据延伸回放，不改写原验证收益。`
+              : '当前结果复现哈希冻结的原始研究证据；选择“冻结合同延伸”可运行至最新完整交易日。'}
+          </div>
+        )}
 
         {/* 市场环境过滤: 只在指定环境的交易日入场(强制 T-1, 用前一日环境判定) */}
         {!isFrozenPortfolio && <div className="rounded-btn border border-border bg-surface/50 px-3 py-2 space-y-1.5">
