@@ -4,7 +4,9 @@ import { useSearchParams } from 'react-router-dom'
 import {
   AlertTriangle,
   BriefcaseBusiness,
+  CalendarClock,
   CheckCircle2,
+  ChevronDown,
   Clock3,
   Database,
   FileClock,
@@ -12,6 +14,7 @@ import {
   History,
   ListChecks,
   Loader2,
+  MoreHorizontal,
   Pause,
   Play,
   Plus,
@@ -24,7 +27,6 @@ import {
 } from 'lucide-react'
 
 import { EmptyState } from '@/components/EmptyState'
-import { ManagedForwardAccountPanel } from '@/components/ManagedForwardStrategyPanel'
 import { Modal } from '@/components/Modal'
 import { toast } from '@/components/Toast'
 import { fmtPct, priceColorClass } from '@/lib/format'
@@ -208,12 +210,99 @@ function StrategyParamInput({ param, value, onChange }: {
   )
 }
 
-function Metric({ label, value, sub, tone }: { label: string; value: string; sub: string; tone?: string }) {
+function compactDate(value: string | null | undefined) {
+  if (!value) return '—'
+  return value.slice(5, 10).replace('-', '/')
+}
+
+function executionSummary(account: PaperTradingAccount) {
+  const pending = account.orders.filter(order => ['PLANNED', 'PREFLIGHT_OK'].includes(order.status))
+  const buys = pending.filter(order => order.side === 'BUY')
+  const sells = pending.filter(order => order.side === 'SELL')
+  const seal = account.timeline.find(event => (
+    event.event_type === 'SIGNAL_SEAL_COMPLETED' || event.event_type === 'FORWARD_TARGETS_FROZEN'
+  ))
+  const sealDate = seal?.trading_date ?? account.last_processed_date
+
+  if (pending.length) {
+    const plannedDate = pending.find(order => order.scheduled_date)?.scheduled_date
+    return {
+      state: 'ready' as const,
+      kicker: plannedDate ? `${compactDate(plannedDate)} 开盘计划` : '下一交易日开盘计划',
+      title: `${pending.length} 笔订单等待执行`,
+      detail: `买入 ${buys.length} 笔 · 卖出 ${sells.length} 笔；09:25 校验行情与交易约束，09:30 按开盘证据撮合。`,
+      status: '计划已就绪',
+      next: '09:25 盘前校验 → 09:30 开盘执行',
+      orders: pending,
+    }
+  }
+
+  if (seal?.event_type === 'SIGNAL_SEAL_COMPLETED') {
+    const hits = Number(seal.payload.strategy_hits ?? 0)
+    const finalCandidates = Number(seal.payload.final_candidates ?? 0)
+    const blockers = [
+      Number(seal.payload.unsupported_board ?? 0) > 0 ? `${seal.payload.unsupported_board} 只非主板` : '',
+      Number(seal.payload.already_held ?? 0) > 0 ? `${seal.payload.already_held} 只已持仓` : '',
+      Number(seal.payload.already_pending ?? 0) > 0 ? `${seal.payload.already_pending} 只已有订单` : '',
+      Number(seal.payload.slot_limited ?? 0) > 0 ? `${seal.payload.slot_limited} 只超出仓位` : '',
+    ].filter(Boolean)
+    const reason = hits === 0
+      ? `${compactDate(sealDate)} 选股已完成，策略命中 0 只。`
+      : finalCandidates === 0
+        ? `${compactDate(sealDate)} 命中 ${hits} 只，但${blockers.join('、') || '没有形成可执行数量'}。`
+        : `${compactDate(sealDate)} 已完成选股，但当前没有待执行订单。`
+    return {
+      state: 'idle' as const,
+      kicker: '下一次开盘',
+      title: '无交易计划',
+      detail: `${reason} 流水线已运行，不是任务卡住。`,
+      status: '明确不交易',
+      next: '下一完整交易日收盘数据齐备后重新选股',
+      orders: [],
+    }
+  }
+
+  if (seal?.event_type === 'FORWARD_TARGETS_FROZEN') {
+    const targetCount = Number(seal.payload.target_count ?? 0)
+    const orderCount = Number(seal.payload.orders ?? 0)
+    const detail = targetCount > 0 && orderCount === 0
+      ? `${compactDate(sealDate)} 已复核 ${targetCount} 个组合目标，现有持仓已满足目标，无需新增或减仓。`
+      : `${compactDate(sealDate)} 组合目标已冻结，本轮没有生成可执行订单。`
+    return {
+      state: 'idle' as const,
+      kicker: '下一次开盘',
+      title: '无交易计划',
+      detail,
+      status: '目标不变',
+      next: '下一完整交易日收盘数据齐备后重新评估',
+      orders: [],
+    }
+  }
+
+  return {
+    state: 'waiting' as const,
+    kicker: '下一次开盘',
+    title: '交易计划尚未形成',
+    detail: account.last_processed_date
+      ? `${compactDate(account.last_processed_date)} 已完成封板，但没有可展示的执行计划。`
+      : '账户尚未完成首次盘后选股。',
+    status: '等待信号',
+    next: '等待完整收盘数据与信号封板',
+    orders: [],
+  }
+}
+
+function Metric({ label, value, sub, tone = 'text-foreground' }: {
+  label: string
+  value: string
+  sub: string
+  tone?: string
+}) {
   return (
-    <div className="rounded-card border border-border bg-surface px-3 py-3">
-      <div className="text-[11px] text-muted">{label}</div>
-      <div className={`mt-1 num text-lg font-semibold ${tone ?? 'text-foreground'}`}>{value}</div>
-      <div className="mt-0.5 truncate text-[10px] text-muted">{sub}</div>
+    <div className="rounded-card border border-border bg-base/40 px-3 py-2.5">
+      <div className="text-[10px] text-muted">{label}</div>
+      <div className={`mt-1 num text-sm font-semibold ${tone}`}>{value}</div>
+      <div className="mt-0.5 text-[9px] text-muted">{sub}</div>
     </div>
   )
 }
@@ -294,7 +383,7 @@ function EventTimeline({ account, events }: { account: PaperTradingAccount; even
     moments.push({
       id: 'latest-settlement',
       at: latestSettlement.occurred_at,
-      title: latestSettlement.event_type === 'SETTLEMENT_RESTATED' ? '收盘结算已更新' : '今日收盘结算完成',
+      title: latestSettlement.event_type === 'SETTLEMENT_RESTATED' ? '收盘结算已更新' : '最近收盘结算完成',
       detail: latestSettlement.detail,
       badge: '已完成',
       icon: Database,
@@ -359,7 +448,7 @@ function EventTimeline({ account, events }: { account: PaperTradingAccount; even
             </div>
           )
         })}
-        {!moments.length && <div className="py-10 text-center text-xs text-muted">今天没有需要关注的账户变化</div>}
+        {!moments.length && <div className="py-10 text-center text-xs text-muted">没有需要关注的运行记录</div>}
       </div>
 
       <details className="group border-t border-border bg-base/35">
@@ -586,6 +675,9 @@ export function PaperTrading() {
 
   const nowDate = system?.beijing_time?.slice(0, 10)
   const todayEvents = (account?.timeline ?? []).filter(event => !nowDate || event.occurred_at.slice(0, 10) === nowDate)
+  const runtimeEvents = todayEvents.length > 0
+    ? todayEvents
+    : (account?.timeline ?? []).filter(event => !account?.last_processed_date || event.trading_date === account.last_processed_date)
   const openIncidents = (account?.incidents ?? []).filter(item => item.status === 'open')
   const quoteAge = system?.tracked_symbol_count === 0
     ? '无待执行 / 持仓'
@@ -601,11 +693,18 @@ export function PaperTrading() {
     : system?.executor_health === 'DEGRADED'
       ? 'border-amber-400/40 bg-amber-400/10 text-amber-400'
       : 'border-emerald-400/30 bg-emerald-400/10 text-emerald-400'
+  const execution = account ? executionSummary(account) : null
+  const totalReturn = account?.summary.total_return ?? 0
+  const executionTone = execution?.state === 'ready'
+    ? 'border-accent/40 bg-accent/10 text-accent'
+    : execution?.state === 'idle'
+      ? 'border-emerald-400/30 bg-emerald-400/10 text-emerald-400'
+      : 'border-amber-400/35 bg-amber-400/10 text-amber-300'
 
   const tabs: { id: OpsTab; label: string; count?: number; icon: typeof Clock3 }[] = [
     { id: 'positions', label: '持仓', count: account?.positions.length, icon: BriefcaseBusiness },
-    { id: 'orders', label: '订单', count: account?.orders.length, icon: ListChecks },
-    { id: 'fills', label: '成交', count: account?.fills.length, icon: CheckCircle2 },
+    { id: 'orders', label: '订单记录', count: account?.orders.length, icon: ListChecks },
+    { id: 'fills', label: '成交记录', count: account?.fills.length, icon: CheckCircle2 },
     { id: 'cash', label: '资金流水', count: account?.cash_entries.length, icon: WalletCards },
     { id: 'performance', label: '收益分析', icon: Gauge },
     { id: 'incidents', label: '异常', count: openIncidents.length, icon: ShieldAlert },
@@ -613,41 +712,6 @@ export function PaperTrading() {
 
   return (
     <div className="min-h-full space-y-3">
-      <section className="rounded-card border border-border bg-surface px-3 py-2.5">
-        <div className="flex flex-wrap items-center gap-x-5 gap-y-2">
-          <div>
-            <div className="text-[10px] uppercase tracking-wide text-muted">市场阶段</div>
-            <div className="mt-0.5 flex items-center gap-1.5 text-xs font-medium text-foreground">
-              <Clock3 className="h-3.5 w-3.5 text-accent" />
-              {PHASE_LABELS[system?.market_phase ?? ''] ?? '状态加载中'}
-            </div>
-          </div>
-          <div>
-            <div className="text-[10px] uppercase tracking-wide text-muted">北京时间</div>
-            <div className="mt-0.5 font-mono text-xs text-foreground">{shortTime(system?.beijing_time)}</div>
-          </div>
-          <div>
-            <div className="text-[10px] uppercase tracking-wide text-muted">行情新鲜度</div>
-            <div className={`mt-0.5 text-xs font-medium ${system?.quote_stale && system?.market_phase === 'TRADING' ? 'text-red-400' : 'text-secondary'}`}>{quoteAge} · {system?.quote_source_mode ?? '未接入'}</div>
-          </div>
-          <div>
-            <div className="text-[10px] uppercase tracking-wide text-muted">执行器</div>
-            <div className={`mt-0.5 inline-flex rounded border px-1.5 py-0.5 text-[10px] font-semibold ${healthTone}`}>{system?.executor_health ?? 'LOADING'}</div>
-          </div>
-          <div>
-            <div className="text-[10px] uppercase tracking-wide text-muted">订阅范围</div>
-            <div className="mt-0.5 text-xs text-secondary">{trackedByAccount} 当前账户 · {system?.tracked_symbol_count ?? 0} 全部账户</div>
-          </div>
-          <button
-            type="button"
-            onClick={() => setDrawerOpen(true)}
-            className="ml-auto inline-flex h-8 items-center gap-1.5 rounded-btn bg-accent px-3 text-xs font-semibold text-white"
-          >
-            <Plus className="h-3.5 w-3.5" />新建模拟账户
-          </button>
-        </div>
-      </section>
-
       {system && (system.executor_health !== 'HEALTHY' || (system.quote_stale && system.market_phase === 'TRADING') || account?.reconciliation?.ok === false) && (
         <section className={`flex items-start gap-2 rounded-card border px-3 py-2.5 text-xs ${system?.executor_health === 'ERROR' || account?.reconciliation?.ok === false ? 'border-red-500/40 bg-red-500/10 text-red-300' : 'border-amber-400/40 bg-amber-400/10 text-amber-300'}`}>
           <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0" />
@@ -664,24 +728,31 @@ export function PaperTrading() {
         </section>
       )}
 
-      <section className="rounded-card border border-border bg-surface p-2.5">
-        <div className="flex flex-wrap items-center gap-2">
+      <section className="rounded-card border border-border bg-surface px-3 py-2">
+        <div className="flex flex-wrap items-center gap-2.5">
           <WalletCards className="h-4 w-4 text-accent" />
-          <span className="text-xs font-medium text-foreground">账户</span>
+          <span className="text-xs font-semibold text-foreground">模拟账户</span>
           <span className="rounded-full bg-elevated px-1.5 py-0.5 text-[10px] text-muted">{accountItems.length}</span>
-          <div className="flex min-w-0 flex-1 gap-1.5 overflow-x-auto">
+          <div className="flex min-w-0 flex-1 gap-1 overflow-x-auto">
             {accountItems.map(item => (
               <button
                 key={item.id}
                 type="button"
                 onClick={() => selectAccount(item.id)}
-                className={`shrink-0 rounded-btn border px-3 py-1.5 text-xs ${account?.id === item.id ? 'border-accent bg-accent/15 text-accent' : 'border-border bg-base text-secondary'}`}
+                className={`shrink-0 rounded-btn border px-2.5 py-1.5 text-[11px] transition-colors ${account?.id === item.id ? 'border-accent bg-accent/15 text-accent' : 'border-border bg-base text-secondary hover:border-accent/40 hover:text-foreground'}`}
               >
                 <span className={`mr-1.5 inline-block h-1.5 w-1.5 rounded-full ${item.status === 'active' ? 'bg-emerald-400' : 'bg-muted'}`} />
                 {item.name}
               </button>
             ))}
           </div>
+          <div className="hidden shrink-0 items-center gap-3 text-[10px] text-muted xl:flex">
+            <span className="inline-flex items-center gap-1"><Clock3 className="h-3 w-3" />{PHASE_LABELS[system?.market_phase ?? ''] ?? '加载中'} · {shortTime(system?.beijing_time)}</span>
+            <span className={`rounded border px-1.5 py-0.5 font-semibold ${healthTone}`}>{system?.executor_health ?? 'LOADING'}</span>
+          </div>
+          <button type="button" onClick={() => setDrawerOpen(true)} className="inline-flex h-8 shrink-0 items-center gap-1.5 rounded-btn bg-accent px-3 text-xs font-semibold text-white">
+            <Plus className="h-3.5 w-3.5" />新建账户
+          </button>
         </div>
       </section>
 
@@ -694,40 +765,84 @@ export function PaperTrading() {
 
       {account && (
         <>
-          <section className="rounded-card border border-border bg-surface px-4 py-3">
-            <div className="flex flex-wrap items-start justify-between gap-3">
-              <div>
-                <div className="text-[10px] font-medium uppercase tracking-wide text-accent">当前账户</div>
-                <div className="mt-1 flex flex-wrap items-center gap-2">
-                  <h2 className="text-base font-semibold text-foreground">{account.name}</h2>
-                  <span className={`rounded border px-1.5 py-0.5 text-[10px] ${account.status === 'active' ? 'border-emerald-400/30 bg-emerald-400/10 text-emerald-400' : 'border-border bg-elevated text-muted'}`}>{account.status === 'active' ? '事件时钟运行中' : '已暂停'}</span>
-                  <span className="rounded bg-elevated px-1.5 py-0.5 text-[10px] text-secondary">{account.config.exit_mode === 'intraday' ? '盘中风险模式' : '盘后退出模式'}</span>
-                  {managedStrategy && <span className="rounded bg-accent/10 px-1.5 py-0.5 text-[10px] text-accent">专用前向研究 · {managedStrategy.version}</span>}
+          <section className="grid overflow-visible rounded-card border border-border bg-surface xl:grid-cols-[minmax(0,1.5fr)_minmax(22rem,0.8fr)]">
+            <div className="min-w-0 border-b border-border p-4 xl:border-b-0 xl:border-r">
+              <div className="flex items-start justify-between gap-3">
+                <div className="min-w-0">
+                  <div className="flex flex-wrap items-center gap-2">
+                    <h2 className="truncate text-sm font-semibold text-foreground">{account.name}</h2>
+                    <span className={`rounded border px-1.5 py-0.5 text-[9px] ${account.status === 'active' ? 'border-emerald-400/30 bg-emerald-400/10 text-emerald-400' : 'border-border bg-elevated text-muted'}`}>{account.status === 'active' ? '运行中' : '已暂停'}</span>
+                    <span className="rounded bg-elevated px-1.5 py-0.5 text-[9px] text-secondary">{account.config.exit_mode === 'intraday' ? '盘中退出' : '盘后退出'}</span>
+                    {managedStrategy && <span className="rounded bg-accent/10 px-1.5 py-0.5 text-[9px] text-accent">前向研究 · {managedStrategy.version}</span>}
+                  </div>
+                  <div className="mt-1 text-[10px] text-muted">{account.config.strategy_name ?? account.config.strategy_id} · 最近封板 {account.last_processed_date ?? '尚未封板'}</div>
                 </div>
-                <div className="mt-1 text-[10px] text-muted">
-                  {account.config.strategy_name ?? account.config.strategy_id} · 信号起始 {account.signal_start_date} · 最近封板 {account.last_processed_date ?? '尚未封板'}
-                </div>
+                <details className="group relative z-20 shrink-0">
+                  <summary className="inline-flex h-7 cursor-pointer list-none items-center gap-1 rounded-btn border border-border px-2 text-[10px] text-secondary hover:bg-elevated">
+                    <MoreHorizontal className="h-3.5 w-3.5" />账户管理<ChevronDown className="h-3 w-3 transition-transform group-open:rotate-180" />
+                  </summary>
+                  <div className="absolute right-0 mt-1 grid w-40 gap-1 rounded-card border border-border bg-surface p-1.5 shadow-2xl">
+                    <button type="button" onClick={() => toggleAccount.mutate(account)} className="inline-flex h-8 items-center gap-2 rounded-btn px-2 text-left text-[11px] text-secondary hover:bg-elevated">
+                      {account.status === 'active' ? <Pause className="h-3.5 w-3.5" /> : <Play className="h-3.5 w-3.5" />}{account.status === 'active' ? '暂停账户' : '恢复账户'}
+                    </button>
+                    <button type="button" onClick={() => recoverAccount.mutate(account.id)} className="inline-flex h-8 items-center gap-2 rounded-btn px-2 text-left text-[11px] text-secondary hover:bg-elevated">
+                      <RefreshCw className={`h-3.5 w-3.5 ${recoverAccount.isPending ? 'animate-spin' : ''}`} />核对与恢复
+                    </button>
+                    <button type="button" onClick={() => reconcileAccount.mutate(account.id)} className="inline-flex h-8 items-center gap-2 rounded-btn px-2 text-left text-[11px] text-secondary hover:bg-elevated">
+                      <ShieldCheck className="h-3.5 w-3.5" />三账对账
+                    </button>
+                    {!managedStrategy && <button type="button" onClick={() => setDeleteTarget(account)} className="inline-flex h-8 items-center gap-2 rounded-btn px-2 text-left text-[11px] text-red-400 hover:bg-red-500/10"><Trash2 className="h-3.5 w-3.5" />删除此账户</button>}
+                  </div>
+                </details>
               </div>
-              <div className="flex flex-wrap gap-1.5">
-                <button type="button" onClick={() => toggleAccount.mutate(account)} className="inline-flex h-8 items-center gap-1.5 rounded-btn border border-border px-2.5 text-xs text-secondary">
-                  {account.status === 'active' ? <Pause className="h-3.5 w-3.5" /> : <Play className="h-3.5 w-3.5" />}{account.status === 'active' ? '暂停' : '恢复'}
-                </button>
-                <button type="button" onClick={() => recoverAccount.mutate(account.id)} className="inline-flex h-8 items-center gap-1.5 rounded-btn border border-accent/40 bg-accent/10 px-2.5 text-xs text-accent">
-                  <RefreshCw className={`h-3.5 w-3.5 ${recoverAccount.isPending ? 'animate-spin' : ''}`} />核对 / 恢复
-                </button>
-                <button type="button" onClick={() => reconcileAccount.mutate(account.id)} className="inline-flex h-8 items-center gap-1.5 rounded-btn border border-border px-2.5 text-xs text-secondary">
-                  <ShieldCheck className="h-3.5 w-3.5" />三账对账
-                </button>
-                {!managedStrategy && (
-                  <button type="button" onClick={() => setDeleteTarget(account)} className="inline-flex h-8 items-center gap-1.5 rounded-btn border border-red-500/30 bg-red-500/5 px-2.5 text-xs text-red-400">
-                    <Trash2 className="h-3.5 w-3.5" />删除此账户
-                  </button>
-                )}
+
+              {execution && (
+                <div className={`mt-4 rounded-card border p-3.5 ${executionTone}`}>
+                  <div className="flex items-start gap-3">
+                    <div className="grid h-9 w-9 shrink-0 place-items-center rounded-lg border border-border bg-base/50"><CalendarClock className="h-4 w-4" /></div>
+                    <div className="min-w-0 flex-1">
+                      <div className="flex flex-wrap items-center gap-2">
+                        <span className="text-[10px] font-medium uppercase tracking-wide opacity-80">{execution.kicker}</span>
+                        <span className="rounded-full bg-current/10 px-2 py-0.5 text-[9px] font-semibold">{execution.status}</span>
+                      </div>
+                      <div className="mt-1 text-lg font-semibold text-foreground">{execution.title}</div>
+                      <div className="mt-1 text-[11px] leading-5 text-secondary">{execution.detail}</div>
+                      {execution.orders.length > 0 && (
+                        <div className="mt-2 flex flex-wrap gap-1.5">
+                          {execution.orders.slice(0, 6).map(order => <span key={order.id} className="rounded border border-border bg-base/50 px-2 py-1 text-[10px] text-foreground">{order.name || order.symbol} · {order.side === 'BUY' ? '买' : '卖'} · {orderSizeLabel(order)}</span>)}
+                          {execution.orders.length > 6 && <span className="px-1 py-1 text-[10px] opacity-80">另 {execution.orders.length - 6} 笔</span>}
+                        </div>
+                      )}
+                    </div>
+                  </div>
+                  <div className="mt-3 border-t border-border pt-2 text-[10px] opacity-80">下一步：{execution.next}</div>
+                </div>
+              )}
+
+              <div className="mt-3 flex flex-wrap items-center gap-x-4 gap-y-1 text-[10px] text-muted">
+                <span>行情：{quoteAge} · {system?.quote_source_mode ?? '未接入'}</span>
+                <span>订阅：{trackedByAccount} 只</span>
+                <span className={account.reconciliation.ok ? 'text-emerald-400' : 'text-red-400'}>{account.reconciliation.ok ? '三账一致' : '三账不一致'}</span>
+              </div>
+            </div>
+
+            <div className="min-w-0 p-4">
+              <div className="flex items-start justify-between gap-3">
+                <div><div className="text-[10px] font-medium text-muted">账户权益</div><div className="mt-1 num text-xl font-semibold text-foreground">¥ {money(account.summary.equity)}</div></div>
+                <div className="text-right"><div className="text-[10px] text-muted">累计收益</div><div className={`mt-1 num text-sm font-semibold ${priceColorClass(totalReturn)}`}>{fmtPct(totalReturn)}</div></div>
+              </div>
+              <div className="mt-4 grid grid-cols-3 gap-3 border-y border-border py-3">
+                <div><div className="text-[9px] text-muted">今日盈亏</div><div className={`mt-1 num text-xs font-medium ${account.summary.today_pnl != null ? priceColorClass(account.summary.today_pnl) : 'text-muted'}`}>{account.summary.today_pnl_available && account.summary.today_pnl != null ? `${account.summary.today_pnl >= 0 ? '+' : ''}¥ ${money(account.summary.today_pnl)}` : '待行情'}</div></div>
+                <div><div className="text-[9px] text-muted">可用现金</div><div className="mt-1 num text-xs font-medium text-foreground">¥ {money(account.summary.cash)}</div></div>
+                <div><div className="text-[9px] text-muted">持仓</div><div className="mt-1 num text-xs font-medium text-foreground">{account.summary.position_count} / {account.config.max_positions}</div></div>
+              </div>
+              <div className="mt-3">
+                <div className="flex items-center justify-between text-[10px]"><span className="text-muted">资金使用</span><span className="num text-secondary">{fmtPct(account.summary.exposure)}</span></div>
+                <div className="mt-1.5 h-1.5 overflow-hidden rounded-full bg-elevated"><div className="h-full rounded-full bg-accent" style={{ width: `${Math.min(Math.max(account.summary.exposure * 100, 0), 100)}%` }} /></div>
+                <div className="mt-2 flex items-center justify-between text-[9px] text-muted"><span>持仓市值 ¥ {money(account.summary.market_value)}</span><span>初始资金 ¥ {money(account.config.initial_capital)}</span></div>
               </div>
             </div>
           </section>
-
-          {managedStrategy && <ManagedForwardAccountPanel strategy={managedStrategy} />}
 
           {openIncidents.length > 0 && (
             <section className="rounded-card border border-amber-400/35 bg-amber-400/5 px-3 py-2.5">
@@ -738,30 +853,6 @@ export function PaperTrading() {
               <div className="mt-1 text-[11px] text-amber-200/80">{openIncidents[0].title} · {openIncidents[0].detail}</div>
             </section>
           )}
-
-          <section className="grid grid-cols-2 gap-2 lg:grid-cols-5">
-            <Metric label="账户权益" value={`¥ ${money(account.summary.equity)}`} sub={`初始 ¥ ${money(account.config.initial_capital)}`} />
-            <Metric label="可用现金" value={`¥ ${money(account.summary.cash)}`} sub={`现金占比 ${fmtPct(account.summary.equity ? account.summary.cash / account.summary.equity : 0)}`} />
-            <Metric label="持仓市值" value={`¥ ${money(account.summary.market_value)}`} sub={`${account.summary.position_count} / ${account.config.max_positions} 个持仓`} />
-            <Metric
-              label="今日盈亏"
-              value={account.summary.today_pnl_available && account.summary.today_pnl != null ? `${account.summary.today_pnl >= 0 ? '+' : ''}¥ ${money(account.summary.today_pnl)}` : '—'}
-              sub={account.summary.today_pnl_available ? `风险敞口 ${fmtPct(account.summary.exposure)}` : '等待当日有效行情'}
-              tone={account.summary.today_pnl != null ? priceColorClass(account.summary.today_pnl) : 'text-muted'}
-            />
-            <Metric label="订单 / 异常" value={`${account.summary.pending_order_count} / ${account.summary.open_incident_count}`} sub={account.reconciliation.ok ? '三账一致' : '三账不平'} tone={account.reconciliation.ok ? 'text-foreground' : 'text-red-400'} />
-          </section>
-
-          <section className="overflow-hidden rounded-card border border-border bg-surface">
-            <div className="flex items-center justify-between border-b border-border px-3 py-2.5">
-              <div>
-                <div className="flex items-center gap-2"><History className="h-4 w-4 text-accent" /><span className="text-xs font-semibold text-foreground">今日关键进展</span></div>
-                <div className="mt-0.5 pl-6 text-[10px] text-muted">默认只展示影响账户结果的节点</div>
-              </div>
-              <span className="text-[10px] text-muted">北京时间 · 完整技术记录可展开</span>
-            </div>
-            <EventTimeline account={account} events={todayEvents} />
-          </section>
 
           <section className="overflow-hidden rounded-card border border-border bg-surface">
             <div className="flex gap-1 overflow-x-auto border-b border-border px-2 py-2">
@@ -856,6 +947,21 @@ export function PaperTrading() {
               </div>)}</div> : <div className="py-12 text-center text-xs text-muted"><ShieldCheck className="mx-auto mb-2 h-5 w-5 text-emerald-400" />没有异常记录</div>
             )}
           </section>
+
+          <details className="group overflow-hidden rounded-card border border-border bg-surface">
+            <summary className="flex cursor-pointer list-none items-center justify-between gap-3 px-3 py-2.5 text-xs hover:bg-elevated/50">
+              <span className="inline-flex min-w-0 items-center gap-2 font-medium text-secondary">
+                <History className="h-3.5 w-3.5 text-accent" />运行记录
+                <span className="truncate text-[10px] font-normal text-muted">
+                  {todayEvents.length > 0 ? `今日 ${todayEvents.length} 条` : `最近封板 ${compactDate(account.last_processed_date)}`}
+                </span>
+              </span>
+              <span className="inline-flex shrink-0 items-center gap-1 text-[10px] text-muted">
+                默认收起<ChevronDown className="h-3.5 w-3.5 transition-transform group-open:rotate-180" />
+              </span>
+            </summary>
+            <div className="border-t border-border"><EventTimeline account={account} events={runtimeEvents} /></div>
+          </details>
         </>
       )}
 
