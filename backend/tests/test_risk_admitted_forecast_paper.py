@@ -349,6 +349,11 @@ def test_v2_account_is_separate_and_freezes_allocator_contract(
     assert v2["config"]["position_sizing"] == "participation_evidence_budget"
     assert v2["config"]["research_result_sha256"] == strategy.V2_RESULT_SHA256
     assert len(service.ledger.list_accounts()) == 2
+    snapshot = strategy.managed_strategy_snapshot(
+        service,
+        strategy_id=strategy.V2_STRATEGY_ID,
+    )
+    assert snapshot["live"]["microcap_slot_budget"] is None
 
 
 def test_v2_plan_scales_microcap_targets_to_participation_budget(

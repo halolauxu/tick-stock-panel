@@ -370,25 +370,19 @@ def managed_strategy_snapshot(
             "pending_order_count": int(summary.get("pending_order_count") or 0),
             "open_incident_count": int(summary.get("open_incident_count") or 0),
             "observed_settlement_days": len(nav),
-            "microcap_slot_budget": int(
-                state.get(
-                    "microcap_slots",
-                    (
-                        participation.NO_SLOTS
-                        if strategy_id == V2_STRATEGY_ID
-                        else participation.FULL_SLOTS
-                    ),
-                )
+            "microcap_slot_budget": (
+                int(state["microcap_slots"])
+                if "microcap_slots" in state
+                else participation.FULL_SLOTS
+                if strategy_id == STRATEGY_ID
+                else None
             ),
-            "pending_microcap_slot_budget": int(
-                state.get(
-                    "pending_microcap_slots",
-                    (
-                        participation.NO_SLOTS
-                        if strategy_id == V2_STRATEGY_ID
-                        else participation.FULL_SLOTS
-                    ),
-                )
+            "pending_microcap_slot_budget": (
+                int(state["pending_microcap_slots"])
+                if "pending_microcap_slots" in state
+                else participation.FULL_SLOTS
+                if strategy_id == STRATEGY_ID
+                else None
             ),
             "allocation_upgrade_days": int(state.get("upgrade_days", 0)),
         },

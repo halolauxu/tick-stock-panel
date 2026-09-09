@@ -777,7 +777,11 @@ export function PaperTrading() {
                   </div>
                   <div className="mt-1 text-[10px] text-muted">
                     {account.config.strategy_name ?? account.config.strategy_id} · 最近封板 {account.last_processed_date ?? '尚未封板'}
-                    {managedStrategy?.version === 'V2' && ` · 微盘预算 ${managedStrategy.live.microcap_slot_budget}/${managedStrategy.contract.total_slots} 槽`}
+                    {managedStrategy?.version === 'V2' && (
+                      managedStrategy.live.microcap_slot_budget == null
+                        ? ' · 微盘预算待首次封板'
+                        : ` · 微盘预算 ${managedStrategy.live.microcap_slot_budget}/${managedStrategy.contract.total_slots} 槽`
+                    )}
                   </div>
                 </div>
                 <details className="group relative z-20 shrink-0">

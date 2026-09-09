@@ -2095,8 +2095,8 @@ export interface ManagedForwardStrategy {
     pending_order_count: number
     open_incident_count: number
     observed_settlement_days: number
-    microcap_slot_budget: number
-    pending_microcap_slot_budget: number
+    microcap_slot_budget: number | null
+    pending_microcap_slot_budget: number | null
     allocation_upgrade_days: number
   }
 }
