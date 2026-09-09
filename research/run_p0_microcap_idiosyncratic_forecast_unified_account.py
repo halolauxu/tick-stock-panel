@@ -41,6 +41,8 @@ def build_daily_targets(
     microcap_candidates: pl.DataFrame,
     event_candidates: pl.DataFrame,
     all_dates: list[date],
+    *,
+    microcap_slots_by_date: dict[date, int] | None = None,
 ) -> pl.DataFrame:
     micro_by_date = account._partition_rows(microcap_candidates, "entry_date")
     event_by_date = account._partition_rows(event_candidates, "entry_date")
@@ -73,7 +75,19 @@ def build_daily_targets(
                     "source_rank": row["cap_rank"],
                 }
             )
-        micro_slots = TOTAL_SLOTS - EVENT_SLOTS * len(event_rows)
+        configured_micro_slots = (
+            int(microcap_slots_by_date.get(day, 0))
+            if microcap_slots_by_date is not None
+            else TOTAL_SLOTS
+        )
+        if not 0 <= configured_micro_slots <= TOTAL_SLOTS:
+            raise ValueError(
+                f"invalid micro-cap slot budget for {day}: {configured_micro_slots}"
+            )
+        micro_slots = min(
+            configured_micro_slots,
+            TOTAL_SLOTS - EVENT_SLOTS * len(event_rows),
+        )
         for row in current_micro:
             if row["symbol"] in event_symbols:
                 continue
@@ -167,6 +181,7 @@ def run_period(
     *,
     event_gate_by_date: dict[date, bool] | None = None,
     event_admission_by_date: dict[date, bool] | None = None,
+    microcap_slots_by_date: dict[date, int] | None = None,
 ) -> dict[str, Any]:
     screen._set_event_period(start, end)
     raw = baseline.load_daily(data_dir, end=end).filter(pl.col("date") >= start)
@@ -217,7 +232,12 @@ def run_period(
             else "none"
         ),
     }
-    targets = build_daily_targets(microcap_candidates, event_candidates, all_dates)
+    targets = build_daily_targets(
+        microcap_candidates,
+        event_candidates,
+        all_dates,
+        microcap_slots_by_date=microcap_slots_by_date,
+    )
     target_counts = (
         targets.group_by("family")
         .agg(
