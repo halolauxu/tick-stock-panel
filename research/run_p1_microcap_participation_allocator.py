@@ -36,8 +36,8 @@ TREND_WINDOW = 20
 LIQUIDITY_BASE_WINDOW = 60
 UPGRADE_CONFIRMATION_DAYS = 3
 FULL_SLOTS = 20
-HALF_SLOTS = 10
 NO_SLOTS = 0
+SLOTS_PER_CONFIRMATION = FULL_SLOTS // 4
 
 
 def attach_participation_features(features: pl.DataFrame) -> pl.DataFrame:
@@ -109,11 +109,7 @@ def raw_slot_budget(feature: dict[str, Any]) -> int:
     if bool(feature.get("severe_limit_down")):
         return NO_SLOTS
     score = int(feature.get("participation_score") or 0)
-    if score >= 3:
-        return FULL_SLOTS
-    if score == 2:
-        return HALF_SLOTS
-    return NO_SLOTS
+    return max(NO_SLOTS, min(FULL_SLOTS, score * SLOTS_PER_CONFIRMATION))
 
 
 def build_allocation_clock(
@@ -221,11 +217,13 @@ def _allocation_summary(
     decisions: list[dict[str, Any]], start: date, end: date
 ) -> dict[str, Any]:
     scoped = [row for row in decisions if start <= row["action_date"] <= end]
+    level_days = {
+        str(slots): sum(row["microcap_slots"] == slots for row in scoped)
+        for slots in range(NO_SLOTS, FULL_SLOTS + 1, SLOTS_PER_CONFIRMATION)
+    }
     return {
         "trading_days": len(scoped),
-        "full_days": sum(row["microcap_slots"] == FULL_SLOTS for row in scoped),
-        "half_days": sum(row["microcap_slots"] == HALF_SLOTS for row in scoped),
-        "cash_days": sum(row["microcap_slots"] == NO_SLOTS for row in scoped),
+        "days_by_microcap_slots": level_days,
         "mean_microcap_slots": (
             sum(int(row["microcap_slots"]) for row in scoped) / len(scoped)
             if scoped
@@ -317,7 +315,13 @@ def run(
                 "20d_microcap_positive_breadth_at_least_half",
                 "20d_microcap_liquidity_at_least_60d_average",
             ],
-            "allocation": {"four_or_three": 20, "two": 10, "zero_or_one": 0},
+            "allocation": {
+                "zero_confirmations": 0,
+                "one_confirmation": 5,
+                "two_confirmations": 10,
+                "three_confirmations": 15,
+                "four_confirmations": 20,
+            },
             "upgrade_confirmation_days": UPGRADE_CONFIRMATION_DAYS,
             "downgrade": "immediate",
             "missing_feature": "cash",

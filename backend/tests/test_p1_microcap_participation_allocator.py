@@ -47,7 +47,7 @@ def test_allocator_is_fail_closed_and_delays_only_exposure_upgrades() -> None:
     assert slots[days[3]] == 0
     assert slots[days[4]] == 20
     assert slots[days[5]] == 10
-    assert slots[days[6]] == 0
+    assert slots[days[6]] == 5
     assert decisions[0]["raw_microcap_slots"] == 0
 
 
