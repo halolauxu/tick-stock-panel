@@ -104,6 +104,11 @@ export function ManagedForwardStrategyPanel({ view }: { view: 'strategy' | 'back
             <div className="rounded border border-border bg-surface px-2.5 py-2"><span className="text-muted">调仓：</span>{strategy.contract.rebalance} · 事件最多{strategy.contract.event_lifetime_days}日</div>
             <div className="rounded border border-border bg-surface px-2.5 py-2"><span className="text-muted">前向：</span>至少 {strategy.contract.observation_trading_days} 个真实交易日</div>
           </div>
+          {strategy.version === 'V2' && (
+            <div className="rounded border border-accent/20 bg-accent/5 px-2.5 py-2 text-[10px] text-secondary">
+              <span className="text-muted">微盘资金预算：</span>{strategy.contract.microcap_allocation}
+            </div>
+          )}
           <div className="flex flex-wrap items-center gap-x-4 gap-y-1 text-[9px] text-muted">
             <span>来源：{strategy.provenance.created_by} · 提交 {strategy.provenance.introduced_commit}</span>
             <span className={strategy.provenance.artifact_verified ? 'text-emerald-400' : 'text-amber-300'}>

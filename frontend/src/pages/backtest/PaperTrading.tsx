@@ -775,7 +775,10 @@ export function PaperTrading() {
                     <span className="rounded bg-elevated px-1.5 py-0.5 text-[9px] text-secondary">{account.config.exit_mode === 'intraday' ? '盘中退出' : '盘后退出'}</span>
                     {managedStrategy && <span className="rounded bg-accent/10 px-1.5 py-0.5 text-[9px] text-accent">前向研究 · {managedStrategy.version}</span>}
                   </div>
-                  <div className="mt-1 text-[10px] text-muted">{account.config.strategy_name ?? account.config.strategy_id} · 最近封板 {account.last_processed_date ?? '尚未封板'}</div>
+                  <div className="mt-1 text-[10px] text-muted">
+                    {account.config.strategy_name ?? account.config.strategy_id} · 最近封板 {account.last_processed_date ?? '尚未封板'}
+                    {managedStrategy?.version === 'V2' && ` · 微盘预算 ${managedStrategy.live.microcap_slot_budget}/${managedStrategy.contract.total_slots} 槽`}
+                  </div>
                 </div>
                 <details className="group relative z-20 shrink-0">
                   <summary className="inline-flex h-7 cursor-pointer list-none items-center gap-1 rounded-btn border border-border px-2 text-[10px] text-secondary hover:bg-elevated">

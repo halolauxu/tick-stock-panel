@@ -27,6 +27,7 @@ from app.price_limits import (
     polars_limit_price,
     polars_price_limit_pct,
 )
+from app.services import microcap_participation as participation
 
 STRATEGY_ID = "risk_admitted_idiosyncratic_forecast_v1"
 ACCOUNT_ID = "risk-forecast-v1"
@@ -42,6 +43,12 @@ MAIN_BOARD_PATTERN = r"^(?:(?:000|001|002|003)\d{3}\.SZ|(?:600|601|603|605)\d{3}
 RESULT_SHA256 = "6c70333c3c07543a9240a86ae3166fd75f4afaf13a418167e2ef394e89964145"
 RESULT_FILE = "p0_risk_admitted_idiosyncratic_forecast_overlay_v1.json"
 STATE_SCHEMA = "risk-admitted-idiosyncratic-forecast-forward-v1"
+V2_STRATEGY_ID = "participation_budgeted_idiosyncratic_forecast_v2"
+V2_ACCOUNT_ID = "risk-forecast-v2"
+V2_ACCOUNT_NAME = "主板微盘参与度预算 × 特异性业绩预告（前向）"
+V2_RESULT_SHA256 = "5c4e9a23390c0f439b3474d58e1e6adc7944786600688afbb8f8c760bc1985d7"
+V2_RESULT_FILE = "p1_microcap_participation_allocator_2026-09-08.json"
+V2_STATE_SCHEMA = "participation-budgeted-idiosyncratic-forecast-forward-v2"
 THRESHOLDS = {
     "microcap_excess_5d_p10": -0.02012421350845861,
     "microcap_breadth_3d_p10": 0.2822831103242099,
@@ -68,6 +75,24 @@ HISTORICAL_RESULTS = (
         "yearly": (0.2314, 0.6296, 0.0167),
     },
 )
+V2_HISTORICAL_RESULTS = (
+    {
+        "id": "validation_context",
+        "label": "2021–2023 已知历史上下文",
+        "annualized": 0.10622987990683908,
+        "total_return": 0.3381058071224172,
+        "max_drawdown": -0.10860933379401827,
+        "yearly": (0.2603848461, 0.0424893979, 0.0183935397),
+    },
+    {
+        "id": "known_stress",
+        "label": "2024–2026-09-08 已知历史压力期",
+        "annualized": 0.14060673293961679,
+        "total_return": 0.4047568378344344,
+        "max_drawdown": -0.21819476447093067,
+        "yearly": (0.07956088, 0.1944065700, 0.0894362764),
+    },
+)
 
 _FROZEN_ACCOUNT_CONTRACT = {
     "strategy_id": STRATEGY_ID,
@@ -89,57 +114,111 @@ _FROZEN_ACCOUNT_CONTRACT = {
     "research_result_sha256": RESULT_SHA256,
 }
 
+_V2_FROZEN_ACCOUNT_CONTRACT = {
+    **_FROZEN_ACCOUNT_CONTRACT,
+    "strategy_id": V2_STRATEGY_ID,
+    "position_sizing": "participation_evidence_budget",
+    "research_result_sha256": V2_RESULT_SHA256,
+}
+
 
 def ensure_account(paper_service, baseline_date: date) -> dict[str, Any]:
     """Create the one immutable 200k forward account, idempotently."""
-    _require_frozen_result(paper_service.repo.store.data_dir)
+    return _ensure_account(
+        paper_service,
+        baseline_date,
+        account_id=ACCOUNT_ID,
+        account_name=ACCOUNT_NAME,
+        strategy_id=STRATEGY_ID,
+        result_file=RESULT_FILE,
+        result_sha256=RESULT_SHA256,
+        contract=_FROZEN_ACCOUNT_CONTRACT,
+        event_weight=EVENT_WEIGHT,
+        microcap_weight=MICROCAP_WEIGHT,
+    )
+
+
+def ensure_v2_account(paper_service, baseline_date: date) -> dict[str, Any]:
+    """Create the participation-budgeted shadow account without rewriting V1."""
+    return _ensure_account(
+        paper_service,
+        baseline_date,
+        account_id=V2_ACCOUNT_ID,
+        account_name=V2_ACCOUNT_NAME,
+        strategy_id=V2_STRATEGY_ID,
+        result_file=V2_RESULT_FILE,
+        result_sha256=V2_RESULT_SHA256,
+        contract=_V2_FROZEN_ACCOUNT_CONTRACT,
+        event_weight=EVENT_WEIGHT,
+        microcap_weight=MICROCAP_WEIGHT,
+    )
+
+
+def _ensure_account(
+    paper_service,
+    baseline_date: date,
+    *,
+    account_id: str,
+    account_name: str,
+    strategy_id: str,
+    result_file: str,
+    result_sha256: str,
+    contract: dict[str, Any],
+    event_weight: float,
+    microcap_weight: float,
+) -> dict[str, Any]:
+    _require_result(
+        paper_service.repo.store.data_dir,
+        result_file=result_file,
+        result_sha256=result_sha256,
+    )
     try:
-        account = paper_service.ledger.get_account(ACCOUNT_ID)
+        account = paper_service.ledger.get_account(account_id)
         config = account["config"]
         mismatches = {
             key: {"expected": expected, "actual": config.get(key)}
-            for key, expected in _FROZEN_ACCOUNT_CONTRACT.items()
+            for key, expected in contract.items()
             if config.get(key) != expected
         }
         if mismatches:
             raise ValueError("现有前向账户合同与冻结策略不一致，拒绝静默覆盖")
         paper_service.ledger.resolve_incident(
-            f"account:{ACCOUNT_ID}:FORWARD_CONTRACT_MISMATCH"
+            f"account:{account_id}:FORWARD_CONTRACT_MISMATCH"
         )
         return account
     except KeyError:
         account = paper_service.ledger.create_account(
-            name=ACCOUNT_NAME,
+            name=account_name,
             baseline_date=baseline_date,
-            account_id=ACCOUNT_ID,
+            account_id=account_id,
             config={
-                **_FROZEN_ACCOUNT_CONTRACT,
-                "strategy_name": ACCOUNT_NAME,
+                **contract,
+                "strategy_name": account_name,
                 "symbols": None,
                 "params": {},
                 "overrides": {},
             },
         )
         paper_service.ledger.record_account_event(
-            ACCOUNT_ID,
-            event_key=f"{ACCOUNT_ID}:FROZEN_CONTRACT:{RESULT_SHA256}",
+            account_id,
+            event_key=f"{account_id}:FROZEN_CONTRACT:{result_sha256}",
             event_type="FORWARD_CONTRACT_FROZEN",
             trading_date=baseline_date,
             title="前向合同已冻结",
             detail="仅记录部署后的真实信号、次日开盘订单与成交；禁止历史回填和账户内调参",
             payload={
-                "strategy_id": STRATEGY_ID,
-                "result_sha256": RESULT_SHA256,
+                "strategy_id": strategy_id,
+                "result_sha256": result_sha256,
                 "capital": INITIAL_CAPITAL,
-                "event_weight": EVENT_WEIGHT,
-                "microcap_weight": MICROCAP_WEIGHT,
+                "event_weight": event_weight,
+                "microcap_weight": microcap_weight,
             },
         )
         return account
 
 
 def is_managed_account(config: dict[str, Any]) -> bool:
-    return config.get("strategy_id") == STRATEGY_ID
+    return config.get("strategy_id") in {STRATEGY_ID, V2_STRATEGY_ID}
 
 
 def inputs_ready(data_dir: Path, signal_date: date) -> bool:
@@ -149,9 +228,11 @@ def inputs_ready(data_dir: Path, signal_date: date) -> bool:
     return covered is not None and covered >= signal_date
 
 
-def checkpoint_signal_date(data_dir: Path) -> date | None:
+def checkpoint_signal_date(
+    data_dir: Path, strategy_id: str = STRATEGY_ID
+) -> date | None:
     try:
-        state = _load_state(_state_path(data_dir)) or {}
+        state = _load_state(_state_path(data_dir, strategy_id)) or {}
     except (OSError, ValueError, json.JSONDecodeError):
         return None
     return _as_date(state.get("last_signal_date"))
@@ -161,6 +242,7 @@ def managed_strategy_snapshot(
     paper_service,
     *,
     now: datetime | None = None,
+    strategy_id: str = STRATEGY_ID,
 ) -> dict[str, Any]:
     """Return product-facing provenance and live state for the managed account.
 
@@ -169,12 +251,45 @@ def managed_strategy_snapshot(
     monitoring from running a materially different contract; Backtest uses a
     dedicated account-level adapter for the verified frozen evidence.
     """
+    if strategy_id == V2_STRATEGY_ID:
+        account_id = V2_ACCOUNT_ID
+        account_name = V2_ACCOUNT_NAME
+        result_file = V2_RESULT_FILE
+        result_sha256 = V2_RESULT_SHA256
+        historical_results = V2_HISTORICAL_RESULTS
+        version = "V2"
+        source = "known_history_redesign"
+        description = (
+            "主板微盘只在绝对趋势、相对强度、市场广度和流动性得到确认时承担仓位；"
+            "急性风险期才准入公司特异性正向业绩预告。"
+        )
+        introduced_commit = "b6faeb0"
+        frozen_at = "2026-09-09"
+        note = "已知历史重构后的独立前向影子账户；历史结果不是样本外收益证明。"
+    elif strategy_id == STRATEGY_ID:
+        account_id = ACCOUNT_ID
+        account_name = ACCOUNT_NAME
+        result_file = RESULT_FILE
+        result_sha256 = RESULT_SHA256
+        historical_results = HISTORICAL_RESULTS
+        version = "V1"
+        source = "frozen_research"
+        description = (
+            "沪深主板微盘周调仓为底仓；微盘风险关闭时，使用公司特异性正向业绩预告"
+            "替换部分微盘暴露。"
+        )
+        introduced_commit = "1f2ef35"
+        frozen_at = "2026-09-03"
+        note = "V1 独立前向观察账户；不代表主板短周期 V2 路线通过。"
+    else:
+        raise ValueError(f"未知托管策略: {strategy_id}")
+
     current = now or cn_now()
     data_dir = paper_service.repo.store.data_dir
-    result_path = data_dir / "research" / RESULT_FILE
-    artifact_verified = _artifact_verified(result_path)
+    result_path = data_dir / "research" / result_file
+    artifact_verified = _artifact_verified(result_path, result_sha256)
     try:
-        account = paper_service.ledger.get_account(ACCOUNT_ID)
+        account = paper_service.ledger.get_account(account_id)
     except KeyError:
         account = None
 
@@ -182,7 +297,7 @@ def managed_strategy_snapshot(
     receipt = _read_json(data_dir / "event_data" / "forecast" / "sync_status.json")
     forecast_covered = _as_date(receipt.get("end_date")) if receipt else None
     try:
-        state = _load_state(_state_path(data_dir)) or {}
+        state = _load_state(_state_path(data_dir, strategy_id)) or {}
     except (OSError, ValueError, json.JSONDecodeError):
         state = {}
     account_signal = _as_date((account or {}).get("last_processed_date"))
@@ -205,23 +320,20 @@ def managed_strategy_snapshot(
     last_settlement = _as_date(nav[-1].get("trading_date")) if nav else None
     summary = (account or {}).get("summary") or {}
     return {
-        "id": STRATEGY_ID,
-        "name": ACCOUNT_NAME.removesuffix("（前向）"),
-        "version": "V1",
+        "id": strategy_id,
+        "name": account_name.removesuffix("（前向）"),
+        "version": version,
         "kind": "managed_forward",
-        "source": "frozen_research",
-        "account_id": ACCOUNT_ID,
-        "description": (
-            "沪深主板微盘周调仓为底仓；微盘风险关闭时，使用公司特异性正向业绩预告"
-            "替换部分微盘暴露。"
-        ),
+        "source": source,
+        "account_id": account_id,
+        "description": description,
         "provenance": {
             "created_by": "自动研究部署",
-            "introduced_commit": "1f2ef35",
-            "frozen_at": "2026-09-03",
-            "research_result_sha256": RESULT_SHA256,
+            "introduced_commit": introduced_commit,
+            "frozen_at": frozen_at,
+            "research_result_sha256": result_sha256,
             "artifact_verified": artifact_verified,
-            "note": "V1 独立前向观察账户；不代表主板短周期 V2 路线通过。",
+            "note": note,
         },
         "contract": {
             "initial_capital": INITIAL_CAPITAL,
@@ -233,9 +345,13 @@ def managed_strategy_snapshot(
             "event_lifetime_days": EVENT_LIFETIME,
             "rebalance": "每周五盘后",
             "execution": "下一交易日开盘 · T+1 · 100股整数手 · 含费用/滑点/容量约束",
+            "microcap_allocation": (
+                "4项独立参与度证据按0/25/50/75/100%分配；降仓立即，加仓连续3日确认"
+                if strategy_id == V2_STRATEGY_ID else "100%剩余槽位"
+            ),
         },
         "historical_results": [
-            {**row, "yearly": list(row["yearly"])} for row in HISTORICAL_RESULTS
+            {**row, "yearly": list(row["yearly"])} for row in historical_results
         ],
         "live": {
             "account_exists": account is not None,
@@ -254,8 +370,38 @@ def managed_strategy_snapshot(
             "pending_order_count": int(summary.get("pending_order_count") or 0),
             "open_incident_count": int(summary.get("open_incident_count") or 0),
             "observed_settlement_days": len(nav),
+            "microcap_slot_budget": int(
+                state.get(
+                    "microcap_slots",
+                    (
+                        participation.NO_SLOTS
+                        if strategy_id == V2_STRATEGY_ID
+                        else participation.FULL_SLOTS
+                    ),
+                )
+            ),
+            "pending_microcap_slot_budget": int(
+                state.get(
+                    "pending_microcap_slots",
+                    (
+                        participation.NO_SLOTS
+                        if strategy_id == V2_STRATEGY_ID
+                        else participation.FULL_SLOTS
+                    ),
+                )
+            ),
+            "allocation_upgrade_days": int(state.get("upgrade_days", 0)),
         },
     }
+
+
+def managed_strategy_snapshots(
+    paper_service, *, now: datetime | None = None
+) -> list[dict[str, Any]]:
+    return [
+        managed_strategy_snapshot(paper_service, now=now, strategy_id=V2_STRATEGY_ID),
+        managed_strategy_snapshot(paper_service, now=now, strategy_id=STRATEGY_ID),
+    ]
 
 
 def _managed_lifecycle(
@@ -384,12 +530,15 @@ def _read_json(path: Path) -> dict[str, Any] | None:
     return payload if isinstance(payload, dict) else None
 
 
-def _artifact_verified(path: Path) -> bool:
+def _artifact_verified(path: Path, expected_sha256: str = RESULT_SHA256) -> bool:
     if not path.is_file():
         return False
     try:
         stat = path.stat()
-        return _cached_artifact_sha256(str(path), stat.st_mtime_ns, stat.st_size) == RESULT_SHA256
+        return (
+            _cached_artifact_sha256(str(path), stat.st_mtime_ns, stat.st_size)
+            == expected_sha256
+        )
     except OSError:
         return False
 
@@ -430,6 +579,7 @@ def _record_target_events(
         payload={
             "decision_id": plan["decision_id"],
             "risk": plan.get("risk"),
+            "allocation": plan.get("allocation"),
             "target_count": len(targets),
             "event_count": plan.get("event_count", 0),
             "microcap_count": plan.get("microcap_count", 0),
@@ -460,8 +610,11 @@ def seal_account(paper_service, account_id: str, signal_date: date) -> dict[str,
     baseline = date.fromisoformat(account["baseline_date"])
     if signal_date < baseline:
         return {"signals": 0, "orders": 0}
+    strategy_id = str(account["config"].get("strategy_id") or "")
+    if strategy_id not in {STRATEGY_ID, V2_STRATEGY_ID}:
+        raise ValueError("账户不属于可托管的前向策略")
 
-    state_path = _state_path(paper_service.repo.store.data_dir)
+    state_path = _state_path(paper_service.repo.store.data_dir, strategy_id)
     previous = _load_state(state_path)
     account_signal = _as_date(account.get("last_processed_date"))
     state_signal = _as_date((previous or {}).get("last_signal_date"))
@@ -476,7 +629,9 @@ def seal_account(paper_service, account_id: str, signal_date: date) -> dict[str,
     # ledger remains the source of truth; the state/decision files are a
     # deterministic strategy checkpoint, never evidence that an order filled.
     if state_signal == signal_date and account_signal != signal_date:
-        decision = _read_json(_decision_path(paper_service.repo.store.data_dir, signal_date))
+        decision = _read_json(
+            _decision_path(paper_service.repo.store.data_dir, signal_date, strategy_id)
+        )
         if not decision or decision.get("decision_id") != previous.get("last_decision_id"):
             raise ValueError("前向状态已推进但不可变决策缺失，拒绝直接标记封板")
         day_signals = [
@@ -512,11 +667,13 @@ def seal_account(paper_service, account_id: str, signal_date: date) -> dict[str,
         signal_date,
         baseline_date=baseline,
         previous_state=previous,
+        strategy_id=strategy_id,
     )
     if account_signal == signal_date:
         _write_decision(
             paper_service.repo.store.data_dir,
             {**plan, "forward_state": next_state},
+            strategy_id=strategy_id,
         )
         _atomic_json(state_path, next_state)
         return {"signals": 0, "orders": 0}
@@ -586,7 +743,7 @@ def seal_account(paper_service, account_id: str, signal_date: date) -> dict[str,
         position = positions[symbol]
         _, _, created = paper_service.ledger.record_signal_and_order(
             account_id=account_id,
-            strategy_id=STRATEGY_ID,
+            strategy_id=strategy_id,
             symbol=symbol,
             name=str(position.get("name") or symbol),
             side="SELL",
@@ -639,7 +796,7 @@ def seal_account(paper_service, account_id: str, signal_date: date) -> dict[str,
         if required_increase > capacity:
             _, created = paper_service.ledger.record_skipped_signal(
                 account_id=account_id,
-                strategy_id=STRATEGY_ID,
+                strategy_id=strategy_id,
                 symbol=symbol,
                 name=str(target.get("name") or symbol),
                 side="BUY",
@@ -668,7 +825,7 @@ def seal_account(paper_service, account_id: str, signal_date: date) -> dict[str,
             reason = "frozen_target_rebalance_increase"
         _, _, created = paper_service.ledger.record_signal_and_order(
             account_id=account_id,
-            strategy_id=STRATEGY_ID,
+            strategy_id=strategy_id,
             symbol=symbol,
             name=str(target.get("name") or symbol),
             side=side,
@@ -690,6 +847,7 @@ def seal_account(paper_service, account_id: str, signal_date: date) -> dict[str,
     _write_decision(
         paper_service.repo.store.data_dir,
         {**plan, "forward_state": next_state},
+        strategy_id=strategy_id,
     )
     _atomic_json(state_path, next_state)
     _record_target_events(
@@ -710,15 +868,23 @@ def build_forward_plan(
     *,
     baseline_date: date,
     previous_state: dict[str, Any] | None,
+    strategy_id: str = STRATEGY_ID,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
+    if strategy_id not in {STRATEGY_ID, V2_STRATEGY_ID}:
+        raise ValueError(f"未知托管策略: {strategy_id}")
+    participation_budgeted = strategy_id == V2_STRATEGY_ID
     _require_forecast_receipt(data_dir, signal_date)
     panel = _load_recent_panel(data_dir, signal_date)
     dates = panel.get_column("date").unique().sort().to_list()
     if not dates or dates[-1] != signal_date:
         raise ValueError(f"缺少 {signal_date} 完整 enriched 数据")
     features = build_daily_features(panel)
+    if participation_budgeted:
+        features = participation.attach_participation_features(features)
     feature_by_date = {row["date"]: row for row in features.to_dicts()}
-    state = previous_state or _bootstrap_state(data_dir, baseline_date)
+    state = previous_state or _bootstrap_state(
+        data_dir, baseline_date, strategy_id=strategy_id
+    )
     last_signal = _as_date(state.get("last_signal_date"))
     new_dates = [day for day in dates if last_signal is None or day > last_signal]
     if signal_date not in new_dates:
@@ -733,7 +899,23 @@ def build_forward_plan(
         "off_days": int(state.get("off_days", 0)),
         "clean_days": int(state.get("clean_days", 0)),
     }
+    allocation = {
+        "microcap_slots": int(
+            state.get(
+                "microcap_slots",
+                participation.NO_SLOTS if participation_budgeted else TOTAL_SLOTS,
+            )
+        ),
+        "pending_microcap_slots": int(
+            state.get(
+                "pending_microcap_slots",
+                participation.NO_SLOTS if participation_budgeted else TOTAL_SLOTS,
+            )
+        ),
+        "upgrade_days": int(state.get("upgrade_days", 0)),
+    }
     last_risk: dict[str, Any] | None = None
+    last_allocation: dict[str, Any] | None = None
     for day in new_dates:
         active_events = [
             {**event, "age": int(event.get("age", 0)) + 1}
@@ -744,6 +926,10 @@ def build_forward_plan(
         if feature is None:
             raise ValueError(f"缺少 {day} 风险状态特征")
         risk, last_risk = advance_risk_state(risk, feature)
+        if participation_budgeted:
+            allocation, last_allocation = participation.advance_allocation_state(
+                allocation, feature
+            )
         current_day = panel.filter(pl.col("date") == day)
         if day >= baseline_date and not risk["risk_on"]:
             new_events = _idiosyncratic_events_for_date(data_dir, day, current_day)
@@ -801,7 +987,13 @@ def build_forward_plan(
                 "target_weight": EVENT_WEIGHT,
             }
         )
-    micro_slots = TOTAL_SLOTS - len(active_events) * int(EVENT_WEIGHT / MICROCAP_WEIGHT)
+    configured_micro_slots = (
+        allocation["microcap_slots"] if participation_budgeted else TOTAL_SLOTS
+    )
+    micro_slots = min(
+        configured_micro_slots,
+        TOTAL_SLOTS - len(active_events) * int(EVENT_WEIGHT / MICROCAP_WEIGHT),
+    )
     for row in microcap_targets:
         if row["symbol"] in event_symbols:
             continue
@@ -819,11 +1011,20 @@ def build_forward_plan(
         micro_slots -= 1
 
     decision_payload = {
-        "schema_version": STATE_SCHEMA,
+        "schema_version": (
+            V2_STATE_SCHEMA if participation_budgeted else STATE_SCHEMA
+        ),
         "signal_date": signal_date.isoformat(),
         "baseline_date": baseline_date.isoformat(),
-        "research_result_sha256": RESULT_SHA256,
+        "research_result_sha256": (
+            V2_RESULT_SHA256 if participation_budgeted else RESULT_SHA256
+        ),
         "risk": {**risk, "features": last_risk},
+        **(
+            {"allocation": {**allocation, "features": last_allocation}}
+            if participation_budgeted
+            else {}
+        ),
         "weekly_rebalance": weekly_rebalance,
         "rebalance_dates": rebalance_dates,
         "recovered_gap_dates": recovered_gap_dates,
@@ -836,10 +1037,13 @@ def build_forward_plan(
     ).hexdigest()
     plan = {**decision_payload, "decision_id": decision_id}
     next_state = {
-        "schema_version": STATE_SCHEMA,
+        "schema_version": (
+            V2_STATE_SCHEMA if participation_budgeted else STATE_SCHEMA
+        ),
         "baseline_date": baseline_date.isoformat(),
         "last_signal_date": signal_date.isoformat(),
         **risk,
+        **(allocation if participation_budgeted else {}),
         "active_events": active_events,
         "microcap_targets": microcap_targets,
         "last_decision_id": decision_id,
@@ -1308,39 +1512,24 @@ def _idiosyncratic_events_for_date(
     return scored.to_dicts()
 
 
-def _bootstrap_state(data_dir: Path, baseline_date: date) -> dict[str, Any]:
+def _bootstrap_state(
+    data_dir: Path,
+    baseline_date: date,
+    *,
+    strategy_id: str = STRATEGY_ID,
+) -> dict[str, Any]:
+    if strategy_id == V2_STRATEGY_ID:
+        return _bootstrap_v2_state(data_dir, baseline_date)
     result_path = _require_frozen_result(data_dir)
     payload = json.loads(result_path.read_text(encoding="utf-8"))
     decisions = payload["risk"]["known_stress"]["decisions"]
     if not decisions:
         raise ValueError("冻结研究结果缺少风险状态审计")
-    last = decisions[-1]
-    switch_index = max(
-        (index for index, row in enumerate(decisions) if row.get("switch")),
-        default=-1,
-    )
-    if switch_index >= 0:
-        start = decisions[switch_index]
-        risk = {
-            "risk_on": bool(start["risk_on"]),
-            "off_days": 0,
-            "clean_days": 0,
-        }
-        for row in decisions[switch_index + 1 :]:
-            risk, _ = advance_risk_state(
-                risk,
-                {
-                    "date": row["decision_date"],
-                    "ordinary_alarm_count": row["ordinary_alarm_count"],
-                    "severe_limit_down": row["severe_limit_down"],
-                },
-            )
-    else:
-        risk = {"risk_on": bool(last["risk_on"]), "off_days": 0, "clean_days": 0}
+    risk = _risk_state_from_decisions(decisions)
     return {
         "schema_version": STATE_SCHEMA,
         "baseline_date": baseline_date.isoformat(),
-        "last_signal_date": last["decision_date"],
+        "last_signal_date": decisions[-1]["decision_date"],
         **risk,
         "active_events": [],
         "microcap_targets": [],
@@ -1348,11 +1537,100 @@ def _bootstrap_state(data_dir: Path, baseline_date: date) -> dict[str, Any]:
     }
 
 
+def _bootstrap_v2_state(data_dir: Path, baseline_date: date) -> dict[str, Any]:
+    result_path = _require_result(
+        data_dir,
+        result_file=V2_RESULT_FILE,
+        result_sha256=V2_RESULT_SHA256,
+    )
+    payload = json.loads(result_path.read_text(encoding="utf-8"))
+    allocation_decisions = payload["allocation"]["known_stress"]["decisions"]
+    risk_decisions = payload["event_risk"]["known_stress"]["decisions"]
+    if not allocation_decisions or not risk_decisions:
+        raise ValueError("参与度研究结果缺少状态审计")
+    last_allocation = allocation_decisions[-1]
+    checkpoint = _as_date(last_allocation.get("decision_date"))
+    if checkpoint is None:
+        raise ValueError("参与度研究结果缺少有效日期")
+    scoped_risk = [
+        row
+        for row in risk_decisions
+        if (_as_date(row.get("decision_date")) or date.min) <= checkpoint
+    ]
+    if not scoped_risk:
+        raise ValueError("参与度与事件风险时钟无法对齐")
+    risk = _risk_state_from_decisions(scoped_risk)
+    upgrade_days = int(
+        last_allocation.get(
+            "upgrade_days",
+            last_allocation.get("upgrade_confirmation_days", 0),
+        )
+        or 0
+    )
+    microcap_slots = int(last_allocation.get("microcap_slots") or 0)
+    pending_slots = int(
+        last_allocation.get(
+            "pending_microcap_slots",
+            last_allocation.get("raw_microcap_slots")
+            if upgrade_days
+            else microcap_slots,
+        )
+        or 0
+    )
+    return {
+        "schema_version": V2_STATE_SCHEMA,
+        "baseline_date": baseline_date.isoformat(),
+        "last_signal_date": checkpoint.isoformat(),
+        **risk,
+        "microcap_slots": microcap_slots,
+        "pending_microcap_slots": pending_slots,
+        "upgrade_days": upgrade_days,
+        "active_events": [],
+        "microcap_targets": [],
+        "last_decision_id": None,
+    }
+
+
+def _risk_state_from_decisions(decisions: list[dict[str, Any]]) -> dict[str, Any]:
+    last = decisions[-1]
+    switch_index = max(
+        (index for index, row in enumerate(decisions) if row.get("switch")),
+        default=-1,
+    )
+    if switch_index < 0:
+        return {"risk_on": bool(last["risk_on"]), "off_days": 0, "clean_days": 0}
+    start = decisions[switch_index]
+    risk = {
+        "risk_on": bool(start["risk_on"]),
+        "off_days": 0,
+        "clean_days": 0,
+    }
+    for row in decisions[switch_index + 1 :]:
+        risk, _ = advance_risk_state(
+            risk,
+            {
+                "date": row["decision_date"],
+                "ordinary_alarm_count": row["ordinary_alarm_count"],
+                "severe_limit_down": row["severe_limit_down"],
+            },
+        )
+    return risk
+
+
 def _require_frozen_result(data_dir: Path) -> Path:
-    result_path = data_dir / "research" / RESULT_FILE
-    if (
-        not result_path.exists()
-        or hashlib.sha256(result_path.read_bytes()).hexdigest() != RESULT_SHA256
+    return _require_result(
+        data_dir,
+        result_file=RESULT_FILE,
+        result_sha256=RESULT_SHA256,
+    )
+
+
+def _require_result(
+    data_dir: Path, *, result_file: str, result_sha256: str
+) -> Path:
+    result_path = data_dir / "research" / result_file
+    if not result_path.exists() or (
+        hashlib.sha256(result_path.read_bytes()).hexdigest() != result_sha256
     ):
         raise ValueError("冻结研究结果缺失或哈希不一致，拒绝启动前向账户")
     return result_path
@@ -1368,16 +1646,20 @@ def _require_forecast_receipt(data_dir: Path, signal_date: date) -> None:
         raise ValueError(f"业绩预告只同步到 {covered}，未覆盖信号日 {signal_date}")
 
 
-def _state_path(data_dir: Path) -> Path:
-    return data_dir / "research" / "forward" / STRATEGY_ID / "state.json"
+def _state_path(data_dir: Path, strategy_id: str = STRATEGY_ID) -> Path:
+    return data_dir / "research" / "forward" / strategy_id / "state.json"
 
 
-def _decision_path(data_dir: Path, signal_date: date) -> Path:
+def _decision_path(
+    data_dir: Path,
+    signal_date: date,
+    strategy_id: str = STRATEGY_ID,
+) -> Path:
     return (
         data_dir
         / "research"
         / "forward"
-        / STRATEGY_ID
+        / strategy_id
         / "decisions"
         / f"{signal_date.isoformat()}.json"
     )
@@ -1387,13 +1669,25 @@ def _load_state(path: Path) -> dict[str, Any] | None:
     if not path.exists():
         return None
     payload = json.loads(path.read_text(encoding="utf-8"))
-    if payload.get("schema_version") != STATE_SCHEMA:
+    expected_schema = (
+        V2_STATE_SCHEMA if V2_STRATEGY_ID in path.parts else STATE_SCHEMA
+    )
+    if payload.get("schema_version") != expected_schema:
         raise ValueError("前向状态版本不匹配")
     return payload
 
 
-def _write_decision(data_dir: Path, plan: dict[str, Any]) -> None:
-    path = _decision_path(data_dir, date.fromisoformat(plan["signal_date"]))
+def _write_decision(
+    data_dir: Path,
+    plan: dict[str, Any],
+    *,
+    strategy_id: str = STRATEGY_ID,
+) -> None:
+    path = _decision_path(
+        data_dir,
+        date.fromisoformat(plan["signal_date"]),
+        strategy_id,
+    )
     if path.exists():
         current = json.loads(path.read_text(encoding="utf-8"))
         if current.get("decision_id") != plan["decision_id"]:

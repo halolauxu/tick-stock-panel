@@ -49,7 +49,7 @@ def test_risk_clock_requires_two_alarms_and_three_clean_days_after_minimum_off()
 
 def test_forward_account_is_idempotent_and_freezes_contract(tmp_path, monkeypatch) -> None:
     service = _PaperService(tmp_path)
-    monkeypatch.setattr(strategy, "_require_frozen_result", lambda _data_dir: tmp_path)
+    monkeypatch.setattr(strategy, "_require_result", lambda *_args, **_kwargs: tmp_path)
 
     created = strategy.ensure_account(service, date(2026, 9, 3))
     repeated = strategy.ensure_account(service, date(2026, 9, 4))
@@ -63,7 +63,7 @@ def test_forward_account_is_idempotent_and_freezes_contract(tmp_path, monkeypatc
 
 def test_forward_account_rejects_any_frozen_contract_drift(tmp_path, monkeypatch) -> None:
     service = _PaperService(tmp_path)
-    monkeypatch.setattr(strategy, "_require_frozen_result", lambda _data_dir: tmp_path)
+    monkeypatch.setattr(strategy, "_require_result", lambda *_args, **_kwargs: tmp_path)
     service.ledger.create_account(
         name=strategy.ACCOUNT_NAME,
         baseline_date=date(2026, 9, 3),
@@ -109,7 +109,7 @@ def test_managed_account_dispatches_to_dedicated_sealer(tmp_path, monkeypatch) -
 
 def test_managed_snapshot_explains_waiting_pipeline_and_provenance(tmp_path, monkeypatch) -> None:
     service = _PaperService(tmp_path, latest_enriched=date(2026, 9, 3))
-    monkeypatch.setattr(strategy, "_require_frozen_result", lambda _data_dir: tmp_path)
+    monkeypatch.setattr(strategy, "_require_result", lambda *_args, **_kwargs: tmp_path)
     monkeypatch.setattr(strategy, "_pipeline_schedule", lambda: {"hour": 21, "minute": 0})
     strategy.ensure_account(service, date(2026, 9, 3))
     strategy._atomic_json(
@@ -133,7 +133,7 @@ def test_managed_snapshot_explains_waiting_pipeline_and_provenance(tmp_path, mon
 
 def test_managed_snapshot_distinguishes_delayed_data_from_waiting_signal(tmp_path, monkeypatch) -> None:
     service = _PaperService(tmp_path, latest_enriched=date(2026, 9, 3))
-    monkeypatch.setattr(strategy, "_require_frozen_result", lambda _data_dir: tmp_path)
+    monkeypatch.setattr(strategy, "_require_result", lambda *_args, **_kwargs: tmp_path)
     monkeypatch.setattr(strategy, "_pipeline_schedule", lambda: {"hour": 21, "minute": 0})
     strategy.ensure_account(service, date(2026, 9, 3))
 
@@ -332,3 +332,91 @@ def test_gap_recovery_advances_each_day_without_backdating_orders(
         "600001.SH", "600002.SH"
     }
     assert state["last_signal_date"] == monday.isoformat()
+
+
+def test_v2_account_is_separate_and_freezes_allocator_contract(
+    tmp_path, monkeypatch
+) -> None:
+    service = _PaperService(tmp_path)
+    monkeypatch.setattr(strategy, "_require_result", lambda *_args, **_kwargs: tmp_path)
+
+    v1 = strategy.ensure_account(service, date(2026, 9, 9))
+    v2 = strategy.ensure_v2_account(service, date(2026, 9, 9))
+
+    assert v1["id"] == strategy.ACCOUNT_ID
+    assert v2["id"] == strategy.V2_ACCOUNT_ID
+    assert v2["config"]["strategy_id"] == strategy.V2_STRATEGY_ID
+    assert v2["config"]["position_sizing"] == "participation_evidence_budget"
+    assert v2["config"]["research_result_sha256"] == strategy.V2_RESULT_SHA256
+    assert len(service.ledger.list_accounts()) == 2
+
+
+def test_v2_plan_scales_microcap_targets_to_participation_budget(
+    tmp_path, monkeypatch
+) -> None:
+    thursday = date(2026, 9, 3)
+    friday = date(2026, 9, 4)
+    panel = pl.DataFrame({"date": [thursday, friday]})
+    features = pl.DataFrame(
+        {
+            "date": [thursday, friday],
+            "ordinary_alarm_count": [0, 0],
+            "severe_limit_down": [False, False],
+            "participation_score": [2, 1],
+            "microcap_absolute_20d": [0.01, 0.01],
+            "microcap_relative_20d": [0.01, -0.01],
+            "microcap_breadth_20d": [0.55, 0.40],
+            "microcap_liquidity_20d_60d": [0.95, 0.95],
+        }
+    )
+    candidates = [
+        {
+            "symbol": f"600{index:03d}.SH",
+            "name": f"测试{index}",
+            "signal_amount": 100_000_000.0,
+            "market_cap": 1_000_000_000.0 + index,
+            "cap_rank": index,
+        }
+        for index in range(10)
+    ]
+    monkeypatch.setattr(strategy, "_require_forecast_receipt", lambda *_args: None)
+    monkeypatch.setattr(strategy, "_load_recent_panel", lambda *_args: panel)
+    monkeypatch.setattr(strategy, "build_daily_features", lambda _panel: features)
+    monkeypatch.setattr(
+        strategy.participation,
+        "attach_participation_features",
+        lambda frame: frame,
+    )
+    monkeypatch.setattr(
+        strategy,
+        "_idiosyncratic_events_for_date",
+        lambda *_args: [],
+    )
+    monkeypatch.setattr(strategy, "_microcap_targets", lambda _current: candidates)
+    previous = {
+        "schema_version": strategy.V2_STATE_SCHEMA,
+        "baseline_date": thursday.isoformat(),
+        "last_signal_date": thursday.isoformat(),
+        "risk_on": True,
+        "off_days": 0,
+        "clean_days": 0,
+        "microcap_slots": 10,
+        "pending_microcap_slots": 10,
+        "upgrade_days": 0,
+        "active_events": [],
+        "microcap_targets": [],
+        "last_decision_id": "prior",
+    }
+
+    plan, next_state = strategy.build_forward_plan(
+        tmp_path,
+        friday,
+        baseline_date=thursday,
+        previous_state=previous,
+        strategy_id=strategy.V2_STRATEGY_ID,
+    )
+
+    assert plan["allocation"]["microcap_slots"] == 5
+    assert plan["microcap_count"] == 5
+    assert sum(row["target_weight"] for row in plan["targets"]) == pytest.approx(0.25)
+    assert next_state["microcap_slots"] == 5

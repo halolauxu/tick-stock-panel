@@ -1326,6 +1326,10 @@ class PaperTradingService:
                 if latest is None or latest > current.date():
                     summary["skipped"] += 1
                     continue
+                baseline = date.fromisoformat(str(row["baseline_date"])[:10])
+                if latest < baseline:
+                    summary["skipped"] += 1
+                    continue
                 if latest == current.date() and current.time() < SIGNAL_SEAL_TIME:
                     summary["skipped"] += 1
                     continue
@@ -1337,7 +1341,10 @@ class PaperTradingService:
 
                 is_managed = managed.is_managed_account(config)
                 checkpoint = (
-                    managed.checkpoint_signal_date(self.repo.store.data_dir)
+                    managed.checkpoint_signal_date(
+                        self.repo.store.data_dir,
+                        str(config.get("strategy_id") or ""),
+                    )
                     if is_managed else last_signal
                 )
                 if last_signal is not None and last_signal >= latest and checkpoint == latest:
@@ -2070,6 +2077,9 @@ class PaperTradingService:
         for row in self.ledger.list_account_rows(active_only=True):
             config = json.loads(row["config_json"])
             latest = self.repo.latest_enriched_date(config.get("asset_type", "stock"))
+            baseline = date.fromisoformat(str(row["baseline_date"])[:10])
+            if latest is None or latest < baseline:
+                continue
             seal_is_due = latest is not None and (
                 latest < now.date()
                 or (latest == now.date() and now.time() >= SIGNAL_SEAL_TIME)
@@ -2082,7 +2092,10 @@ class PaperTradingService:
             )
             is_managed = managed.is_managed_account(config)
             checkpoint = (
-                managed.checkpoint_signal_date(self.repo.store.data_dir)
+                managed.checkpoint_signal_date(
+                    self.repo.store.data_dir,
+                    str(config.get("strategy_id") or ""),
+                )
                 if is_managed else last_signal
             )
             if last_signal is not None and last_signal >= latest and checkpoint == latest:

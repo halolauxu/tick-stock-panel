@@ -28,135 +28,30 @@ import run_p0_microcap_escape as escape  # noqa: E402
 import run_p0_microcap_idiosyncratic_forecast_unified_account as unified  # noqa: E402
 import run_p0_risk_gated_idiosyncratic_forecast_overlay as gated  # noqa: E402
 
+from app.services import microcap_participation as participation  # noqa: E402
+
 SCHEMA_VERSION = "p1-microcap-participation-allocator-v1"
 VALIDATION = (date(2021, 1, 1), date(2023, 12, 31))
 STRESS_START = date(2024, 1, 1)
 RECENT_START = date(2026, 3, 1)
-TREND_WINDOW = 20
-LIQUIDITY_BASE_WINDOW = 60
-UPGRADE_CONFIRMATION_DAYS = 3
-FULL_SLOTS = 20
-NO_SLOTS = 0
-SLOTS_PER_CONFIRMATION = FULL_SLOTS // 4
+UPGRADE_CONFIRMATION_DAYS = participation.UPGRADE_CONFIRMATION_DAYS
+FULL_SLOTS = participation.FULL_SLOTS
+NO_SLOTS = participation.NO_SLOTS
+SLOTS_PER_CONFIRMATION = participation.SLOTS_PER_CONFIRMATION
 
 
 def attach_participation_features(features: pl.DataFrame) -> pl.DataFrame:
-    """Describe whether the whole micro-cap cohort has tradable participation."""
-    return (
-        features.sort("date")
-        .with_columns(
-            (
-                (pl.col("microcap_daily_return") + 1.0).rolling_map(
-                    lambda values: values.product(),
-                    window_size=TREND_WINDOW,
-                    min_samples=TREND_WINDOW,
-                )
-                - 1.0
-            ).alias("microcap_absolute_20d"),
-            (
-                (pl.col("microcap_daily_return") + 1.0).rolling_map(
-                    lambda values: values.product(),
-                    window_size=TREND_WINDOW,
-                    min_samples=TREND_WINDOW,
-                )
-                / (pl.col("market_daily_return") + 1.0).rolling_map(
-                    lambda values: values.product(),
-                    window_size=TREND_WINDOW,
-                    min_samples=TREND_WINDOW,
-                )
-                - 1.0
-            ).alias("microcap_relative_20d"),
-            pl.col("microcap_breadth")
-            .rolling_mean(
-                window_size=TREND_WINDOW,
-                min_samples=TREND_WINDOW,
-            )
-            .alias("microcap_breadth_20d"),
-            (
-                pl.col("microcap_median_amount").rolling_mean(
-                    window_size=TREND_WINDOW,
-                    min_samples=TREND_WINDOW,
-                )
-                / pl.col("microcap_median_amount").rolling_mean(
-                    window_size=LIQUIDITY_BASE_WINDOW,
-                    min_samples=LIQUIDITY_BASE_WINDOW,
-                )
-            ).alias("microcap_liquidity_20d_60d"),
-        )
-        .with_columns(
-            pl.sum_horizontal(
-                (pl.col("microcap_absolute_20d") > 0).cast(pl.UInt8),
-                (pl.col("microcap_relative_20d") > 0).cast(pl.UInt8),
-                (pl.col("microcap_breadth_20d") >= 0.5).cast(pl.UInt8),
-                (pl.col("microcap_liquidity_20d_60d") >= 1.0).cast(pl.UInt8),
-            )
-            .fill_null(0)
-            .alias("participation_score")
-        )
-    )
+    return participation.attach_participation_features(features)
 
 
 def raw_slot_budget(feature: dict[str, Any]) -> int:
-    """Map interpretable participation evidence to a capital budget."""
-    required = (
-        "microcap_absolute_20d",
-        "microcap_relative_20d",
-        "microcap_breadth_20d",
-        "microcap_liquidity_20d_60d",
-    )
-    if any(feature.get(key) is None for key in required):
-        return NO_SLOTS
-    if bool(feature.get("severe_limit_down")):
-        return NO_SLOTS
-    score = int(feature.get("participation_score") or 0)
-    return max(NO_SLOTS, min(FULL_SLOTS, score * SLOTS_PER_CONFIRMATION))
+    return participation.raw_slot_budget(feature)
 
 
 def build_allocation_clock(
     features: pl.DataFrame,
 ) -> tuple[dict[date, int], list[dict[str, Any]]]:
-    """Apply close-known evidence at the next open with cautious upgrades."""
-    rows = features.sort("date").to_dicts()
-    slots_by_open: dict[date, int] = {}
-    decisions: list[dict[str, Any]] = []
-    active_slots = NO_SLOTS
-    pending_upgrade = NO_SLOTS
-    upgrade_days = 0
-    audit_fields = (
-        "microcap_absolute_20d",
-        "microcap_relative_20d",
-        "microcap_breadth_20d",
-        "microcap_liquidity_20d_60d",
-    )
-    for index, row in enumerate(rows[:-1]):
-        raw_slots = raw_slot_budget(row)
-        if raw_slots <= active_slots:
-            active_slots = raw_slots
-            pending_upgrade = raw_slots
-            upgrade_days = 0
-        else:
-            if pending_upgrade == raw_slots:
-                upgrade_days += 1
-            else:
-                pending_upgrade = raw_slots
-                upgrade_days = 1
-            if upgrade_days >= UPGRADE_CONFIRMATION_DAYS:
-                active_slots = raw_slots
-                upgrade_days = 0
-        action_date = rows[index + 1]["date"]
-        slots_by_open[action_date] = active_slots
-        decisions.append(
-            {
-                "decision_date": row["date"],
-                "action_date": action_date,
-                "participation_score": int(row.get("participation_score") or 0),
-                "raw_microcap_slots": raw_slots,
-                "microcap_slots": active_slots,
-                "upgrade_confirmation_days": upgrade_days,
-                **{key: row.get(key) for key in audit_fields},
-            }
-        )
-    return slots_by_open, decisions
+    return participation.build_allocation_clock(features)
 
 
 def build_allocator(

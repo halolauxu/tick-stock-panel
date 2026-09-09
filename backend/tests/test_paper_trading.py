@@ -1699,6 +1699,41 @@ def test_signal_recovery_seals_a_prior_ready_day_before_market_open(tmp_path, mo
     assert calls == [(account["id"], SIGNAL_DAY)]
 
 
+def test_signal_recovery_does_not_backfill_before_account_baseline(
+    tmp_path, monkeypatch
+):
+    from app.services import risk_admitted_forecast_paper as managed
+
+    service = _service(tmp_path)
+    service.ledger.create_account(
+        name="新前向账户",
+        baseline_date=date(2026, 8, 27),
+        account_id=managed.V2_ACCOUNT_ID,
+        config={
+            "strategy_id": managed.V2_STRATEGY_ID,
+            "asset_type": "stock",
+            "initial_capital": managed.INITIAL_CAPITAL,
+        },
+    )
+    calls: list[tuple[str, date]] = []
+    monkeypatch.setattr(managed, "inputs_ready", lambda *_args: True)
+    monkeypatch.setattr(
+        service,
+        "seal_account_signals",
+        lambda account_id, signal_date: (
+            calls.append((account_id, signal_date))
+            or {"signals": 0, "orders": 0}
+        ),
+    )
+
+    result = service.seal_ready_signals(
+        now=datetime(2026, 8, 27, 8, 45, tzinfo=CN_TZ)
+    )
+
+    assert result == {"processed": 0, "skipped": 1, "failed": 0, "orders": 0}
+    assert calls == []
+
+
 def test_creating_one_order_does_not_claim_the_whole_signal_day_completed(tmp_path):
     ledger = PaperLedger(tmp_path)
     account = ledger.create_account(
@@ -1847,14 +1882,20 @@ def test_managed_strategy_api_uses_dedicated_read_model(monkeypatch, tmp_path):
     request = SimpleNamespace(app=SimpleNamespace(state=state))
     monkeypatch.setattr(
         managed,
-        "managed_strategy_snapshot",
-        lambda _service: {"id": managed.STRATEGY_ID, "kind": "managed_forward"},
+        "managed_strategy_snapshots",
+        lambda _service: [
+            {"id": managed.V2_STRATEGY_ID, "kind": "managed_forward"},
+            {"id": managed.STRATEGY_ID, "kind": "managed_forward"},
+        ],
     )
 
     result = paper_api.managed_strategies(request)
 
     assert result == {
-        "items": [{"id": managed.STRATEGY_ID, "kind": "managed_forward"}],
+        "items": [
+            {"id": managed.V2_STRATEGY_ID, "kind": "managed_forward"},
+            {"id": managed.STRATEGY_ID, "kind": "managed_forward"},
+        ],
     }
 
 

@@ -189,9 +189,9 @@ def paper_trading_status(request: Request) -> dict:
 def managed_strategies(request: Request) -> dict:
     """Expose dedicated forward portfolios without registering fake StrategyDefs."""
     try:
-        from app.services.risk_admitted_forecast_paper import managed_strategy_snapshot
+        from app.services.risk_admitted_forecast_paper import managed_strategy_snapshots
 
-        return {"items": [managed_strategy_snapshot(_service(request))]}
+        return {"items": managed_strategy_snapshots(_service(request))}
     except Exception as exc:
         _raise_store_error(exc)
 

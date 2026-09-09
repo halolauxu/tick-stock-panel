@@ -2035,7 +2035,7 @@ export interface PaperTradingReconciliation {
 }
 
 export interface ManagedForwardStrategyPeriod {
-  id: 'validation' | 'known_stress'
+  id: string
   label: string
   annualized: number
   total_return: number
@@ -2048,7 +2048,7 @@ export interface ManagedForwardStrategy {
   name: string
   version: string
   kind: 'managed_forward'
-  source: 'frozen_research'
+  source: 'frozen_research' | 'known_history_redesign'
   account_id: string
   description: string
   provenance: {
@@ -2069,6 +2069,7 @@ export interface ManagedForwardStrategy {
     event_lifetime_days: number
     rebalance: string
     execution: string
+    microcap_allocation: string
   }
   historical_results: ManagedForwardStrategyPeriod[]
   live: {
@@ -2094,6 +2095,9 @@ export interface ManagedForwardStrategy {
     pending_order_count: number
     open_incident_count: number
     observed_settlement_days: number
+    microcap_slot_budget: number
+    pending_microcap_slot_budget: number
+    allocation_upgrade_days: number
   }
 }
 

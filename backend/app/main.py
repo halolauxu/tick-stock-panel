@@ -272,29 +272,40 @@ async def _application_lifespan(app: FastAPI):
 
     paper_trading_service = get_paper_trading_service(app.state)
 
-    # The frozen overlay owns one forward-only paper account. Creation is
-    # idempotent, hash-gated, and never replays historical fills on startup.
-    from app.services.risk_admitted_forecast_paper import ACCOUNT_ID, ensure_account
+    # Managed portfolios are separate immutable forward accounts.  V2 never
+    # rewrites V1 history, and neither account replays historical fills.
+    from app.services.risk_admitted_forecast_paper import (
+        ACCOUNT_ID,
+        V2_ACCOUNT_ID,
+        ensure_account,
+        ensure_v2_account,
+    )
 
-    try:
-        ensured = ensure_account(paper_trading_service, cn_today())
-        logger.info("forecast overlay paper account ready: %s", ensured["id"])
-    except Exception as exc:  # noqa: BLE001
-        logger.warning("forecast overlay paper account not started: %s", exc)
+    for managed_account_id, ensure_managed_account in (
+        (ACCOUNT_ID, ensure_account),
+        (V2_ACCOUNT_ID, ensure_v2_account),
+    ):
         try:
-            paper_trading_service.ledger.get_account(ACCOUNT_ID)
-            paper_trading_service.ledger.open_incident(
-                account_id=ACCOUNT_ID,
-                incident_key=f"account:{ACCOUNT_ID}:FORWARD_CONTRACT_MISMATCH",
-                code="FORWARD_CONTRACT_MISMATCH",
-                severity="critical",
-                title="前向账户合同校验失败",
-                detail=str(exc),
-                entity_type="account",
-                entity_id=ACCOUNT_ID,
-            )
-        except KeyError:
-            pass
+            ensured = ensure_managed_account(paper_trading_service, cn_today())
+            logger.info("managed paper account ready: %s", ensured["id"])
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("managed paper account not started: %s", exc)
+            try:
+                paper_trading_service.ledger.get_account(managed_account_id)
+                paper_trading_service.ledger.open_incident(
+                    account_id=managed_account_id,
+                    incident_key=(
+                        f"account:{managed_account_id}:FORWARD_CONTRACT_MISMATCH"
+                    ),
+                    code="FORWARD_CONTRACT_MISMATCH",
+                    severity="critical",
+                    title="前向账户合同校验失败",
+                    detail=str(exc),
+                    entity_type="account",
+                    entity_id=managed_account_id,
+                )
+            except KeyError:
+                pass
 
     def _refresh_paper_quotes_on_boot() -> None:
         try:
