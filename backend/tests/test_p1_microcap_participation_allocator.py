@@ -108,3 +108,51 @@ def test_target_builder_rejects_invalid_slot_budget() -> None:
         assert "invalid micro-cap slot budget" in str(exc)
     else:
         raise AssertionError("invalid slot budget should fail closed")
+
+
+def test_zero_slot_action_date_can_still_sell_at_an_exact_quote() -> None:
+    buy_day = date(2026, 9, 7)
+    cash_day = date(2026, 9, 8)
+    candidates = pl.DataFrame(
+        {
+            "date": [buy_day],
+            "entry_date": [buy_day],
+            "symbol": ["600000.SH"],
+            "signal_amount": [100_000_000.0],
+            "cap_rank": [1],
+            "target_weight": [0.05],
+            "family": [unified.MICROCAP_FAMILY],
+        }
+    )
+    quotes = pl.DataFrame(
+        {
+            "date": [buy_day, cash_day],
+            "symbol": ["600000.SH", "600000.SH"],
+            "amount": [100_000_000.0, 100_000_000.0],
+            "volume": [1_000_000.0, 1_000_000.0],
+            "raw_open": [10.0, 10.2],
+            "open": [10.0, 10.2],
+            "close": [10.1, 10.2],
+            "is_excluded_name": [False, False],
+            "limit_up_price": [11.0, 11.11],
+            "limit_down_price": [9.0, 9.09],
+        }
+    )
+    execution_seed = candidates.select("symbol").unique().join(
+        pl.DataFrame({"entry_date": [buy_day, cash_day]}),
+        how="cross",
+    )
+    grid = unified.account.build_execution_grid(execution_seed, quotes)
+
+    result = unified.account.simulate_account(
+        candidates,
+        grid,
+        initial_cash=200_000.0,
+        target_positions=20,
+        action_dates=[buy_day, cash_day],
+        candidate_weight_column="target_weight",
+    )
+
+    sells = [row for row in result["orders"] if row["side"] == "SELL"]
+    assert len(sells) == 1
+    assert sells[0]["status"] == "FILLED"

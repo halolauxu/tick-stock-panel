@@ -257,7 +257,17 @@ def run_period(
             raw_source.filter(pl.col("symbol").is_in(symbols)), data_dir
         )
     )
-    execution_grid = account.build_execution_grid(targets, quotes)
+    execution_seed = targets
+    if microcap_slots_by_date is not None:
+        # A zero-slot decision must still carry quotes for positions that need
+        # to be sold.  Deriving execution dates only from non-empty targets
+        # would turn a valid risk exit into thousands of false missing-data
+        # rejections.
+        execution_seed = targets.select("symbol").unique().join(
+            pl.DataFrame({"entry_date": all_dates}),
+            how="cross",
+        )
+    execution_grid = account.build_execution_grid(execution_seed, quotes)
     delist_dates = risk.load_delist_dates(data_dir, symbols)
     simulation = account.simulate_account(
         targets,
